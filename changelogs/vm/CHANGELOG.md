@@ -545,6 +545,10 @@ Both failures were invisible on debug images, which load the sek8s profiles in c
   name — so the very first build task that touched libvirt config failed the run outright. It
   is now two handlers sharing a `listen` topic, which keeps the existing modular-libvirt
   (`virtqemud`) first, monolithic (`libvirtd`) fallback behaviour.
+- The sr25519 role's "rustup not found" error now names the account it searched under and the
+  path it searched, and gives the command to install rustup for that account. rustup is a
+  per-user install, so the previous advice — run `build-setup.yml` — was a dead end for the case
+  that actually produces this error: build-setup having already run, for a different user.
 
 ### Removed
 - Hard-coded validator SS58 (`5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ`) removed from all Ansible role defaults (`common`, `admission-controller`, `attestation-service`, `system-manager`) and inventory files (`ansible/guest/inventory.yml`, `local/inventory.prod.yml`). The `validator` Ansible variable is no longer used anywhere in the guest image build.
