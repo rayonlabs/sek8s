@@ -38,6 +38,18 @@ def gpu_tools_dir() -> Path:
     return SCRIPTS_DIR / "gpu-tools"
 
 
+def tdx_measure_script() -> Path:
+    """The bundled ``tdx-measure``: the single implementation of which files RTMR3
+    measures, in what order, and how each is hashed.
+
+    The identical file is installed into the guest at ``/usr/local/bin/tdx-measure`` by
+    the rtmr3-measure Ansible role, and is run there by the initramfs measurer, the
+    build-time manifest generator and ``rtmr3-verify``. Predicting a measurement on the
+    host must run the same script rather than reimplement it — four independent walkers
+    of ``tdx-measure.conf`` used to exist and they disagreed four ways."""
+    return SCRIPTS_DIR / "tdx-measure"
+
+
 def default_config_path() -> str:
     """The launch config.yaml when a caller passes none. ``CHUTES_CVM_CONFIG`` override, else
     ``./config.yaml`` in the current directory — where ``chutes-cvm config init`` writes it. Ansible

@@ -150,7 +150,6 @@ Key configuration in `playbooks/group_vars/all.yml`:
 - `k3s_version` - Kubernetes version
 - `cuda_version` / `nvidia_version` - GPU driver versions  
 - `validator` - Allowed validator SS58 address
-- `attestation_endpoint` - Remote attestation service URL
 
 See role-specific defaults for component configuration.
 

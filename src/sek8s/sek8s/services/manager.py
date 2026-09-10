@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from loguru import logger
-from sek8s_common.log_config import configure_logging
 
 from sek8s.config import SystemManagerConfig, image_config
 from sek8s.server import WebServer
@@ -51,7 +50,6 @@ class SystemManagerServer(WebServer):
 def create_app() -> FastAPI:
     """Create the manager FastAPI app (for testing or programmatic use)."""
     config = SystemManagerConfig()
-    configure_logging(config.debug)
     server = SystemManagerServer(config)
     return server.app
 

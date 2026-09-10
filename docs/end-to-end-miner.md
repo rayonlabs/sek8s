@@ -20,7 +20,7 @@ This guide combines the host automation in `host-tools/`, the k3s-based TDX gues
 
 ## ✅ Pre-flight Checklist
 
-- Intel TDX-capable server (Ubuntu **26.04** host, NVIDIA GPUs). **8× H200: NVSwitch required** for the validated stack. **RTX Pro 6000** has no NVSwitch. **Lab-validated** combinations are in [`host-tools/README.md`](../host-tools/README.md#validated-host-topologies) and `chutes-cvm host setup --topology-matrix`.
+- Intel TDX-capable server (Ubuntu **26.04** host, NVIDIA GPUs). **8× H200: NVSwitch required** for the validated stack. **RTX Pro 6000** has no NVSwitch. **Lab-validated** combinations are in [`host-tools/README.md`](../host-tools/README.md#validated-host-topologies).
 - Intel PCCS access + API key (for PCK cert registration)
 - The VM image downloaded via `chutes-cvm image download` (requires `aria2`)
 - Miner credentials: SS58 address and secret seed without `0x`

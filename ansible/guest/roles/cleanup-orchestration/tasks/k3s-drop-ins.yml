@@ -42,6 +42,14 @@
         group: root
         mode: '0644'
 
+    - name: Copy AppArmor verification dependency drop-in
+      ansible.builtin.copy:
+        src: files/k3s.service.d/apparmor-verify.conf
+        dest: /etc/systemd/system/k3s.service.d/apparmor-verify.conf
+        owner: root
+        group: root
+        mode: '0644'
+
     - name: Copy chroot restriction drop-in
       ansible.builtin.copy:
         src: files/k3s.service.d/chroot-restrictions.conf

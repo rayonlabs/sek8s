@@ -26,22 +26,34 @@
 #   for each file F in sorted(all files under configured paths):
 #       rtmr3_{i+1} = SHA384(rtmr3_i || SHA384(F.contents))
 #
-# SYNC NOTE: this chain algorithm and the file-collection logic must stay
-# identical to verify-access-config (ansible/guest/roles/rtmr3-measure/files/).
-# If either changes, update both scripts.  Both files are intentionally standalone
-# (no sek8s dependency) so they work on tee-gpu-vm builds where /opt/sek8s is
-# not installed.
+# WHICH files are measured, in WHAT ORDER, and HOW each one is hashed are NOT
+# decided here: they come from /usr/local/bin/tdx-measure, the same script the
+# initramfs measurer runs at boot and the build-time manifest generator runs over
+# the image.  Re-deriving any of that here is exactly what let four independent
+# walkers of tdx-measure.conf disagree four ways.  This script owns only the chain
+# fold and the comparison against hardware.
+#
+# The helper is loaded from /usr/local/lib/sek8s (RTMR3-measured, like this script)
+# rather than imported from the sek8s package: this runs on the SYSTEM interpreter,
+# ordered before k3s, and must not resolve through /opt/sek8s/venv, which is
+# outside the measured-path list.
 #
 # Hardware RTMR3 is read from a fresh TDX attestation quote (primary) or the
 # tsm-mr sysfs attribute (fallback for kernels that expose it as readable).
 # Any unrecoverable error also triggers a forced poweroff.
 
-import hashlib
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+# Before the import, not after: /usr/local/lib is RTMR3-measured, so a __pycache__
+# written next to the module would change the measured tree and power the VM off on
+# the NEXT boot. The unit sets PYTHONDONTWRITEBYTECODE too; this covers manual runs.
+sys.dont_write_bytecode = True
+sys.path.insert(0, "/usr/local/lib/sek8s")
+from rtmr3 import Rtmr3Error, compute_rtmr3  # noqa: E402
 
 CONF             = Path("/etc/tdx-measure.conf")
 SYSFS_RTMR3      = "/sys/class/misc/tdx_guest/measurements/rtmr3:sha384"
@@ -83,61 +95,21 @@ def fatal(msg: str) -> None:
     sys.exit(1)
 
 
-# ── config & file collection ─────────────────────────────────────────────────
+# ── measurement ──────────────────────────────────────────────────────────────
 
-def load_conf_paths() -> list[str]:
-    if not CONF.exists():
-        fatal(f"measure config not found: {CONF}")
-    paths: list[str] = []
-    for line in CONF.read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            paths.append(line)
-    if not paths:
-        fatal(f"no paths configured in {CONF}")
-    return paths
+def measure() -> tuple[bytes, list[tuple[str, str]]]:
+    """Return (expected RTMR3, per-file (sha384hex, path)).
 
-
-def collect_files(cfg_paths: list[str]) -> list[str]:
-    """Return sorted list of regular, non-symlink file paths to measure."""
-    files: list[str] = []
-    for p in cfg_paths:
-        rp = Path(p)
-        if rp.is_dir():
-            for f in rp.rglob("*"):
-                if f.is_file() and not f.is_symlink():
-                    files.append(str(f))
-        elif rp.is_file() and not rp.is_symlink():
-            files.append(str(rp))
-    return sorted(files)
-
-
-# ── RTMR3 chain computation ──────────────────────────────────────────────────
-
-def sha384_file(path: str) -> bytes:
-    h = hashlib.sha384()
+    Both the file set and the per-file hashes come from tdx-measure; the chain fold
+    is `rtmr3 = SHA384(rtmr3 || SHA384(contents))` from an all-zero register, which
+    is what the hardware accumulates as the initramfs extends each file.
+    Root is "" because this verifies the live filesystem, post-bind-mount.
+    """
     try:
-        with open(path, "rb") as fh:
-            while chunk := fh.read(1 << 16):
-                h.update(chunk)
-    except OSError as exc:
-        fatal(f"cannot read file for hashing: {path}: {exc}")
-    return h.digest()
-
-
-def compute_expected_rtmr3(files: list[str]) -> bytes:
-    """
-    Simulate the RTMR3 extension chain from all-zeros initial state.
-    Mirrors the init-bottom rtmr3-measure script exactly:
-        for each file (sorted lexicographically):
-            extend_data = SHA384(file_contents)         # 48 bytes written to sysfs
-            rtmr3       = SHA384(rtmr3 || extend_data)  # hardware mixes in accumulated value
-    """
-    rtmr3 = bytes(QUOTE_RTMR3_LEN)  # TDX initial RTMR3 = all-zeros
-    for path in files:
-        extend_data = sha384_file(path)
-        rtmr3 = hashlib.sha384(rtmr3 + extend_data).digest()
-    return rtmr3
+        expected_hex, files = compute_rtmr3("", CONF)
+    except Rtmr3Error as exc:
+        fatal(str(exc))
+    return bytes.fromhex(expected_hex), files
 
 
 # ── hardware RTMR3 read ──────────────────────────────────────────────────────
@@ -211,14 +183,9 @@ def read_hardware_rtmr3() -> bytes:
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    cfg_paths = load_conf_paths()
-    files     = collect_files(cfg_paths)
-
-    if not files:
-        fatal("no files found to measure — check tdx-measure.conf paths")
-
-    print(f"rtmr3-verify: measuring {len(files)} files ...")
-    expected = compute_expected_rtmr3(files)
+    print("rtmr3-verify: measuring via tdx-measure ...")
+    expected, files = measure()
+    print(f"rtmr3-verify: measured {len(files)} files")
 
     print("rtmr3-verify: reading hardware RTMR3 ...")
     hardware = read_hardware_rtmr3()
@@ -240,12 +207,8 @@ def main() -> None:
     print(f"  computed: {expected.hex()}", file=sys.stderr)
     print(f"  hardware: {hardware.hex()}", file=sys.stderr)
     print("\nrtmr3-verify: per-file hashes (current filesystem):", file=sys.stderr)
-    for f in files:
-        try:
-            h = hashlib.sha384(Path(f).read_bytes()).hexdigest()
-            print(f"  {h}  {f}", file=sys.stderr)
-        except OSError as exc:
-            print(f"  (error: {exc})  {f}", file=sys.stderr)
+    for digest, path in files:
+        print(f"  {digest}  {path}", file=sys.stderr)
     fatal("storage or runtime tampering detected — RTMR3 does not match expected value")
 
 

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import contextlib
 import glob
-import hashlib
 import json
 import os
 import re
@@ -29,6 +28,8 @@ import time
 from pathlib import Path
 
 from chutes_cvm import proc
+from chutes_cvm.measurement.rtmr3 import Rtmr3Error, fold_chain, measured_hashes
+from chutes_cvm.paths import tdx_measure_script
 
 
 class MeasurementError(RuntimeError):
@@ -96,51 +97,21 @@ def compute_rtmr1_2(
 # ── RTMR3 (userspace file chain; version-level, LUKS-independent) ──────────────
 
 
-def _measured_files(mount_root: str, conf_path: str) -> list[tuple[str, str]]:
-    """(root-relative path, full mounted path) for every regular non-symlink file named by
-    /etc/tdx-measure.conf, sorted by root-relative path — matching rtmr3-measure/-verify.
+def rtmr3_chain(mount_root: str, conf_path: str) -> tuple[str, list[tuple[str, str]]]:
+    """Compute RTMR3 over a mounted root by running the bundled ``tdx-measure``.
+
+    Which files are measured, in what order, and how each is hashed are decided by that
+    script — the same one the guest runs at boot and at verify time — so this cannot
+    predict a value the guest will not reproduce. Only the chain fold happens here,
+    because the hardware does the folding at boot.
+
+    Returns (uppercase hex, [(per-file sha384 hex, root-relative path)]).
     """
-    cfg_paths: list[str] = []
-    for line in Path(conf_path).read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            cfg_paths.append(line)
-    if not cfg_paths:
-        raise MeasurementError("no paths configured in tdx-measure.conf")
-
-    root = mount_root.rstrip("/")
-    rootlen = len(root)
-    entries: list[tuple[str, str]] = []
-    for cfg_path in cfg_paths:
-        mounted = Path(root + cfg_path)
-        if mounted.is_dir():
-            for f in mounted.rglob("*"):
-                if f.is_file() and not f.is_symlink():
-                    entries.append((str(f)[rootlen:], str(f)))
-        elif mounted.is_file() and not mounted.is_symlink():
-            entries.append((cfg_path, str(mounted)))
-    entries.sort(key=lambda e: e[0])
-    if not entries:
-        raise MeasurementError(
-            "no files found to measure — check tdx-measure.conf paths"
-        )
-    return entries
-
-
-def rtmr3_chain(files: list[tuple[str, str]]) -> tuple[str, list[tuple[str, str]]]:
-    """Replay the RTMR3 extension chain over ``files`` (root-relative path, full path).
-
-    ``rtmr3 = 0x00*48; for f: rtmr3 = SHA384(rtmr3 || SHA384(f.contents))`` — identical to
-    rtmr3-measure (initramfs) and rtmr3-verify. Returns (uppercase hex, [(per-file-hash,
-    root-relative path)]) — the pure, host-independent core, unit-testable without an image.
-    """
-    rtmr3 = bytes(48)
-    per_file: list[tuple[str, str]] = []
-    for rel_path, full_path in files:
-        file_hash = hashlib.sha384(Path(full_path).read_bytes()).digest()
-        rtmr3 = hashlib.sha384(rtmr3 + file_hash).digest()
-        per_file.append((file_hash.hex(), rel_path))
-    return rtmr3.hex().upper(), per_file
+    try:
+        hashes = measured_hashes(mount_root, conf_path, tdx_measure_script())
+        return fold_chain(hashes), hashes
+    except Rtmr3Error as exc:
+        raise MeasurementError(str(exc)) from exc
 
 
 def _wait_for_path(path: str, timeout: float = 5.0) -> bool:
@@ -341,4 +312,4 @@ def compute_rtmr3(
             raise MeasurementError(
                 "/etc/tdx-measure.conf not found in image — rtmr3-measure did not run"
             )
-        return rtmr3_chain(_measured_files(mnt, conf))
+        return rtmr3_chain(mnt, conf)

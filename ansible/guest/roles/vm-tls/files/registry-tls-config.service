@@ -10,4 +10,11 @@ RemainAfterExit=yes
 # registry-tls group and open group-read so the non-root consumers can present it
 # as their mTLS client identity: chute-log-shipper (log egress) and admission
 # (cosign --registry-client-cert). Files stay root-owned.
-ExecStart=/bin/sh -c 'chgrp registry-tls /run/chutes/registry-tls /run/chutes/registry-tls/client.crt /run/chutes/registry-tls/client.key && chmod 0710 /run/chutes/registry-tls && chmod 0640 /run/chutes/registry-tls/client.key'
+# No `/bin/sh -c` wrapper: sh is in @{confined_bins}, so it would auto-attach
+# sek8s.deny-sensitive-default, which denies reads under /run/chutes. Named chgrp/chmod
+# are outside AppArmor's file mediation mask so it happens to work anyway, but that is
+# a property of these arguments, not of the unit -- adding -R would silently break on
+# boots where AppArmor loads first. Type=oneshot chains ExecStart= lines without a shell.
+ExecStart=/usr/bin/chgrp registry-tls /run/chutes/registry-tls /run/chutes/registry-tls/client.crt /run/chutes/registry-tls/client.key
+ExecStart=/usr/bin/chmod 0710 /run/chutes/registry-tls
+ExecStart=/usr/bin/chmod 0640 /run/chutes/registry-tls/client.key

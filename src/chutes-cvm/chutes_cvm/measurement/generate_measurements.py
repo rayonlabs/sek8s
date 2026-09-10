@@ -280,12 +280,30 @@ def fetch_host_profiles(api_base: str, include_pending: bool = False) -> list[di
 
 
 def _resolve_profile_for_devices(device_ids: list[str]) -> GpuProfile:
-    """The GpuProfile whose ``pci_device_ids`` cover these GPUs — the measurement policy
-    (firmware, CC/PPCIe mode, BAR/VRAM, reserved CPUs, guest-RAM rule) for the class."""
+    """The GpuProfile for these GPUs — the measurement policy (firmware, CC/PPCIe mode,
+    BAR/VRAM, reserved CPUs, guest-RAM rule) for the class.
+
+    All GPUs must be one model. This used to return the first profile any single id
+    matched, so insertion order decided the answer rather than the evidence and a
+    heterogeneous host was measured as whichever model sorted first. The launch path has
+    always refused to guess (``guest.gpu.profiles.resolve_profile``), and the caller here
+    treats a raise as PENDING, so a malformed document is skipped visibly rather than
+    measured plausibly.
+
+    One id per profile, so comparing ids IS comparing profiles.
+    """
+    unique = set(device_ids)
+    if len(unique) != 1:
+        raise ValueError(
+            f"all GPUs must be one model; device ids are {sorted(unique)}"
+            if unique
+            else "host profile reports no GPU device ids"
+        )
+    device_id = unique.pop()
     for profile in GPU_PROFILES.values():
-        if any(profile.matches_device_id(d) for d in device_ids):
+        if profile.matches_device_id(device_id):
             return profile
-    raise ValueError(f"no GPU profile matches device ids {device_ids}")
+    raise ValueError(f"no GPU profile matches device id {device_id}")
 
 
 def topology_from_profile(doc: dict) -> "tuple[GpuProfile, TopologyFingerprint, str]":

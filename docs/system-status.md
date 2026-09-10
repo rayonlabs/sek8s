@@ -97,7 +97,7 @@ All other paths return 404.
 
 - Determine the final authentication story (e.g., reuse validator signature headers similar to the attestation proxy or rely on mTLS). The initial implementation focuses on the read-only execution layer; transport-level protections can be layered in once the consuming component is chosen.
 - Remaining un-exposed units, should a triage gap show up in practice (all secret-free journals):
-  `signing-keys-config`, `registry-tls-config`, `verify-apparmor-profiles`, `gpu-verify`, `rtmr3-verify`,
+  `registry-tls-config`, `verify-apparmor-profiles`, `gpu-verify`, `rtmr3-verify`,
   `setup-cache` / `verify-cache-volume` / `verify-storage`, `attestation-service-init`. These are boot one-shots
   whose failure already surfaces through the long-running service that depends on them, so they are deliberately
   left off rather than widening the endpoint. `config-manager` is excluded by the credential rule above.

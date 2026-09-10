@@ -31,7 +31,6 @@ profile sek8s.system-manager flags=(enforce, attach_disconnected) {
 
   # Environment files
   /etc/system-manager/** r,
-  /run/chutes/validator-auth.env r,
 
   # HF model cache — read/write for downloads
   /var/snap/ r,
@@ -59,9 +58,9 @@ profile sek8s.system-manager flags=(enforce, attach_disconnected) {
   /etc/admission-controller/docker-config/** r,
   /etc/admission-controller/cosign/cosign.pub r,
 
-  # Dynamic signing keys — fetched at boot by fetch-signing-keys initramfs script,
-  # RSA-verified against attested root key, written to tmpfs before pivot_root.
-  /run/chutes/signing-keys/** r,
+  # No /run/chutes rules: nothing here reads it. EnvironmentFile=/run/chutes/validator-auth.env
+  # is read by PID 1 as root before the drop to User=, and the cosign key paths belong to
+  # AdmissionConfig, not this service.
 
   # Helper binaries (sudoers-restricted)
   /usr/local/bin/k3s-images-helper mrix,

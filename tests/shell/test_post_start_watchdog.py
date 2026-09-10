@@ -126,3 +126,40 @@ def test_unit_start_limits_are_in_unit_section():
         line for line in service_section.splitlines() if not line.startswith("#")
     ]
     assert not any(line.startswith("StartLimit") for line in directives)
+
+
+def test_staged_secrets_are_root_only():
+    """Staging must not widen a secret's mode for the life of the consuming script.
+
+    The sources are 0600 root inside a 0700 /run/chutes. Staging them 0444 in a 0755
+    directory made them world-readable to anything already running on the guest, and the
+    window is not short — the step consuming the first one rewrites every secret and
+    configmap through the apiserver. Every step runs as root under aa-exec from a
+    User=root unit, so root-only staging costs nothing.
+
+    Asserted against the source rather than by running it: the staged-file map hardcodes
+    /run/chutes paths a test cannot create without root, so exercising the real path would
+    need a privileged harness. This at least fails loudly if the modes are widened again.
+    """
+    body = (REPO / SCRIPT).read_text()
+    start = body.index("stage_script_files()")
+    end = body.index("unstage_script_files()")
+    staging = body[start:end]
+    # Commands only — the comment above them names the old modes to explain why they
+    # were wrong, and matching raw text would flag that as a regression.
+    commands = [
+        ln.strip()
+        for ln in staging.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    modes = [ln for ln in commands if "chmod " in ln or "install " in ln]
+
+    assert any(
+        "chmod 0700" in ln for ln in modes
+    ), "staging tree must not be world-traversable"
+    assert any(
+        "install -m 0400" in ln for ln in modes
+    ), "staged secrets must be root-read-only"
+    assert not any(
+        "0755" in ln or "0444" in ln for ln in modes
+    ), f"staging reverted to world-readable modes: {modes}"

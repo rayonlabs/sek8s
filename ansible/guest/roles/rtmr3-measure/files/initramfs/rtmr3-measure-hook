@@ -22,6 +22,12 @@ copy_exec /usr/local/bin/tdx-rtmr-extend
 # sha384sum for hashing measured files (from coreutils — always present)
 copy_exec /usr/bin/sha384sum
 
+# The single implementation of which files are measured, in what order, and how each
+# is hashed — shared with the build-time manifest generator, rtmr3-verify and the
+# host-side measurement predictor, so none of them can enumerate or hash differently.
+# POSIX sh over find/sed/sort/wc/mktemp/sha384sum, all present in the initramfs.
+copy_exec /usr/local/bin/tdx-measure
+
 # TDX guest kernel module — needed so /dev/tdx_guest is available
 manual_add_modules tdx_guest
 force_load tdx_guest

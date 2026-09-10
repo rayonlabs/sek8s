@@ -8,12 +8,15 @@ After=setup-storage-bind-mounts.service
 # Must succeed before k3s starts — ensuring k3s never reads manifests that
 # diverge from what RTMR3 attests.
 Before=k3s.service
-Before=k3s-agent.service
 Requires=setup-storage-bind-mounts.service
 
 [Service]
 Type=oneshot
 EnvironmentFile=-/etc/default/rtmr3-verify
+# The rtmr3 helper is imported from /usr/local/lib/sek8s, which is RTMR3-measured;
+# a __pycache__ written beside it would change that tree and power the VM off on
+# the NEXT boot. rtmr3-verify sets sys.dont_write_bytecode too, for manual runs.
+Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/local/bin/rtmr3-verify
 RemainAfterExit=yes
 TimeoutStartSec=120

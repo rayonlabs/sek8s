@@ -57,7 +57,7 @@ _B200_LIVE_FP = known.B200_XEON_FP
 
 @pytest.mark.parametrize(
     "device_id",
-    ["2bb1", "2BB1", "2Bb1"],
+    ["2bb5", "2BB5", "2Bb5"],
 )
 def test_device_id_matching_is_case_insensitive(device_id):
     profile = GPU_PROFILES["RTX_PRO_6000"]
@@ -69,9 +69,7 @@ def test_device_id_rejects_other_profiles_ids():
     fingerprints, not sibling profiles), so every profile must reject every
     OTHER profile's device IDs."""
     for key, profile in GPU_PROFILES.items():
-        foreign_ids = [
-            pid for k, p in GPU_PROFILES.items() if k != key for pid in p.pci_device_ids
-        ]
+        foreign_ids = [p.pci_device_id for k, p in GPU_PROFILES.items() if k != key]
         for foreign_id in foreign_ids:
             assert not profile.matches_device_id(
                 foreign_id
@@ -92,11 +90,41 @@ def test_no_duplicate_pci_device_ids_across_profiles():
     """
     by_device_id: dict[str, list[str]] = {}
     for key, profile in GPU_PROFILES.items():
-        for pid in profile.pci_device_ids:
-            by_device_id.setdefault(pid.lower(), []).append(key)
+        by_device_id.setdefault(profile.pci_device_id.lower(), []).append(key)
 
     dupes = {pid: keys for pid, keys in by_device_id.items() if len(keys) > 1}
     assert not dupes, f"device IDs claimed by multiple profiles: {dupes}"
+
+
+def test_every_profile_declares_exactly_one_device_id():
+    """One product per profile — the field is a string, so this guards the values.
+
+    A profile carries far more than a BAR layout: reserved CPUs, the guest-RAM rule, NUMA
+    handling, firmware, expected_gpus and the CC/PPCIe mode arguments. Two products that
+    agree on all of those today can diverge later with nothing to notice, so distinct
+    hardware gets a distinct profile. RTX_PRO_6000 previously covered both the Workstation
+    and Server editions, and the BAR layout it carries was measured on the Server card.
+    """
+    for key, profile in GPU_PROFILES.items():
+        assert isinstance(
+            profile.pci_device_id, str
+        ), f"{key}: device id must be a string"
+        assert profile.pci_device_id, f"{key}: device id must not be empty"
+
+
+def test_the_passthrough_stub_names_the_profile_s_own_gpu():
+    """The offline stub stands in for the real card, so it must be the same device.
+
+    It used to declare 2bb1 while the profile also matched 2bb5 and the BAR layout came
+    from a 2bb5 card — the stub named a product the measurement was not taken from.
+    """
+    for key, profile in GPU_PROFILES.items():
+        stub = profile.passthrough.get("gpu")
+        if stub is None:
+            continue
+        assert (
+            stub.device_id.lower() == profile.pci_device_id.lower()
+        ), f"{key}: stub device id {stub.device_id} != profile {profile.pci_device_id}"
 
 
 def test_all_registered_profiles_are_gpu_profile_subclasses():

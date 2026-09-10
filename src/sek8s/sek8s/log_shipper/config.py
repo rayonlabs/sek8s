@@ -77,9 +77,10 @@ class LogShipperConfig(BaseSettings):
     container_name: str = Field(
         default="chute",
         alias="CONTAINER_NAME",
-        description="Only this pod container's logs are shipped. Admission enforces the chute "
-        "main container is named 'chute'; init/sidecar containers are skipped so the stream stays "
-        "single-container (monotonic ts, which the validator's high-watermark dedupe relies on).",
+        description="Only this pod container's logs are shipped. Admission denies a chute "
+        "workload with no container of this name, so the assumption holds; init/sidecar "
+        "containers are skipped to keep the stream single-container, hence monotonic in ts, "
+        "which the validator's high-watermark dedupe relies on.",
     )
     command_timeout_seconds: float = Field(
         default=15.0, alias="COMMAND_TIMEOUT_SECONDS", gt=0.0, le=120.0
@@ -94,14 +95,6 @@ class LogShipperConfig(BaseSettings):
     )
 
     # ── Streaming window / cadence ──────────────────────────────────────────
-    buffer_bytes: int = Field(
-        default=1_048_576,
-        alias="BUFFER_BYTES",
-        ge=65_536,
-        le=64 * 1_048_576,
-        description="Per-pod in-flight read window — the deterministic memory ceiling. "
-        "Must exceed the CRI physical line cap (~16 KiB) so a window always makes progress.",
-    )
     poll_interval_seconds: float = Field(
         default=10.0,
         alias="POLL_INTERVAL_SECONDS",
@@ -109,9 +102,24 @@ class LogShipperConfig(BaseSettings):
         le=3600.0,
         description="Idle sleep when caught up to EOF (only new bytes are read next cycle)",
     )
+    drain_interval_seconds: float = Field(
+        default=0.1,
+        alias="DRAIN_INTERVAL_SECONDS",
+        gt=0.0,
+        le=60.0,
+        description="Gap between batches while draining a backlog. Bounds the request rate "
+        "against the validator, and guarantees the loop always yields — a chute writing "
+        "faster than we ship would otherwise never let it await.",
+    )
     batch_max_lines: int = Field(default=500, alias="BATCH_MAX_LINES", ge=1, le=100_000)
     batch_max_bytes: int = Field(
-        default=1_048_576, alias="BATCH_MAX_BYTES", ge=1024, le=64 * 1_048_576
+        default=1_048_576,
+        alias="BATCH_MAX_BYTES",
+        ge=1024,
+        le=64 * 1_048_576,
+        description="Bytes read per batch, which is also the deterministic memory ceiling: "
+        "the reader hands out one batch at a time, so the two are the same number. Must "
+        "exceed the CRI physical line cap (~16 KiB) so a read always makes progress.",
     )
     max_line_bytes: int = Field(
         default=16_384,

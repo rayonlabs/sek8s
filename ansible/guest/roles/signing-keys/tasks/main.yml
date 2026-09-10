@@ -66,28 +66,11 @@
     mode: '0755'
   notify: update initramfs
 
-# ── Shared key-access group + consumer wiring (self-contained) ───────────────
-# This role owns the whole key-access story: the fetched keys land under 0700
-# /run/chutes owned root:root, so we create the shared chutes-keys group, a
-# boot-time perms unit that chgrp's the keys to it, and a systemd drop-in that
-# grants each consumer (admission-controller) group membership + a bind of the
-# keys. Wiring the consumer via a drop-in (rather than editing its unit) keeps
-# admission-controller ignorant of signing keys, and sidesteps a build ordering
-# trap: the group and the SupplementaryGroups= that references it land together
-# here, after admission's first (group-less) start earlier in the build.
-
-- name: Create chutes-keys group (shared read access to fetched signing keys)
-  ansible.builtin.group:
-    name: chutes-keys
-    system: true
-
-- name: Install signing-keys-config service
-  ansible.builtin.copy:
-    src: signing-keys-config.service
-    dest: /etc/systemd/system/signing-keys-config.service
-    owner: root
-    group: root
-    mode: '0644'
+# ── Consumer wiring (self-contained) ────────────────────────────────────────
+# The keys are PUBLIC and the initramfs writes them 0644, so nothing gates them and no
+# group or perms unit is involved. Admission reaches them through a drop-in that binds
+# the subtree into the private tmpfs its unit mounts over 0700 /run/chutes. Wiring it
+# via a drop-in rather than editing the unit keeps admission ignorant of signing keys.
 
 - name: Ensure admission-controller systemd drop-in directory exists
   ansible.builtin.file:
@@ -105,8 +88,6 @@
     group: root
     mode: '0644'
 
-- name: Enable signing-keys-config service
+- name: Reload systemd so the admission-controller drop-in takes effect
   ansible.builtin.systemd:
-    name: signing-keys-config.service
-    enabled: true
     daemon_reload: true

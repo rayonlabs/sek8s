@@ -10,6 +10,7 @@ from fastapi.applications import AppType
 from fastapi.responses import ORJSONResponse
 from loguru import logger
 from sek8s_common.config import ServerConfig
+from sek8s_common.log_config import configure_logging
 from starlette.requests import Request
 from starlette.types import Lifespan
 
@@ -21,6 +22,13 @@ class WebServer:
         self, config: ServerConfig, lifespan: Optional[Lifespan[AppType]] = None
     ):
         self.config = config
+        # Install the hardened sink here rather than in each entrypoint. The guest
+        # journals are miner-readable over the status API, so a service that misses
+        # this runs on loguru's default handler and renders local variable values
+        # inside tracebacks. Every service builds one of these before it serves —
+        # whether it then calls run() or serve() — so this is the one place that
+        # cannot be forgotten.
+        configure_logging(config.debug)
         self.app = FastAPI(
             debug=config.debug, default_response_class=ORJSONResponse, lifespan=lifespan  # type: ignore[arg-type]
         )

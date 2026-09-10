@@ -141,7 +141,8 @@ def test_submit_registers_an_unknown_class():
 
 def test_submit_registers_the_target_os_class_not_the_live_one():
     """`--target-os X --submit` must register the class the host BECOMES: submitting the live
-    host's OS/QEMU would baseline a (release, QEMU) pair the target release never ships."""
+    host's OS/QEMU would baseline a (release, QEMU) pair the target release never ships.
+    """
     stack, _, _ = _patch(covered=[], status="unknown", qemu_raises=True)
     with stack, patch(
         "chutes_cvm.guest.verify.submit_profile",

@@ -12,7 +12,6 @@ Requires=rtmr3-verify.service
 # them (setup-storage-bind-mounts evicted the addon tracking so k3s re-applies
 # on start), and complete before the admission controller starts serving.
 Before=k3s.service
-Before=k3s-agent.service
 Before=admission-controller.service
 
 [Service]

@@ -82,14 +82,22 @@ stage_script_files() {
     local dir="$STAGE_ROOT/$script_name"
     rm -rf "${dir:?}"
     mkdir -p "$dir"
-    chmod 0755 "$STAGE_ROOT" "$dir"
+    # 0700/0400 root-owned. Staging exists to get around AppArmor, not DAC: each step's
+    # profile denies /run/chutes outright and grants /run/k3s-init/<script>/ instead. The uid
+    # never changes -- this unit is User=root and aa-exec switches the profile, not the user --
+    # so root-only modes still satisfy both layers. A wider mode buys the mechanism nothing,
+    # because AppArmor mediates paths and not modes, and costs a real widening: the sources are
+    # 0600 root in a 0700 /run/chutes, and 0444 exposed them to everything else on the guest for
+    # the life of the step -- long enough to matter, since 00-reencrypt-secrets rewrites every
+    # secret and configmap through the apiserver.
+    chmod 0700 "$STAGE_ROOT" "$dir"
 
     local f
     for f in $files; do
         if [ -r "$f" ]; then
             # install, not cp: cp is in @{confined_bins}, so exec'ing it would attach
             # sek8s.deny-sensitive-default and be denied both paths, unconfined wrapper or not.
-            install -m 0444 "$f" "$dir/$(basename "$f")"
+            install -m 0400 "$f" "$dir/$(basename "$f")"
         else
             # Not fatal here: each consumer enforces its own safe-failure behaviour, and failing
             # the whole run would take down the steps that do not need this file.

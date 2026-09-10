@@ -38,8 +38,11 @@ fi
 
 # Create snap cache dir: 1000:1000 (tdx) so pods can use it; 2775 so group (tdx) can write; chutes is in group tdx so system-manager can write
 mkdir -p "$SNAP_CACHE"
-chown -R "$SNAP_OWNER" "$SNAP_CACHE"
+# chmod first: it repairs each directory's mode on the pre-order visit, so the walk can descend
+# into pod-created entries. chown cannot repair anything, so running it first makes an
+# unreadable directory abort the script (set -e) and OnFailure=poweroff.target bricks the VM.
 chmod -R 2775 "$SNAP_CACHE"
+chown -R "$SNAP_OWNER" "$SNAP_CACHE"
 
 # system-manager's XDG cache. Created HERE, and deliberately not from system-manager's own
 # ExecStartPre: that ran `+/bin/bash -c 'install -d ...'`, and the `+` prefix makes systemd skip

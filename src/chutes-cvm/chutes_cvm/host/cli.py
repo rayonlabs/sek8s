@@ -185,7 +185,7 @@ def _add_api_args(p: argparse.ArgumentParser) -> None:
 def main(argv: "list[str] | None" = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # `setup` owns its own argparse (--topology-matrix / --noninteractive), so forward to it
+    # `setup` owns its own argparse (--noninteractive), so forward to it
     # verbatim before our argparse touches the args (matches the top-level passthrough pattern).
     if argv and argv[0] == "setup":
         from chutes_cvm.host.setup import main as _setup_main
