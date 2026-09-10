@@ -401,6 +401,12 @@ Version source of truth: `ansible/guest/VERSION`
   No image shipped today acts on such arguments, so nothing was exploitable; the rule closes
   the asymmetry so a future image that does act on them cannot slip through unnoticed.
   Applies to main, init and ephemeral containers; other pods in the namespace are unaffected.
+- Bumped the pinned guest HWE kernel from `7.0.0-28.28~24.04.1` to `7.0.0-31.31~24.04.1`.
+  The pin is deliberate — it keeps the guest kernel, and so the measurement baseline,
+  reproducible across rebuilds — but noble-updates and noble-security carry only the newest
+  HWE ABI, so the old version stopped resolving and the build failed outright at "Install HWE
+  kernel and headers (pinned)". The new version is the current archive kernel and ships from
+  noble-security. Guest RTMR measurements change accordingly.
 
 ### Fixed
 - `nvidia-fabricmanager` is no longer reported as unhealthy when it is intentionally masked (valid on non-NVLink hosts). The services overview now returns `ok` in this configuration instead of incorrectly reporting `degraded`.
