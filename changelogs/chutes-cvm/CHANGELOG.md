@@ -3,7 +3,7 @@
 The `chutes-cvm` CLI + toolkit (`src/chutes-cvm/`) — an independently installable host CLI
 (`pip`/`install.sh`). Versioned with SemVer via `src/chutes-cvm/VERSION`. Run
 `make promote-changelogs` to aggregate fragments into the current version section.
-## [0.1.0] - 2026-09-02
+## [0.1.0] - 2026-09-10
 
 ### Added
 - **`chutes-cvm measurements`** — TDX measurement generation is now a first-class command
@@ -219,6 +219,13 @@ The `chutes-cvm` CLI + toolkit (`src/chutes-cvm/`) — an independently installa
   (previously `<base>.manifest.json`). `manifest.json` is the only name the readers —
   `image verify`, `image download`, and `guest launch` — look for, so a freshly generated
   set is directly consumable and copyable as a whole directory. Pass `-o` for the old name.
+- Offline RTMR3 prediction now runs the same `tdx-measure` script the guest runs, instead of
+  reimplementing the walk in Python. The script is bundled with the package, so a `pip install
+  chutes-cvm` can still predict a measurement with no checkout, and the guest image is built by
+  copying that same file in. Previously this module decided independently which files to measure,
+  in what order, and how to hash them, and had drifted from the guest in ways that would have made
+  a predicted measurement disagree with the one a VM actually produces. Only the chain fold stays
+  in Python, because at boot the hardware does the folding.
 
 ### Fixed
 - Bridge networking now clamps TCP MSS to the egress interface's PMTU (`setup-bridge.sh`),
@@ -234,9 +241,30 @@ The `chutes-cvm` CLI + toolkit (`src/chutes-cvm/`) — an independently installa
 - `host submit-profile` on an unsupported OS release (or a supported one running a QEMU it does
   not ship) is now rejected locally, as `host verify` already was. It previously registered the
   host class anyway, spending a measurement-generation slot on a class that could never attest.
+- Measurement generation now skips a host whose GPUs are not all the same model instead of
+  measuring it as whichever model was listed first. Such a host cannot launch anyway —
+  launching has always rejected mixed hardware — so the entry it produced was unusable
+  rather than wrong in a dangerous way; it is now reported as pending with the reason,
+  alongside the other hosts that cannot yet be generated offline.
+- Each GPU profile now describes exactly one graphics card. The RTX PRO 6000 profile
+  covered both the Workstation and Server editions, so a Workstation host was measured
+  using hardware details read from a Server card. Workstation Edition is not supported and
+  no longer resolves — such a host is reported as pending rather than measured incorrectly.
+  A profile carries reserved CPU counts, guest memory rules, firmware and confidential
+  computing settings as well, so two cards that happen to agree on those today could
+  quietly diverge later.
 
 ### Removed
 - **The `ntp` and `chutes_dirs` ansible roles** — folded into `chutes-cvm host setup` (above). The
   `host_prerequisites` role stays (still used by the launch / remediate / build-setup playbooks) but
   is no longer part of `setup.yml`.
+- Removed the lab-validated host topology matrix (`chutes_cvm/host/support_matrix.py`) and the
+  `chutes-cvm host setup --topology-matrix` flag that printed it. The matrix was a hardcoded
+  set of (Ubuntu, GPU SKU, GPU count) triples maintained by hand and consulted by nothing —
+  its lookup helper had no callers, so it documented support rather than enforcing it, and it
+  drifted from reality (B300 was listed by the formatter but absent from the data). Host
+  support is now determined by probing the actual host with the chutes-cvm CLI, and the set of
+  supported profiles is served by the API, so the static table was a second source of truth
+  with no way to stay correct. The validated-topology table in `host-tools/README.md` remains
+  as operator documentation.
 
