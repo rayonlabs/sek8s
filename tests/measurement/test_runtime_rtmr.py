@@ -16,38 +16,38 @@ import pytest
 import yaml
 from chutes_cvm.measurement import generate_measurements as gm
 from chutes_cvm.measurement import runtime_rtmr as rr
+from chutes_cvm.measurement.rtmr3 import fold_chain
 
 # ── RTMR3 chain ────────────────────────────────────────────────────────────────
 
 
 def test_rtmr3_chain_matches_reference(tmp_path):
-    a = tmp_path / "a"
-    a.write_bytes(b"alpha")
-    b = tmp_path / "b"
-    b.write_bytes(b"beta")
-    files = [("/etc/a", str(a)), ("/etc/b", str(b))]
+    """The fold matches an independent reference, and runs the real tdx-measure."""
+    root = tmp_path / "root"
+    (root / "etc").mkdir(parents=True)
+    (root / "etc/a").write_bytes(b"alpha")
+    (root / "etc/b").write_bytes(b"beta")
+    conf = tmp_path / "conf"
+    conf.write_text("/etc/a\n/etc/b\n")
 
-    rtmr3, per_file = rr.rtmr3_chain(files)
+    rtmr3, per_file = rr.rtmr3_chain(str(root), str(conf))
 
     # Independent reference: rtmr3 = 0x00*48; rtmr3 = SHA384(rtmr3 || SHA384(contents)).
     acc = bytes(48)
-    for _, full in files:
-        acc = hashlib.sha384(
-            acc + hashlib.sha384(Path(full).read_bytes()).digest()
-        ).digest()
+    for payload in (b"alpha", b"beta"):
+        acc = hashlib.sha384(acc + hashlib.sha384(payload).digest()).digest()
     assert rtmr3 == acc.hex().upper()
     assert [p[1] for p in per_file] == ["/etc/a", "/etc/b"]
     assert per_file[0][0] == hashlib.sha384(b"alpha").hexdigest()
 
 
-def test_rtmr3_chain_is_order_sensitive(tmp_path):
-    a = tmp_path / "a"
-    a.write_bytes(b"x")
-    b = tmp_path / "b"
-    b.write_bytes(b"y")
-    r1, _ = rr.rtmr3_chain([("/a", str(a)), ("/b", str(b))])
-    r2, _ = rr.rtmr3_chain([("/b", str(b)), ("/a", str(a))])
-    assert r1 != r2
+def test_rtmr3_chain_is_order_sensitive():
+    """Reordering the same files changes the register — the chain is not a set hash."""
+    pairs = [
+        (hashlib.sha384(b"x").hexdigest(), "/a"),
+        (hashlib.sha384(b"y").hexdigest(), "/b"),
+    ]
+    assert fold_chain(pairs) != fold_chain(list(reversed(pairs)))
 
 
 def test_measured_files_sorts_filters_and_strips_comments(tmp_path):
@@ -55,24 +55,38 @@ def test_measured_files_sorts_filters_and_strips_comments(tmp_path):
     (root / "etc/ssh").mkdir(parents=True)
     (root / "etc/ssh/sshd_config").write_text("cfg")
     (root / "etc/hostname").write_text("h")
-    (root / "etc/link").symlink_to(root / "etc/hostname")  # symlink must be skipped
+    (root / "etc/ssh/link").symlink_to(root / "etc/hostname")  # symlink must be skipped
     conf = tmp_path / "conf"
-    conf.write_text("/etc/ssh\n/etc/hostname\n# a comment\n\n")
+    conf.write_text("/etc/ssh\n/etc/hostname   # inline comment\n# a comment\n\n")
 
-    entries = rr._measured_files(str(root), str(conf))
-    rels = [e[0] for e in entries]
+    _, entries = rr.rtmr3_chain(str(root), str(conf))
+    rels = [e[1] for e in entries]
 
     assert rels == sorted(rels)  # sorted by root-relative path
-    assert "/etc/hostname" in rels
+    assert "/etc/hostname" in rels  # inline comment stripped, path still resolved
     assert "/etc/ssh/sshd_config" in rels
-    assert "/etc/link" not in rels  # symlink filtered out
+    assert "/etc/ssh/link" not in rels  # symlink inside a measured dir filtered out
 
 
 def test_measured_files_empty_conf_raises(tmp_path):
     conf = tmp_path / "conf"
     conf.write_text("# only comments\n\n")
     with pytest.raises(rr.MeasurementError, match="no paths configured"):
-        rr._measured_files(str(tmp_path), str(conf))
+        rr.rtmr3_chain(str(tmp_path), str(conf))
+
+
+def test_symlinked_conf_entry_is_refused(tmp_path):
+    """A conf entry that is itself a symlink used to be followed by the shell walkers
+    and skipped by the Python ones; it is now an error on both sides."""
+    root = tmp_path / "root"
+    (root / "etc").mkdir(parents=True)
+    (root / "etc/real").write_text("x")
+    (root / "etc/link").symlink_to(root / "etc/real")
+    conf = tmp_path / "conf"
+    conf.write_text("/etc/real\n/etc/link\n")
+
+    with pytest.raises(rr.MeasurementError, match="symlink"):
+        rr.rtmr3_chain(str(root), str(conf))
 
 
 # ── RTMR1 / RTMR2 ──────────────────────────────────────────────────────────────

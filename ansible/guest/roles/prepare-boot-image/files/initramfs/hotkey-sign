@@ -28,7 +28,7 @@ HOTKEY_SEED="/run/chutes/miner-seed"
 hotkey_stash_seed() {
     _hk_src="$1/miner-seed"
     [ -f "$_hk_src" ] || return 1
-    mkdir -m 700 -p /run/chutes
+    mkdir -m 0700 -p /run/chutes
     cp "$_hk_src" "$HOTKEY_SEED"
     chmod 600 "$HOTKEY_SEED"
     [ -n "$(hotkey_ss58)" ] || return 1

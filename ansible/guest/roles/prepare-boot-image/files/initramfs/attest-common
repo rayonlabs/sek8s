@@ -75,6 +75,9 @@ generate_vm_root_ca() {
     export OPENSSL_CONF=/dev/null
 
     mkdir -p /tmp
+    # First thing on either boot path to touch /run/chutes, so this sets its mode.
+    # Explicit because `mkdir -m` does not apply to intermediates created by `-p`.
+    mkdir -m 0700 -p /run/chutes
     mkdir -m 700 -p "$CA_DIR"
 
     # Fresh 4096-bit CA each boot — TDX-encrypted DRAM only, never on disk. Subject
@@ -388,8 +391,12 @@ fetch_luks_key() {
 }
 
 # ── Persist ephemeral /run/chutes state for later init-bottom scripts ─────────
+# 0700 is deliberate and load-bearing: the services that need a subtree here get it
+# bound into a private tmpfs by their unit, so nothing reaches it by traversal. Set
+# explicitly at every creation site -- `mkdir -m` does not apply to `-p` intermediates,
+# so this used to land on the umask default and every later `-m` was a silent no-op.
 write_boot_state() {
-    mkdir -m 700 -p /run/chutes
+    mkdir -m 0700 -p /run/chutes
     echo "$VM_NAME" > /run/chutes/vm-name
     echo "$HOTKEY" > /run/chutes/hotkey
     if [ -n "$LUKS_QUOTE_NONCE" ]; then

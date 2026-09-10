@@ -161,7 +161,7 @@ provision_request() {
 # (though debug always has the static key, so it never hits that path).
 write_k3s_encryption_config() {
     local config_path="/run/chutes/k3s-encryption-config.yaml"
-    mkdir -m 700 -p /run/chutes
+    mkdir -m 0700 -p /run/chutes
 
     if [ -z "$K3S_ENCRYPTION_KEY" ]; then
         handle_failure "k3s encryption key not available — VM cannot run k3s securely"

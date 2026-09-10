@@ -3,6 +3,7 @@ import logging
 import os
 import stat
 from contextlib import asynccontextmanager
+from functools import wraps
 from typing import Dict, Optional
 from urllib.parse import urljoin
 
@@ -19,7 +20,6 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from loguru import logger
 from sek8s_common.auth import authorize
-from sek8s_common.log_config import configure_logging
 from sek8s_common.server import WebServer
 
 SERVICE_NAMESPACE = os.getenv("WORKLOAD_NAMESPACE", "chutes")
@@ -101,6 +101,21 @@ class SharedProxyResources:
 class BaseProxyServer(WebServer):
     """Base proxy server with shared functionality."""
 
+    @staticmethod
+    def _error_detail(generic: str, exc: BaseException, expose: bool) -> str:
+        """The upstream error text, but only for a caller allowed to see it.
+
+        An httpx error carries the address it was dialling, so this is gated per ROUTE
+        rather than per port. Port is the wrong granularity: the external app also
+        serves `/server/health` with no authentication at all, and `/server/devices`
+        with `allow_miner=True` — the miner being the party the guest keeps tenants
+        from. Only the two validator-only routes pass ``expose=True``, because the
+        validator cannot log into the guest and would otherwise have to ask the miner
+        to fetch the journal for it. Everyone else gets the fixed string; the detail is
+        logged either way.
+        """
+        return f"{generic}: {exc}" if expose else generic
+
     def __init__(
         self,
         config: AttestationProxyConfig,
@@ -142,6 +157,7 @@ class BaseProxyServer(WebServer):
         body: bytes = b"",
         params: Optional[Dict[str, str]] = None,
         use_unix_socket: bool = False,
+        expose_errors: bool = False,
     ) -> Response:
         """Proxy request with automatic retry on connection errors."""
 
@@ -221,14 +237,16 @@ class BaseProxyServer(WebServer):
             if use_unix_socket:
                 self.shared.consecutive_socket_failures += 1
             raise HTTPException(
-                status_code=502, detail=f"Proxy request failed: {str(e)}"
+                status_code=502,
+                detail=self._error_detail("Upstream unavailable", e, expose_errors),
             )
         except Exception as e:
             logger.error(f"Unexpected error proxying to {full_url}: {e}")
             if use_unix_socket:
                 self.shared.consecutive_socket_failures += 1
             raise HTTPException(
-                status_code=500, detail=f"Internal proxy error: {str(e)}"
+                status_code=500,
+                detail=self._error_detail("Internal proxy error", e, expose_errors),
             )
 
     async def health_check(self):
@@ -265,13 +283,17 @@ class BaseProxyServer(WebServer):
 
     async def not_found_handler(self, request: Request, exc):
         """Custom 404 handler"""
+        # The path is the caller's own input, so echoing it reveals nothing -- but
+        # reflecting request input into a response body is a shape worth not having.
         return Response(
-            content=f"Proxy route not found: {request.url.path}",
+            content="Proxy route not found",
             status_code=404,
             media_type="text/plain",
         )
 
-    async def proxy_to_host_service(self, path: str, request: Request):
+    async def proxy_to_host_service(
+        self, path: str, request: Request, *, expose_errors: bool = False
+    ):
         """Proxy requests to host attestation service via Unix socket"""
         method = request.method
         body = await request.body()
@@ -290,9 +312,17 @@ class BaseProxyServer(WebServer):
             body=body,
             params=params,
             use_unix_socket=True,
+            expose_errors=expose_errors,
         )
 
-    async def proxy_to_service(self, service_name: str, path: str, request: Request):
+    async def proxy_to_service(
+        self,
+        service_name: str,
+        path: str,
+        request: Request,
+        *,
+        expose_errors: bool = False,
+    ):
         """Proxy requests to K8s workload services"""
         if not service_name.replace("-", "").replace("_", "").isalnum():
             raise HTTPException(status_code=400, detail="Invalid service name")
@@ -318,7 +348,38 @@ class BaseProxyServer(WebServer):
             body=body,
             params=params,
             use_unix_socket=False,
+            expose_errors=expose_errors,
         )
+
+
+def attach_hotkey_headers(handler):
+    """Attach the miner-hotkey proof-of-possession to this endpoint's response.
+
+    Drop this on an endpoint whose response the validator reads the proof from, alongside its
+    authorize() dependency. Opt-in per endpoint by design: the proof signs {ss58}:{nonce}:"tee"
+    and nothing about the request, and the API resolves `purpose` ahead of `payload_hash`, so it
+    is a bearer credential good on every purpose="tee" route for its freshness window. A route
+    that does not need it must not carry it, and omitting it where it IS needed fails loudly
+    (attestation is rejected) rather than leaking silently.
+
+    A decorator and not a Depends() on purpose: FastAPI merges headers set on an injected Response
+    only when it serializes the handler's return value, and these handlers return a Response
+    object directly, which FastAPI passes through verbatim — so a dependency's headers are
+    silently discarded. Wrapping the return value is what actually works.
+    """
+
+    @wraps(handler)
+    async def wrapper(self, *args, **kwargs):
+        response = await handler(self, *args, **kwargs)
+        if self._miner_keypair is None or response.status_code >= 400:
+            return response
+        ss58, nonce, signature = sign_response(self._miner_keypair)
+        response.headers["X-Chutes-Hotkey"] = ss58
+        response.headers["X-Chutes-Nonce"] = nonce
+        response.headers["X-Chutes-Signature"] = signature
+        return response
+
+    return wrapper
 
 
 class ExternalProxyServer(BaseProxyServer):
@@ -344,9 +405,9 @@ class ExternalProxyServer(BaseProxyServer):
     async def proxy_request(self, *args, **kwargs) -> Response:
         """Proxy request and attach an X-Signature header for key-possession proof.
 
-        When a miner seed is configured, also stamp EVERY response with a miner-hotkey
-        proof-of-possession (X-Chutes-Hotkey/Nonce/Signature); the validator consumes it where it
-        needs one (e.g. the runtime rc-measurement gate). Absent the seed the headers are omitted.
+        X-Signature covers the response body, so it is bound to what it signs and is safe on every
+        response. The miner-hotkey proof-of-possession is NOT attached here -- see
+        attach_hotkey_headers.
         """
         response = await super().proxy_request(*args, **kwargs)
         assert (
@@ -355,11 +416,6 @@ class ExternalProxyServer(BaseProxyServer):
         response.headers["X-Signature"] = sign_response_body(
             self._private_key, response.body
         )
-        if self._miner_keypair is not None:
-            ss58, nonce, signature = sign_response(self._miner_keypair)
-            response.headers["X-Chutes-Hotkey"] = ss58
-            response.headers["X-Chutes-Nonce"] = nonce
-            response.headers["X-Chutes-Signature"] = signature
         return response
 
     def _setup_routes(self):
@@ -403,15 +459,21 @@ class ExternalProxyServer(BaseProxyServer):
     ):
         return await self.proxy_to_host_service(path="devices", request=request)
 
+    @attach_hotkey_headers
     async def proxy_to_host_service_authenticated(
         self,
         path: str,
         request: Request,
         _auth: bool = Depends(authorize(allow_validator=True, purpose="attest")),
     ):
-        """Proxy to host service with validator auth"""
-        return await self.proxy_to_host_service(path, request)
+        """Proxy to host service with validator auth.
 
+        Carries the hotkey PoP: this is the route GET /server/attest lands on, and verify_server
+        reads the proof off that response.
+        """
+        return await self.proxy_to_host_service(path, request, expose_errors=True)
+
+    @attach_hotkey_headers
     async def proxy_to_service_authenticated(
         self,
         service_name: str,
@@ -419,12 +481,28 @@ class ExternalProxyServer(BaseProxyServer):
         request: Request,
         _auth: bool = Depends(authorize(allow_validator=True, purpose="attest")),
     ):
-        """Proxy to K8s service with validator auth"""
-        return await self.proxy_to_service(service_name, path, request)
+        """Proxy to K8s service with validator auth.
+
+        Carries the hotkey PoP: chute evidence is fetched through here and the rc gate reads the
+        proof off that response.
+        """
+        return await self.proxy_to_service(
+            service_name, path, request, expose_errors=True
+        )
 
 
 class InternalProxyServer(BaseProxyServer):
-    """Internal proxy server with no authentication (NetworkPolicy enforced)."""
+    """Internal proxy server with no authentication (NetworkPolicy enforced).
+
+    Chute pods reach this port for one thing: the attestation service, which this proxy
+    forwards to over a unix socket. It deliberately does NOT expose `/service/{name}`.
+    That route dials another pod's :8002 in the workload namespace, and the netpolicies
+    permit exactly that hop (chute-proxy-access admits the proxy to chute pods on 8002)
+    while the chute egress policy exists to stop chutes reaching each other directly —
+    so serving it unauthenticated here would make this proxy the relay that policy is
+    written to prevent. The authenticated copy on the external port serves the
+    third-party attestation flow and is unaffected.
+    """
 
     def __init__(
         self, config: AttestationProxyConfig, shared_resources: SharedProxyResources
@@ -443,12 +521,6 @@ class InternalProxyServer(BaseProxyServer):
             methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
         )
 
-        self.app.add_api_route(
-            "/service/{service_name}/{path:path}",
-            self.proxy_to_service,
-            methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
-        )
-
         self.app.add_exception_handler(404, self.not_found_handler)
 
         logger.info(f"Internal server routes configured (port {INTERNAL_PORT})")
@@ -460,7 +532,6 @@ def run():
         os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
         config = AttestationProxyConfig()
-        configure_logging(config.debug)
 
         if config.debug:
             logging.getLogger().setLevel(logging.DEBUG)

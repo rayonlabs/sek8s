@@ -75,14 +75,10 @@ ipv6_enabled: true
 
 # Module Security Configuration
 enable_module_security: true
-enable_module_signing: true
 
 # Attestation settings
-attestation_endpoint: "{{ lookup('env', 'ATTESTATION_ENDPOINT') | default('https://api.example.com/attestation', true) }}"
-attestation_interval: 300  # 5 minutes
 
 # Module monitoring
-module_monitoring_enabled: true
 alert_on_unsigned_modules: true
 alert_on_tainted_kernel: true
 

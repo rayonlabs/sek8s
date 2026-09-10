@@ -5,7 +5,6 @@ After=local-fs-pre.target
 Before=setup-cache.service
 Before=cloud-final.service
 Before=k3s.service
-Before=k3s-agent.service
 Before=snapd.service
 OnFailure=poweroff.target
 

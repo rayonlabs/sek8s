@@ -12,7 +12,6 @@ chute_log_shipper_validator_base_url: "https://cvm.chutes.ai"
 chute_log_shipper_namespace: "chutes"
 chute_log_shipper_label_selector: "chutes/chute=true"
 chute_log_shipper_container_name: "chute"
-chute_log_shipper_buffer_bytes: 1048576
 chute_log_shipper_poll_interval: 10
 chute_log_shipper_batch_max_lines: 500
 chute_log_shipper_batch_max_bytes: 1048576

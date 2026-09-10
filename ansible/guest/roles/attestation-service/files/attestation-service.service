@@ -8,6 +8,14 @@ Requires=attestation-service-init.service
 Type=simple
 User=tdx-attest
 Group=tdx-attest
+
+# providers/tdx.py:_get_cert_hash reads proxy-tls/server.crt to bind the quote to the
+# cert this VM serves. /run/chutes is 0700, so shadow it with a private tmpfs and bind
+# in just that subtree; a bind alone cannot cross the 0700 parent. mode is explicit:
+# tmpfs defaults to 1777. The proxy pod reads the same directory via a kubelet hostPath
+# mount, which is unaffected because kubelet is root.
+TemporaryFileSystem=/run/chutes:ro,mode=0755
+BindReadOnlyPaths=-/run/chutes/proxy-tls
 WorkingDirectory=/opt/sek8s
 
 # Use virtual environment

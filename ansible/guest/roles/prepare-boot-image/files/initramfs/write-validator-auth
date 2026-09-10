@@ -111,7 +111,7 @@ if [ -n "$SS58_INVALID" ]; then
 fi
 
 # /run/chutes/ already exists (created by fetch_key_and_unlock), but ensure it.
-mkdir -m 700 -p /run/chutes
+mkdir -m 0700 -p /run/chutes
 
 # Write the env file into the initramfs /run tmpfs (mode 600 — root only)
 printf 'ALLOWED_VALIDATORS=%s\n' "$VALIDATOR_SS58" > "$VALIDATOR_AUTH_ENV"

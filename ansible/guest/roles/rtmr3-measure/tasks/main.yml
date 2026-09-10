@@ -76,6 +76,69 @@
     - /tmp/tdx-rtmr-extend.c
     - /tmp/tdx-rtmr-extend
 
+# ── Install the shared measurement implementation ───────────────────────────
+# tdx-measure decides WHICH files are measured, in WHAT ORDER, and HOW each is hashed.
+# The initramfs measurer (via the hook), prepare-boot-image's manifest generator,
+# rtmr3-verify and the host-side measurement predictor all run this one script. Four
+# separate walkers of this conf used to exist and they disagreed four ways; keeping
+# exactly one is the fix. /usr/local/bin is RTMR3-measured, so the script is covered by
+# the measurement it produces.
+#
+# Source of truth is the chutes-cvm package, because that is the copy which must ship
+# standalone (bundled into the wheel, so a `pip install chutes-cvm` on a host can
+# predict a guest measurement with no checkout). The guest gets the same bytes copied
+# out of this checkout at build time — one authored file, not a vendored pair.
+
+- name: Remove immutable flag from tdx-measure (idempotency)
+  ansible.builtin.shell: chattr -i /usr/local/bin/tdx-measure 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Install tdx-measure
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/src/chutes-cvm/chutes_cvm/scripts/tdx-measure"
+    dest: /usr/local/bin/tdx-measure
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Set tdx-measure immutable
+  ansible.builtin.command: chattr +i /usr/local/bin/tdx-measure
+  changed_when: false
+
+# The Python half — the chain fold and a parser for tdx-measure's output. Installed to
+# /usr/local/lib (RTMR3-measured) rather than into the sek8s venv, because rtmr3-verify
+# runs on the system interpreter before k3s and /opt/sek8s/venv is outside the
+# measured-path list. Same file as the host-side predictor imports, for the same reason
+# as tdx-measure above.
+
+- name: Create /usr/local/lib/sek8s
+  ansible.builtin.file:
+    path: /usr/local/lib/sek8s
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Remove immutable flag from the rtmr3 helper module (idempotency)
+  ansible.builtin.shell: chattr -i /usr/local/lib/sek8s/rtmr3.py 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Install the rtmr3 helper module
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/src/chutes-cvm/chutes_cvm/measurement/rtmr3.py"
+    dest: /usr/local/lib/sek8s/rtmr3.py
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Set the rtmr3 helper module immutable
+  ansible.builtin.command: chattr +i /usr/local/lib/sek8s/rtmr3.py
+  changed_when: false
+
 # ── Detect VM type from installed components ─────────────────────────────────
 # Rather than requiring an explicit flag, we detect the VM type from what other
 # roles have already installed.  setup-storage-bind-mounts.sh is only present

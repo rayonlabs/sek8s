@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import List
 
 from loguru import logger
@@ -19,6 +20,25 @@ from .config import LogShipperConfig
 # tests) do `from ...crictl import CrictlError`.
 from .exceptions import CrictlError
 from .models import ChutePod
+
+# A k8s label value, per apiserver `IsValidLabelValue`: alphanumeric ends, dashes,
+# underscores and dots between, 63 bytes max.
+#
+# Re-asserted here rather than inherited, because `config_id` is concatenated into an
+# egress URL path (`config.logs_url`) that the shipper requests with the VM's mTLS
+# client identity. A `/` in that value is NOT escaped -- it is structural by the time
+# yarl parses the assembled string, and `..` is then resolved away, so the request
+# leaves `/instances/launch_config/` entirely. The apiserver refuses `/` in a label,
+# which is the only reason that is unreachable; nothing in this module said so, and
+# nothing here would notice if pod metadata ever arrived from somewhere else.
+#
+# Valid values already satisfy this by construction, so it rejects nothing real.
+_LABEL_VALUE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$")
+_LABEL_VALUE_MAX = 63
+
+
+def _is_label_value(value: str) -> bool:
+    return len(value) <= _LABEL_VALUE_MAX and bool(_LABEL_VALUE.match(value))
 
 
 async def run_crictl(config: LogShipperConfig, args: List[str]) -> str:
@@ -83,6 +103,20 @@ def parse_chute_pods(raw: str, config: LogShipperConfig) -> List[ChutePod]:
             continue
         if not (name and uid and config_id):
             continue
+        if not _is_label_value(config_id):
+            logger.warning(
+                f"Skipping chute pod {name}: config-id label is not a valid label "
+                f"value (length {len(config_id)})"
+            )
+            continue
+
+        deployment_id = labels.get(config.deployment_id_label, "")
+        if deployment_id and not _is_label_value(deployment_id):
+            logger.warning(
+                f"Skipping chute pod {name}: deployment-id label is not a valid "
+                f"label value (length {len(deployment_id)})"
+            )
+            continue
 
         pods.append(
             ChutePod(
@@ -90,7 +124,7 @@ def parse_chute_pods(raw: str, config: LogShipperConfig) -> List[ChutePod]:
                 name=name,
                 uid=uid,
                 namespace=namespace,
-                deployment_id=labels.get(config.deployment_id_label, ""),
+                deployment_id=deployment_id,
                 state=item.get("state", ""),
                 labels=labels,
             )

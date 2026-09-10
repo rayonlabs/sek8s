@@ -267,7 +267,7 @@ def _is_known_gpu(lspci_line: str) -> bool:
 
 
 def detect_nvidia_gpus() -> list[str]:
-    """Detect NVIDIA GPU BDFs via lspci (vendor 10de, device IDs from GpuProfile.pci_device_ids)."""
+    """Detect NVIDIA GPU BDFs via lspci (vendor 10de, device IDs from GpuProfile.pci_device_id)."""
     devices = []
     for line in _lspci_lines(_NVIDIA_VENDOR):
         parts = line.strip().split()

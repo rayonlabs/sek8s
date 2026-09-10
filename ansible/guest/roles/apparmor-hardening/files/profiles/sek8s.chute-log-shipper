@@ -1,8 +1,9 @@
 # vim: ft=apparmor
 # sek8s.chute-log-shipper — AppArmor profile for the chute-log-shipper service.
 # Applied via systemd AppArmorProfile= directive (not auto-attached).
-# Confines the service to exactly: chute pod logs, the CRI socket + k3s/crictl
-# wrapper, the registry-tls leaf, the cursor dir, and outbound network.
+# Confines the service to exactly: chute pod logs, the registry-tls leaf, the cursor
+# dir, and outbound network. The CRI socket is NOT reachable from this profile -- it
+# lives only in the crictl child profile, entered by exec'ing crictl-pods-helper.
 
 abi <abi/4.0>,
 
@@ -46,25 +47,14 @@ profile sek8s.chute-log-shipper flags=(enforce, attach_disconnected) {
   /var/lib/chute-log-shipper/ rw,
   /var/lib/chute-log-shipper/** rwk,
 
-  # CRI socket for `k3s crictl` (via the restricted wrapper).
-  /run/k3s/containerd/containerd.sock rw,
-
-  # Restricted crictl wrapper + the k3s binary it execs. /usr/local/bin/k3s is a symlink into the
-  # versioned data dir, and AppArmor mediates the RESOLVED path — so the real binary must be granted
-  # too, or the exec is denied in enforce. The k3s multi-call binary also shells out to the iptables
-  # backend on invocation (even for `crictl`), so those are granted to keep it functional; see the
-  # note below — a log reader touching iptables is worth revisiting.
-  /usr/local/bin/crictl-pods-helper rix,
-  /usr/local/bin/k3s mrix,
-  /var/lib/rancher/k3s/data/*/bin/k3s mrix,
-  /etc/rancher/k3s/config.yaml r,
-  /etc/machine-id r,
-  /bin/bash rix,
-
-  # crictl reads its config here to learn the CRI (containerd) socket endpoint; without it
-  # `crictl pods` dies at config load before it can query anything.
-  /var/lib/rancher/k3s/agent/etc/ r,
-  /var/lib/rancher/k3s/agent/etc/crictl.yaml r,
+  # Pod discovery transitions to the crictl child profile (defined below) rather than
+  # inheriting this one. The CRI socket is full control of containerd — pull, run and exec
+  # any image, bypassing admission and cosign entirely — so it must not be reachable from
+  # the long-running Python process that parses attacker-controlled log lines. `rix` would
+  # inherit, which is what made the wrapper's allowlist decorative: a process that can exec
+  # /usr/local/bin/k3s directly never goes through crictl-pods-helper. Same reasoning and
+  # same shape as `du`/`df` -> disk_diag in sek8s.system-manager.
+  /usr/local/bin/crictl-pods-helper cx -> crictl,
 
   # System libraries.
   /usr/lib/** rm,
@@ -89,7 +79,61 @@ profile sek8s.chute-log-shipper flags=(enforce, attach_disconnected) {
   network unix stream,
   network unix dgram,
 
-  # Subprocesses (the crictl wrapper / k3s) inherit this profile.
+  # Signals to the crictl child (it is the only subprocess).
   signal send peer=sek8s.chute-log-shipper,
   signal receive peer=sek8s.chute-log-shipper,
+  signal send peer=sek8s.chute-log-shipper//crictl,
+
+  # ── crictl child profile ──────────────────────────────────────────────────────────────
+  # Everything needed to run `k3s crictl {pods,ps} -o json` and nothing else. Entered ONLY
+  # by exec'ing crictl-pods-helper, whose case statement (crictl-pods-helper:13-35) is now a
+  # real boundary: the socket and the k3s binary exist only in here, so the allowlist cannot
+  # be sidestepped by exec'ing k3s directly.
+  profile crictl flags=(enforce, attach_disconnected) {
+    include <abstractions/base>
+    include <abstractions/nameservice>
+
+    # The wrapper is a #! script: both it and its interpreter must be reachable here.
+    # dash, not bash — bash would source $BASH_ENV inside this profile before the
+    # wrapper's allowlist ran, handing the CRI socket to whoever set it.
+    /usr/local/bin/crictl-pods-helper r,
+    /usr/bin/dash mrix,
+    /bin/dash mrix,
+
+    # /usr/local/bin/k3s is a symlink into the versioned data dir and AppArmor mediates the
+    # RESOLVED path, so the real binary must be granted too or the exec is denied in enforce.
+    /usr/local/bin/k3s mrix,
+    /var/lib/rancher/k3s/data/*/bin/k3s mrix,
+
+    # The CRI socket, and the config that tells crictl where to find it.
+    /run/k3s/containerd/containerd.sock rw,
+    /etc/chute-log-shipper/crictl.yaml r,
+    /etc/rancher/k3s/config.yaml r,
+    /var/lib/rancher/k3s/agent/etc/ r,
+    /var/lib/rancher/k3s/agent/etc/crictl.yaml r,
+    /etc/machine-id r,
+
+    # The k3s multi-call binary shells out to its iptables backend even for `crictl`. It is
+    # not granted: the calls fail, the failures are non-fatal, and a log reader has no
+    # business touching the firewall. Denials from that path are expected noise.
+
+    /usr/lib/** rm,
+    /usr/local/lib/** rm,
+    /etc/ld.so.cache r,
+    /etc/ld.so.conf r,
+    /etc/ld.so.conf.d/** r,
+
+    @{PROC}/** r,
+    @{sys}/** r,
+    /dev/null rw,
+    /dev/tty rw,
+    /dev/urandom r,
+    owner @{PROC}/@{pid}/fd/ r,
+
+    # Connecting to the containerd socket.
+    network unix stream,
+    network unix dgram,
+
+    signal receive peer=sek8s.chute-log-shipper,
+  }
 }

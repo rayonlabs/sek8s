@@ -20,12 +20,6 @@ This guide covers setting up a baremetal host to launch TDX-enabled VMs with GPU
 | 26.04  | B200         | 8         | Validated           | Host-side Fabric Manager. CX7 NVSwitch bridge PFs stay on host. See [Blackwell HGX notes](#blackwell-hgx-notes). |
 | 26.04  | RTX Pro 6000 | 8         | Validated           | No NVSwitch. Intel DCAP attestation. |
 
-Print the canonical matrix from the repo:
-```bash
-cd host-tools/scripts
-chutes-cvm host setup --topology-matrix
-```
-
 #### Blackwell HGX notes
 
 B200 and B300 use a different NVSwitch architecture from H100/H200. `chutes-cvm host setup` detects and configures both, but only **B200** is in the [validated topologies](#validated-host-topologies) above — B300 host setup works the same way but has not yet been validated end-to-end. Key differences that affect host setup:

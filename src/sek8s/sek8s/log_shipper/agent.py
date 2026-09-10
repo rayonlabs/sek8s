@@ -1,15 +1,21 @@
-"""Orchestrator: poll CRI for chute pods, run one capture task per pod, and
-reconcile the offset checkpoints to the live pod set.
+"""Watch for chute pods and keep one shipper alive per pod.
 
-The agent is fail-closed: a crictl error or a dead validator endpoint never
-crashes the loop — it logs, backs off, and retries on the next poll.
+    while True:
+        pods = list_chute_pods()
+        start a shipper for each new pod, stop the ones whose pod is gone
+        sleep
+
+The agent deals in pods and shippers and nothing below that: a shipper owns its own
+task, and the reader inside it owns files and offsets. Fail-closed by construction —
+a crictl error or a dead validator never breaks the loop, it logs and retries on the
+next poll.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ssl
-from typing import Dict, List, Optional, Set, cast
+from typing import Dict, List, Optional, cast
 
 import aiohttp
 from loguru import logger
@@ -35,118 +41,79 @@ def build_ssl_context(config: LogShipperConfig) -> ssl.SSLContext:
 
 
 class LogShipperAgent:
-    """Discovers chute pods and manages their per-pod capture tasks."""
+    """Discovers chute pods and keeps their capture running."""
 
     def __init__(self, config: LogShipperConfig):
         self._config = config
         self._checkpoints = CheckpointStore(config.checkpoint_path)
-        # config_id -> running capture task
-        self._tasks: Dict[str, asyncio.Task] = {}
-        # config_id -> pod being captured (for logging)
-        self._pods: Dict[str, ChutePod] = {}
-        # config_ids whose capture finished (stop/backstop) — not re-spawned while live
-        self._done: Set[str] = set()
-        self._session: Optional[aiohttp.ClientSession] = None  # set in run()
+        # config_id -> shipper. Holds finished shippers too; see _sync.
+        self._shippers: Dict[str, PodLogShipper] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
 
     async def run(self) -> None:
         await self._checkpoints.load()
-        context = build_ssl_context(self._config)
-        connector = aiohttp.TCPConnector(ssl=context)
+        connector = aiohttp.TCPConnector(ssl=build_ssl_context(self._config))
         async with aiohttp.ClientSession(connector=connector) as session:
             self._session = session
             try:
                 while True:
-                    await self._poll_once()
+                    await self._poll()
                     await asyncio.sleep(self._config.poll_interval_seconds)
             finally:
-                await self._shutdown()
+                await self._stop_all()
 
-    async def _poll_once(self) -> None:
+    async def _poll(self) -> None:
+        """One discovery pass. A failed pass changes nothing and retries later."""
         try:
             pods = await list_chute_pods(self._config)
         except CrictlError as exc:
-            logger.warning("Pod discovery failed (will retry): {}", exc)
+            logger.warning(f"Pod discovery failed (will retry): {exc}")
             return
+        await self._sync(pods)
+        await self._checkpoints.reconcile(pod.config_id for pod in pods)
 
-        live_ids = {pod.config_id for pod in pods}
-        self._reap_finished()
-        await self._drop_gone(live_ids)
-        self._spawn_new(pods, live_ids)
-        await self._checkpoints.reconcile(live_ids)
+    async def _sync(self, pods: List[ChutePod]) -> None:
+        """Start a shipper for each new pod; stop the ones whose pod has gone.
 
-    def _reap_finished(self) -> None:
-        """Move completed tasks out of the active set."""
-        for config_id, task in list(self._tasks.items()):
-            if not task.done():
-                continue
-            self._tasks.pop(config_id, None)
-            self._pods.pop(config_id, None)
-            if task.cancelled():
-                continue
-            exc = task.exception()
-            if exc is not None:
-                logger.error(
-                    "Capture task for config_id={} errored: {}", config_id, exc
-                )
-            self._done.add(config_id)
+        A finished shipper stays in the map. Its `running` is False, but the key is
+        still there, and that is what stops us restarting capture the validator
+        deliberately ended for a pod that is still present. The key goes only when the
+        pod does — so one map answers both "am I capturing this?" and "have I already
+        handled this?", with no second set to keep in step.
+        """
+        live = {pod.config_id: pod for pod in pods}
 
-    async def _drop_gone(self, live_ids: Set[str]) -> None:
-        """Cancel captures and forget state for pods that have disappeared."""
-        tracked = set(self._tasks) | self._done
-        for config_id in tracked - live_ids:
-            task = self._tasks.pop(config_id, None)
-            if task is not None and not task.done():
-                task.cancel()
-            self._pods.pop(config_id, None)
-            self._done.discard(config_id)
-            await self._checkpoints.evict(config_id)
+        for config_id in [c for c in self._shippers if c not in live]:
+            await self._shippers.pop(config_id).stop()
 
-    def _spawn_new(self, pods: List[ChutePod], live_ids: Set[str]) -> None:
-        """Start capture tasks for newly-seen pods, respecting the concurrency cap."""
-        candidates = [
-            pod
-            for pod in pods
-            if pod.config_id not in self._tasks and pod.config_id not in self._done
+        pending = [
+            pod for config_id, pod in live.items() if config_id not in self._shippers
         ]
-        available = self._config.max_concurrent_pods - len(self._tasks)
-        if available <= 0:
-            if candidates:
-                logger.warning(
-                    "At capture capacity ({} pods); deferring {} pod(s) to a later poll",
-                    self._config.max_concurrent_pods,
-                    len(candidates),
-                )
+        if not pending:
             return
-        if len(candidates) > available:
+
+        # Finished shippers hold no resources, so only running ones count against the cap.
+        capacity = self._config.max_concurrent_pods - sum(
+            1 for shipper in self._shippers.values() if shipper.running
+        )
+        if capacity < len(pending):
             logger.warning(
-                "At capture capacity ({} pods); starting {} of {} new pod(s), deferring the rest",
-                self._config.max_concurrent_pods,
-                available,
-                len(candidates),
+                f"At capture capacity ({self._config.max_concurrent_pods} pods); "
+                f"starting {max(capacity, 0)} of {len(pending)} new pod(s), "
+                f"deferring the rest to a later poll"
             )
-        for pod in candidates[:available]:
-            self._pods[pod.config_id] = pod
-            self._tasks[pod.config_id] = asyncio.create_task(self._capture(pod))
+        for pod in pending[: max(capacity, 0)]:
+            shipper = PodLogShipper(
+                pod,
+                self._config,
+                cast(aiohttp.ClientSession, self._session),
+                self._checkpoints,
+            )
+            shipper.start()
+            self._shippers[pod.config_id] = shipper
 
-    async def _capture(self, pod: ChutePod) -> None:
-        # Captures are only spawned from _poll_once, which runs inside run() after
-        # the session is created — so this is always set here.
-        session = cast(aiohttp.ClientSession, self._session)
-        shipper = PodLogShipper(self._config, session, pod, self._checkpoints)
-        await shipper.run()
-
-    async def _shutdown(self) -> None:
-        tasks = list(self._tasks.values())
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        for task in tasks:
-            try:
-                await task
-            except (
-                asyncio.CancelledError,
-                Exception,
-            ):  # noqa: BLE001 - best-effort drain
-                pass
-        self._tasks.clear()
-        self._pods.clear()
+    async def _stop_all(self) -> None:
+        shippers = list(self._shippers.values())
+        self._shippers.clear()
+        for shipper in shippers:
+            await shipper.stop()

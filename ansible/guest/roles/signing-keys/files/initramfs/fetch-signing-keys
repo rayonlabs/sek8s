@@ -83,7 +83,7 @@ KEY_NAMES=$(printf '%s' "$BUNDLE" | jq -r '.keys | keys[]' 2>/dev/null)
 
 # ── Prepare output directories ───────────────────────────────────────────────
 
-mkdir -p /run/chutes
+mkdir -m 0700 -p /run/chutes
 mkdir -p "$OUTPUT_DIR/cosign"
 chmod 755 "$OUTPUT_DIR" "$OUTPUT_DIR/cosign"
 

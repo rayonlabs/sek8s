@@ -14,7 +14,6 @@ import sys
 
 from chutes_cvm import proc
 from chutes_cvm.host.profiles import PPA, APTRepo, HostProfile, resolve_profile
-from chutes_cvm.host.support_matrix import format_topology_matrix
 
 # Fabric Manager version must match the NVIDIA driver version in the guest
 # image.  FM communicates with GPU firmware shared between host and guest;
@@ -776,11 +775,6 @@ def main(argv: "list[str] | None" = None) -> int:
         description="Set up TDX host for confidential GPU computing",
     )
     parser.add_argument(
-        "--topology-matrix",
-        action="store_true",
-        help="Print lab-validated Ubuntu × GPU × count combinations and exit",
-    )
-    parser.add_argument(
         "--noninteractive",
         action="store_true",
         help=(
@@ -791,10 +785,6 @@ def main(argv: "list[str] | None" = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.topology_matrix:
-        print(format_topology_matrix())
-        return 0
-
     try:
         profile = resolve_profile()
     except (ValueError, RuntimeError) as e:
@@ -802,12 +792,6 @@ def main(argv: "list[str] | None" = None) -> int:
         return 1
 
     setup_host(profile, noninteractive=args.noninteractive)
-    print()
-    print(
-        "Validated hardware topologies are listed in the support matrix "
-        "(not every OS profile × GPU SKU has been lab-tested):"
-    )
-    print("  chutes-cvm host setup --topology-matrix")
     return 0
 
 

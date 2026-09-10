@@ -121,22 +121,27 @@ deny contains msg if {
     msg := sprintf("Ephemeral container '%s' requests dangerous capability", [container.name])
 }
 
-# Check for dangerous capabilities
-dangerous_capabilities := {
-    "SYS_ADMIN",
-    "SYS_CHROOT",
-    "SYS_MODULE",
-    "SYS_RAWIO",
-    "SYS_PTRACE",
-    "SYS_BOOT",
-    "MAC_ADMIN",
-    "MAC_OVERRIDE",
-}
+# Capabilities a workload may request. An ALLOWLIST, not a denylist: the previous 8-name denylist
+# admitted every capability outside it -- DAC_READ_SEARCH, DAC_OVERRIDE, NET_ADMIN, SETUID,
+# SYS_RESOURCE, LINUX_IMMUTABLE -- and admitted the literal "ALL" as well, since "ALL" is not a
+# capability name and so never matched. That matters because the user-workload seccomp profile is
+# SCMP_ACT_ALLOW by default with a 22-syscall denylist: it blocks mount(2) but not the newer
+# fsopen/fsconfig/fsmount/move_mount/open_tree, and does not block name_to_handle_at or
+# open_by_handle_at. So DAC_READ_SEARCH alone reads arbitrary inodes on the guest root, and
+# SYS_ADMIN reconstitutes mounting around the blocked syscall.
+#
+#   IPC_LOCK          -- chute containers lock model weights into memory
+#   NET_BIND_SERVICE  -- bind below port 1024; the sole addition Kubernetes' restricted PSS permits
+allowed_capabilities := {"IPC_LOCK", "NET_BIND_SERVICE"}
+
+# Kubernetes accepts "SYS_ADMIN", "CAP_SYS_ADMIN" and lowercase spellings, and containerd
+# normalises before applying them. Compare on the canonical bare-uppercase form so no spelling
+# reaches the container unchecked.
+normalized_capability(cap) := trim_prefix(upper(cap), "CAP_")
 
 has_dangerous_capability(container) if {
     cap := container.securityContext.capabilities.add[_]
-    normalized := trim_prefix(cap, "CAP_")
-    normalized in dangerous_capabilities
+    not normalized_capability(cap) in allowed_capabilities
 }
 
 
@@ -594,6 +599,53 @@ deny contains msg if {
     msg := sprintf("Container '%s' uses forbidden environment variable '%s'", [container.name, env.name])
 }
 
+# The three rules above walk spec.containers only. Init and ephemeral containers were omitted, and
+# cache-init is the one container permitted to run as uid 0 — so LD_PRELOAD there is root code
+# execution on a signed image, using a field the policy never read.
+non_main_containers(spec) := array.concat(
+    object.get(spec, "initContainers", []),
+    object.get(spec, "ephemeralContainers", []),
+)
+
+deny contains msg if {
+    input.request.operation in ["CREATE", "UPDATE"]
+    not helpers.is_rollout_restart
+    helpers.is_pod_resource
+    not helpers.is_system_or_controller_user
+
+    input.request.kind.kind == "Pod"
+    container := non_main_containers(input.request.object.spec)[_]
+    env := container.env[_]
+    is_forbidden_env_var(env.name)
+    msg := sprintf("Container '%s' uses forbidden environment variable '%s'", [container.name, env.name])
+}
+
+deny contains msg if {
+    input.request.operation in ["CREATE", "UPDATE"]
+    not helpers.is_rollout_restart
+    helpers.is_pod_resource
+    not helpers.is_system_or_controller_user
+
+    input.request.kind.kind in ["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"]
+    container := non_main_containers(input.request.object.spec.template.spec)[_]
+    env := container.env[_]
+    is_forbidden_env_var(env.name)
+    msg := sprintf("Container '%s' uses forbidden environment variable '%s'", [container.name, env.name])
+}
+
+deny contains msg if {
+    input.request.operation in ["CREATE", "UPDATE"]
+    not helpers.is_rollout_restart
+    helpers.is_pod_resource
+    not helpers.is_system_or_controller_user
+
+    input.request.kind.kind == "CronJob"
+    container := non_main_containers(input.request.object.spec.jobTemplate.spec.template.spec)[_]
+    env := container.env[_]
+    is_forbidden_env_var(env.name)
+    msg := sprintf("Container '%s' uses forbidden environment variable '%s'", [container.name, env.name])
+}
+
 # List of forbidden environment variables (customize as needed)
 is_forbidden_env_var(name) if {
     name in [
@@ -609,6 +661,12 @@ is_forbidden_env_var(name) if {
 # Allow certain environment variables that are needed
 allowed_env_vars := {
     "HF_TOKEN",
+    # cache-cleaner init container (chutes-miner build_chute_job)
+    "CACHE_MAX_AGE_DAYS",
+    "CACHE_MAX_SIZE_GB",
+    "CLEANUP_EXCLUDE",
+    # downward-API node name, used by chutes-miner chart init containers
+    "NODE_NAME",
     "CUDA_VISIBLE_DEVICES",
     "NVIDIA_VISIBLE_DEVICES",
     "CHUTES_NVIDIA_DEVICES",

@@ -39,6 +39,7 @@ chutes_is_cache_cleaner_init(container) if {
 chutes_effective_run_as_user(container, pod_spec) := uid if {
 	uid := container.securityContext.runAsUser
 }
+
 chutes_effective_run_as_user(container, pod_spec) := uid if {
 	not container.securityContext.runAsUser
 	uid := pod_spec.securityContext.runAsUser
@@ -51,6 +52,7 @@ chutes_container_runs_root_denied(container, pod_spec, is_init_container) if {
 	chutes_effective_run_as_user(container, pod_spec) == 0
 	not is_init_container
 }
+
 chutes_container_runs_root_denied(container, pod_spec, is_init_container) if {
 	chutes_effective_run_as_user(container, pod_spec) == 0
 	is_init_container
@@ -108,7 +110,6 @@ deny contains msg if {
 	msg := sprintf("Chutes namespace: ephemeral container '%s' must not run as root (runAsUser: 0)", [container.name])
 }
 
-
 # Same for workload templates (Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob)
 deny contains msg if {
 	chutes_apply_pod_spec_rules
@@ -148,7 +149,6 @@ deny contains msg if {
 	msg := sprintf("Chutes namespace: init container '%s' must not run as root (runAsUser: 0)", [container.name])
 }
 
-
 deny contains msg if {
 	chutes_apply_pod_spec_rules
 	input.request.namespace == "chutes"
@@ -186,7 +186,6 @@ deny contains msg if {
 	chutes_container_runs_root_denied(container, input.request.object.spec.template.spec, true)
 	msg := sprintf("Chutes namespace: init container '%s' must not run as root (runAsUser: 0)", [container.name])
 }
-
 
 deny contains msg if {
 	chutes_apply_pod_spec_rules
@@ -226,7 +225,6 @@ deny contains msg if {
 	msg := sprintf("Chutes namespace: init container '%s' must not run as root (runAsUser: 0)", [container.name])
 }
 
-
 # =============================================================================
 # CHUTES NAMESPACE: runAsNonRoot FOR NON-CHUTE WORKLOADS
 # =============================================================================
@@ -240,6 +238,7 @@ chutes_is_chute_workload if {
 	input.request.kind.kind == "Pod"
 	input.request.object.metadata.labels["chutes/chute"] == "true"
 }
+
 chutes_is_chute_workload if {
 	input.request.namespace == "chutes"
 	input.request.kind.kind == "Job"
@@ -284,7 +283,6 @@ deny contains msg if {
 	not input.request.object.spec.jobTemplate.spec.template.spec.securityContext.runAsNonRoot
 	msg := "Chutes namespace: pod spec must set securityContext.runAsNonRoot: true (chute workloads excepted)"
 }
-
 
 # =============================================================================
 # CHUTES NAMESPACE: NO SERVICE ACCOUNT TOKEN
@@ -659,9 +657,9 @@ deny contains msg if {
 # authentication — NOT ownerReferences, which are user-settable metadata and could be
 # forged by a miner to bypass this policy.
 
-chutes_is_allowed_volume_type(volume) if { volume.hostPath }
-chutes_is_allowed_volume_type(volume) if { volume.emptyDir != null }
-chutes_is_allowed_volume_type(volume) if { volume.projected }
+chutes_is_allowed_volume_type(volume) if volume.hostPath
+chutes_is_allowed_volume_type(volume) if volume.emptyDir != null
+chutes_is_allowed_volume_type(volume) if volume.projected
 
 deny contains msg if {
 	chutes_apply_pod_spec_rules
@@ -859,4 +857,311 @@ deny contains msg if {
 	input.request.operation in ["CREATE", "UPDATE", "DELETE"]
 	not helpers.is_system_or_controller_user
 	msg := sprintf("Chutes namespace: ConfigMap operations restricted to system controllers (user '%s' denied)", [input.request.userInfo.username])
+}
+
+# =============================================================================
+# CHUTES NAMESPACE: NO LIFECYCLE HOOKS
+# =============================================================================
+# The command rules exist so only the signed image's code runs. A lifecycle hook voids that: it
+# takes arbitrary argv, is never matched by chutes_deny_container (which reads only
+# container.command), and runs as a separate process even when the entrypoint aborts. Worst on
+# cache-init, whose root carve-out assumes only its own entrypoint runs.
+# Flat deny — no legitimate chute spec sets one. Probe exec is constrained separately below.
+
+chutes_all_containers(spec) := array.concat(
+	array.concat(
+		object.get(spec, "containers", []),
+		object.get(spec, "initContainers", []),
+	),
+	object.get(spec, "ephemeralContainers", []),
+)
+
+chutes_lifecycle_msg(container) := sprintf(
+	"Chutes namespace: container '%s' must not set lifecycle hooks (postStart/preStop); only the image entrypoint may execute",
+	[container.name],
+)
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	input.request.kind.kind == "Pod"
+	helpers.is_pod_resource
+	some container in chutes_all_containers(input.request.object.spec)
+	container.lifecycle
+	msg := chutes_lifecycle_msg(container)
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	input.request.kind.kind in ["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"]
+	helpers.is_pod_resource
+	some container in chutes_all_containers(input.request.object.spec.template.spec)
+	container.lifecycle
+	msg := chutes_lifecycle_msg(container)
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	input.request.kind.kind == "CronJob"
+	helpers.is_pod_resource
+	some container in chutes_all_containers(input.request.object.spec.jobTemplate.spec.template.spec)
+	container.lifecycle
+	msg := chutes_lifecycle_msg(container)
+}
+
+# =============================================================================
+# CHUTES NAMESPACE: PROBE EXEC MUST BE A PLAIN LOCALHOST CURL
+# =============================================================================
+# Same primitive as a lifecycle hook, but it cannot be blocked: the chute's middleware
+# authenticates every request except from 127.0.0.1, so kubelet's httpGet probe (which dials the pod
+# IP) is rejected and the probe must run inside the pod.
+#
+# So pin the shape. Port and path stay free; everything else is fixed. The regex is fully anchored
+# because the command is a shell string — unanchored, `curl -f http://127.0.0.1:8000/x; <anything>`
+# passes. Flags that read/write files or redirect the request (-o, -T, -K, -d) are excluded.
+# httpGet/tcpSocket probes are untouched: kubelet runs those, no code in the container.
+
+chutes_probe_command_allowed(command) if {
+	count(command) == 3
+	command[0] == "/bin/sh"
+	command[1] == "-c"
+	regex.match(`^curl( -[fsS]{1,3}| --fail| --silent| --show-error| -m [0-9]{1,3}| --max-time [0-9]{1,3})* http://127\.0\.0\.1:[0-9]{1,5}(/[A-Za-z0-9._~/-]*)?( \|\| exit [0-9]{1,3})?$`, command[2])
+}
+
+# The exec probes a container declares that are not a plain localhost curl.
+chutes_bad_probe_exec(container) if {
+	some probe_name in ["readinessProbe", "livenessProbe", "startupProbe"]
+	probe := object.get(container, probe_name, {})
+	exec_action := object.get(probe, "exec", {})
+	exec_action != {}
+	not chutes_probe_command_allowed(object.get(exec_action, "command", []))
+}
+
+chutes_probe_msg(container) := sprintf(
+	"Chutes namespace: container '%s' probe exec must be a plain localhost curl (/bin/sh -c 'curl -f http://127.0.0.1:<port>/<path> || exit 1')",
+	[container.name],
+)
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	input.request.kind.kind == "Pod"
+	helpers.is_pod_resource
+	some container in chutes_all_containers(input.request.object.spec)
+	chutes_bad_probe_exec(container)
+	msg := chutes_probe_msg(container)
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	input.request.kind.kind in ["Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job"]
+	helpers.is_pod_resource
+	some container in chutes_all_containers(input.request.object.spec.template.spec)
+	chutes_bad_probe_exec(container)
+	msg := chutes_probe_msg(container)
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	input.request.kind.kind == "CronJob"
+	helpers.is_pod_resource
+	some container in chutes_all_containers(input.request.object.spec.jobTemplate.spec.template.spec)
+	chutes_bad_probe_exec(container)
+	msg := chutes_probe_msg(container)
+}
+
+# =============================================================================
+# CHUTES NAMESPACE: NO PROJECTED VOLUMES ON CHUTE WORKLOADS
+# =============================================================================
+# `projected` is a container for exactly the source types the volume allowlist denies: secret,
+# configMap, downwardAPI and serviceAccountToken. The last one is the reason this matters —
+# automountServiceAccountToken: false only suppresses the auto-injected volume, so an explicitly
+# declared serviceAccountToken source still gets a live kube API token. Untrusted chute code must
+# not reach the API at all; job management is the miner's own granted right, exercised with the
+# miner's credentials, not something a chute pod inherits.
+#
+# Non-chute pods in the namespace keep projected: failed-chute-cleanup (deployed into the guest by
+# sek8s from the chutes-miner-gpu chart) legitimately needs a serviceAccountToken source, and is not
+# labelled chutes/chute=true. Chute workloads use only hostPath and emptyDir.
+
+chutes_projected_msg(name) := sprintf(
+	"Chutes namespace: chute workload may not use a projected volume ('%s'); projected sources include serviceAccountToken, which bypasses automountServiceAccountToken: false",
+	[name],
+)
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	helpers.is_pod_resource
+	not helpers.is_system_or_controller_user
+	chutes_is_chute_workload
+	input.request.kind.kind == "Pod"
+	some volume in input.request.object.spec.volumes
+	volume.projected
+	msg := chutes_projected_msg(volume.name)
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	helpers.is_pod_resource
+	not helpers.is_system_or_controller_user
+	chutes_is_chute_workload
+	input.request.kind.kind == "Job"
+	some volume in input.request.object.spec.template.spec.volumes
+	volume.projected
+	msg := chutes_projected_msg(volume.name)
+}
+
+# =============================================================================
+# CHUTES NAMESPACE: CHUTE WORKLOADS MAY NOT CHOOSE A SERVICE ACCOUNT
+# =============================================================================
+# Nothing restricted spec.serviceAccountName, so a chute could name any SA in the namespace. The
+# `agent` SA holds secrets get/list/watch in chutes, and 03-k3s-miner-credentials.sh reconciles
+# miner-credentials -- which contains the miner seed -- into that namespace. Combined with a
+# projected serviceAccountToken source (denied above) that was a direct read of the seed over the
+# kube API. Denying both independently means neither step alone suffices.
+#
+# Real chute specs set no serviceAccountName, so they run as `default`, which has no RoleBinding.
+
+chutes_sa_msg(name) := sprintf(
+	"Chutes namespace: chute workload may not select serviceAccountName '%s'; chutes run as the unprivileged default account",
+	[name],
+)
+
+chutes_bad_service_account(spec) := name if {
+	name := object.get(spec, "serviceAccountName", "default")
+	name != "default"
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	helpers.is_pod_resource
+	not helpers.is_system_or_controller_user
+	chutes_is_chute_workload
+	input.request.kind.kind == "Pod"
+	msg := chutes_sa_msg(chutes_bad_service_account(input.request.object.spec))
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	helpers.is_pod_resource
+	not helpers.is_system_or_controller_user
+	chutes_is_chute_workload
+	input.request.kind.kind == "Job"
+	msg := chutes_sa_msg(chutes_bad_service_account(input.request.object.spec.template.spec))
+}
+
+# =============================================================================
+# A CHUTE WORKLOAD MUST BE CAPTURABLE BY THE LOG SHIPPER
+# =============================================================================
+# The shipper runs inside the attested guest precisely so the untrusted miner cannot
+# turn it off. It could, though: the miner authors the pod spec, and the shipper finds
+# a pod by its `chutes/config-id` label and reads only the container named "chute".
+# Omit the label and the pod is invisible; name the container something else and its
+# log directory is never opened. Neither cost the miner anything, because nothing else
+# in the guest consulted either value -- so the two assumptions the shipper was built
+# on are enforced here rather than merely documented.
+#
+# The label must be on the POD, which is what the shipper reads back off CRI: on the
+# pod itself, or on a Job's spec.template.metadata.
+
+chutes_workload_containers := object.get(input.request.object.spec, "containers", []) if {
+	input.request.kind.kind == "Pod"
+}
+
+chutes_workload_containers := object.get(input.request.object.spec.template.spec, "containers", []) if {
+	input.request.kind.kind == "Job"
+}
+
+chutes_workload_pod_labels := object.get(input.request.object.metadata, "labels", {}) if {
+	input.request.kind.kind == "Pod"
+}
+
+chutes_workload_pod_labels := object.get(input.request.object.spec.template.metadata, "labels", {}) if {
+	input.request.kind.kind == "Job"
+}
+
+chutes_has_main_container if {
+	container := chutes_workload_containers[_]
+	container.name == "chute"
+}
+
+# Non-empty, because the shipper skips a pod whose config_id is falsy -- an empty
+# label hides it just as completely as a missing one.
+chutes_has_config_id if {
+	object.get(chutes_workload_pod_labels, "chutes/config-id", "") != ""
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	helpers.is_pod_resource
+	chutes_is_chute_workload
+	not chutes_has_main_container
+	msg := "Chutes namespace: a chute workload must have a container named 'chute' (the log shipper captures only that container)"
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	helpers.is_pod_resource
+	chutes_is_chute_workload
+	not chutes_has_config_id
+	msg := "Chutes namespace: a chute workload must carry a non-empty 'chutes/config-id' label (the log shipper discovers pods by it)"
+}
+
+# =============================================================================
+# A CHUTE WORKLOAD MAY NOT SUPPLY CONTAINER ARGS
+# =============================================================================
+# `command` is tightly restricted above, but Kubernetes gives the pod author two ways
+# to shape argv: when `command` is omitted, `args` replaces the image's CMD and is
+# passed to its ENTRYPOINT. Restricting one and not the other enforced half of the
+# entrypoint guarantee.
+#
+# Denied outright rather than pattern-matched, because nothing legitimate sets it: the
+# real spec builder gives neither cache-init nor chute a `command` or an `args` — both
+# run their image entrypoint and are configured entirely through env. A chute that
+# genuinely needs trailing arguments still has the sanctioned route, `command` starting
+# with ["chutes", "run"].
+#
+# Covers init and ephemeral containers too: that is where the design intent is
+# strictest ("image entrypoint only") and where an arbitrary argv would be least visible.
+
+chutes_workload_all_containers contains container if {
+	some container in chutes_workload_containers
+}
+
+chutes_workload_all_containers contains container if {
+	input.request.kind.kind == "Pod"
+	some container in object.get(input.request.object.spec, "initContainers", [])
+}
+
+chutes_workload_all_containers contains container if {
+	input.request.kind.kind == "Pod"
+	some container in object.get(input.request.object.spec, "ephemeralContainers", [])
+}
+
+chutes_workload_all_containers contains container if {
+	input.request.kind.kind == "Job"
+	some container in object.get(input.request.object.spec.template.spec, "initContainers", [])
+}
+
+deny contains msg if {
+	chutes_apply_pod_spec_rules
+	input.request.namespace == "chutes"
+	helpers.is_pod_resource
+	chutes_is_chute_workload
+	some container in chutes_workload_all_containers
+	container.args
+	msg := sprintf(
+		"Chutes namespace: container '%s' must not set args (use the image entrypoint; a chute passes trailing arguments via command)",
+		[container.name],
+	)
 }

@@ -48,7 +48,7 @@ else
     # downstream startup runs unchanged — write-validator-auth, 03-k3s-validator-auth.sh
     # and system-manager all see a credential exactly as in prod, needing no debug
     # branches. A debug VM never serves real traffic, so this allow-list entry is inert.
-    mkdir -m 700 -p /run/chutes
+    mkdir -m 0700 -p /run/chutes
     printf '%s' "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" > /run/chutes/validator-ss58
     chmod 600 /run/chutes/validator-ss58
     log_msg "debug attestation fail-open: wrote dummy validator-ss58 for normal downstream startup"

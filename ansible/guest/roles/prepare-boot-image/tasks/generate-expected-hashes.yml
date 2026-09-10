@@ -19,10 +19,23 @@
 # same absolute paths the boot-time lookup (expected_hash_for) matches on.
 - name: Generate /etc/tdx-rtmr3-expected-hashes over the finalized root
   ansible.builtin.shell: |
+    set -euo pipefail
     root="{{ newroot_mount }}"
     root="${root%/}"
     conf="$root/etc/tdx-measure.conf"
     out="$root/etc/tdx-rtmr3-expected-hashes"
+
+    # Both the file set and the hashes come from tdx-measure, the SAME script the
+    # initramfs measurer runs at boot, so this manifest cannot disagree with what
+    # RTMR3 is actually extended with. It owns the parse, the LC_ALL=C ordering, the
+    # symlinked-entry refusal and the content-only `sha384sum < file` hashing; this
+    # task only swaps the two fields into the manifest's <path> <hash> layout.
+    # Hashing BEFORE touching $out so a bad conf fails the build with the previous
+    # manifest intact — build is where such a problem should surface, not boot.
+    hashes=$(mktemp)
+    trap 'rm -f "$hashes"' EXIT
+    "$root/usr/local/bin/tdx-measure" hash "$root" "$conf" > "$hashes"
+
     chattr -i "$out" 2>/dev/null || true
     {
       printf '# Expected SHA-384 hashes for canonical files, verified at boot.\n'
@@ -30,19 +43,9 @@
       printf '# measured file is hashed in its true on-disk state — nothing excluded. Baked into\n'
       printf '# the initramfs (covered by RTMR1); a boot-time mismatch powers the VM off.\n'
       printf '# Format: <absolute-path> <sha384hex>\n'
-      grep -v '^[[:space:]]*#' "$conf" | grep -v '^[[:space:]]*$' | while IFS= read -r path; do
-        full="$root$path"
-        if [ -f "$full" ]; then
-          printf '%s %s\n' "$path" "$(sha384sum "$full" | awk '{ print $1 }')"
-        elif [ -d "$full" ]; then
-          # LC_ALL=C: sort is locale-sensitive, so collation differences between build hosts (or
-          # a changed locale on the same host) would reorder these lines, changing the bytes of
-          # this file, the initramfs that embeds it, and therefore RTMR2 — with no content change.
-          find "$full" -type f | LC_ALL=C sort | while IFS= read -r f; do
-            printf '%s %s\n' "${f#"$root"}" "$(sha384sum "$f" | awk '{ print $1 }')"
-          done
-        fi
-      done
+      while IFS= read -r line; do
+        printf '%s %s\n' "${line#* }" "${line%% *}"
+      done < "$hashes"
     } > "$out"
     chattr +i "$out"
   args:

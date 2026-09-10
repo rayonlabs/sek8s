@@ -25,7 +25,7 @@
 
 # ── Registry mTLS leaf: shared group + consumer wiring (self-contained) ───────
 # This role owns the registry-client-leaf access story end to end, mirroring the
-# signing-keys role. The leaf is minted root:root under 0755 /run/chutes by the
+# signing-keys role. The leaf is minted root:root under 0700 /run/chutes by the
 # setup_vm_tls script above; here we create the shared registry-tls group, a
 # boot-time perms unit that chgrp's the leaf to it, and SupplementaryGroups
 # drop-ins granting each consumer group membership. Wiring consumers via drop-ins
