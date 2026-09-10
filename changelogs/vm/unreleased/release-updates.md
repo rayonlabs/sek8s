@@ -1,9 +1,3 @@
-### Fixed
-
-- The TDX quote provider now validates the supplied nonce (exactly 64 hex characters) and asserts
-  the assembled REPORTDATA is exactly 128 hex characters, instead of truncating it. A malformed
-  nonce is rejected with HTTP 400 rather than producing a quote.
-
 ### Changed
 
 - Admission control now restricts which container may mount the shared cache root. The
@@ -59,46 +53,36 @@
   how `rtmr3-verify.service` is already anchored. Neither service can start unless every sek8s
   profile is loaded in enforce mode.
 
-- Rebuilt the chute log shipper around three parts with one job each: an agent that watches
-  for pods, a shipper per pod that ships until the validator says stop, and a reader that
-  turns log files into batches. Reading and shipping were previously interleaved in one
-  class, which is how two defects hid in it.
+- Chute workloads must now declare a container named `chute` and a non-empty
+  `chutes/config-id` label. The in-guest log shipper finds a chute pod by that label and
+  reads only that container, so a pod spec missing either was captured by nothing —
+  and because the pod spec is authored outside the guest, that was a way to opt out of
+  log capture entirely. Nothing else consulted either value, so neither omission was
+  visible before. Real chute specs already set both.
 
-  A chute could permanently stall its own log capture, and every other pod's with it. A
-  single log line longer than the read window never contains its terminating record, so the
-  shipper withheld it, never advanced its offset, and re-read the same bytes forever — while
-  never yielding, which starved the shared event loop and stopped capture for every pod on
-  the host. Such a line is now truncated to the configured maximum and shipped, so capture
-  always moves forward.
+- `/etc/chute-log-shipper` is now covered by the RTMR3 measurement. It holds the validator
+  URL logs are sent to and the settings that decide which pods are captured, and it was the
+  only sek8s service configuration left out — so an edit to it was the one that would not
+  have shown up in the measurement.
 
-  A pod could also lose ground it had already made: when a read stopped early on its size
-  limit, the offsets of files it had not yet reached were discarded and those files were
-  re-shipped from the beginning. Offsets are now retired only when the log file itself is
-  gone.
+- `/usr/lib` is now covered by the RTMR3 measurement on both images. The measured set
+  previously included the system binaries but not the shared libraries those binaries load
+  — half the executable surface, and the one the confined services are granted read and
+  execute access to. It also brings the kernel modules on disk into the measurement, which
+  the boot-time measurement did not reach. Costs roughly ten seconds of boot.
 
-  Delivery remains at-least-once and the request rate against the validator is now bounded,
-  with progress committed only once the validator has accepted a batch.
-
-- **Config**: `BUFFER_BYTES` is retired. `BATCH_MAX_BYTES` now bounds both the batch and the
-  per-pod memory ceiling, because only one batch is held at a time. Existing images are
-  unaffected — unknown settings are ignored — but the setting no longer does anything.
+- Chute workloads may no longer set container `args`. Overriding a container's command was
+  already blocked, but Kubernetes offers two ways to shape what a container runs: with the
+  command omitted, `args` replaces the image's own default and is handed to its entrypoint.
+  Restricting one and not the other enforced half the guarantee. Real chute specs set no args
+  at all: the init container runs its image entrypoint configured by environment variables,
+  and the chute container uses the sanctioned command form, which already carries the
+  arguments it needs.
+  No image shipped today acts on such arguments, so nothing was exploitable; the rule closes
+  the asymmetry so a future image that does act on them cannot slip through unnoticed.
+  Applies to main, init and ephemeral containers; other pods in the namespace are unaffected.
 
 ### Fixed
-
-- The log shipper now checks the pod labels it reads before using them. One of them becomes
-  part of the address it sends logs to, and the guest signs that request with the identity
-  proving it is a genuine confidential VM — so a label containing a path separator would have
-  redirected an authenticated request somewhere it was never meant to go. Kubernetes already
-  rejects such labels, which is why this was not reachable; the shipper now rejects them too
-  rather than relying on a component two layers away. Pods with unusable labels are skipped
-  and their siblings keep shipping.
-
-- The log shipper no longer writes exception messages into its journal. That journal is
-  readable by the miner through the status API, and the service handles chute log output —
-  so an exception that quoted the value that caused it would hand tenant data to the
-  operator it is kept from. Failures now report the error's type and location instead. The
-  parser that turns raw bytes into log lines is also now covered by tests asserting it never
-  raises, since that is what makes the rest of this safe.
 
 - `/run/chutes` is now unreadable except to the services that declare what they need from
   it. Its permissions decide whether four non-root services can reach secrets like the mTLS
@@ -142,6 +126,25 @@
   `tdx-measure` script, which also refuses a symlinked conf entry outright rather than resolving it
   differently in different places. Measured values are unchanged for the current path list.
 
+- Fixed a trap in the measured-file list: a directory and a file beneath it could both be
+  listed, and those files were then measured twice. Nothing was left uncovered, but the
+  measurement depended on that redundancy — removing an entry that looked superfluous would
+  have changed the measurement, and a mismatch powers the machine off, so a tidy-up would
+  have stopped every VM booting and looked like tampering. Each file is now measured once
+  however the list names it.
+
+- Cluster-init secrets are now staged root-only. Three secrets are copied into a temporary
+  directory for the one boot step that needs each, then removed — but they were copied
+  world-readable into a world-traversable directory, widening files that are otherwise
+  owner-only for as long as that step ran. Every step already runs as root, so nothing
+  needed the wider access.
+
+- The two units that fix up permissions under `/run/chutes` now run their tools directly
+  instead of through `/bin/sh`. A shell there auto-attaches the AppArmor profile written for
+  stray and escaped shells, which denies reading that directory, so any recursive walk failed
+  unless the unit happened to run before AppArmor loaded. `registry-tls-config` was not
+  failing — all its arguments are named paths — but the trap is removed so a future recursive
+  change cannot hit it, where the group it sets is load-bearing.
 
 ### Removed
 
@@ -151,33 +154,6 @@
   `setup-cache.service` was the only unit whose sole ordering constraint was the dead one, and now
   orders against the real service. Also removed an unused `workers` group_vars file, which
   contained only commented-out examples and never loaded.
-
-- Chute workloads must now declare a container named `chute` and a non-empty
-  `chutes/config-id` label. The in-guest log shipper finds a chute pod by that label and
-  reads only that container, so a pod spec missing either was captured by nothing —
-  and because the pod spec is authored outside the guest, that was a way to opt out of
-  log capture entirely. Nothing else consulted either value, so neither omission was
-  visible before. Real chute specs already set both.
-
-- `/etc/chute-log-shipper` is now covered by the RTMR3 measurement. It holds the validator
-  URL logs are sent to and the settings that decide which pods are captured, and it was the
-  only sek8s service configuration left out — so an edit to it was the one that would not
-  have shown up in the measurement.
-
-- `/usr/lib` is now covered by the RTMR3 measurement on both images. The measured set
-  previously included the system binaries but not the shared libraries those binaries load
-  — half the executable surface, and the one the confined services are granted read and
-  execute access to. It also brings the kernel modules on disk into the measurement, which
-  the boot-time measurement did not reach. Costs roughly ten seconds of boot.
-
-- Fixed a trap in the measured-file list: a directory and a file beneath it could both be
-  listed, and those files were then measured twice. Nothing was left uncovered, but the
-  measurement depended on that redundancy — removing an entry that looked superfluous would
-  have changed the measurement, and a mismatch powers the machine off, so a tidy-up would
-  have stopped every VM booting and looked like tampering. Each file is now measured once
-  however the list names it.
-
-### Removed
 
 - Removed the boot-time unit that re-grouped the fetched signing keys, along with the
   `chutes-keys` group it populated. Those keys are public verification keys, written
@@ -194,32 +170,3 @@
   misleading as well as unused. Twelve files, four unused variables and a README entry
   documenting a setting that configured nothing. The binary-attestation timer, which is
   installed and does run, is unaffected.
-
-- The system manager now installs the hardened log sink at startup. Its own journal is
-  readable by the miner, and it was the one service still running on the default handler —
-  which renders local variable values inside tracebacks. Nothing was exposing values in
-  practice, but the next error path added to that service would have.
-
-- Chute workloads may no longer set container `args`. Overriding a container's command was
-  already blocked, but Kubernetes offers two ways to shape what a container runs: with the
-  command omitted, `args` replaces the image's own default and is handed to its entrypoint.
-  Restricting one and not the other enforced half the guarantee. Real chute specs set no args
-  at all: the init container runs its image entrypoint configured by environment variables,
-  and the chute container uses the sanctioned command form, which already carries the
-  arguments it needs.
-  No image shipped today acts on such arguments, so nothing was exploitable; the rule closes
-  the asymmetry so a future image that does act on them cannot slip through unnoticed.
-  Applies to main, init and ephemeral containers; other pods in the namespace are unaffected.
-
-- Cluster-init secrets are now staged root-only. Three secrets are copied into a temporary
-  directory for the one boot step that needs each, then removed — but they were copied
-  world-readable into a world-traversable directory, widening files that are otherwise
-  owner-only for as long as that step ran. Every step already runs as root, so nothing
-  needed the wider access.
-
-- The two units that fix up permissions under `/run/chutes` now run their tools directly
-  instead of through `/bin/sh`. A shell there auto-attaches the AppArmor profile written for
-  stray and escaped shells, which denies reading that directory, so any recursive walk failed
-  unless the unit happened to run before AppArmor loaded. `registry-tls-config` was not
-  failing — all its arguments are named paths — but the trap is removed so a future recursive
-  change cannot hit it, where the group it sets is load-bearing.
