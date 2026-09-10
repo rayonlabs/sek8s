@@ -18,7 +18,7 @@
 #     patched QEMU in a container; see `chutes-cvm measurements generate`)
 #   - Installs libguestfs-tools (RTMR3 mounts the image root read-only;
 #     see `chutes-cvm measurements generate` / the standalone `rtmr3`)
-#   - Installs rustup for the build user (the guest build compiles the sr25519 initramfs
+#   - Installs rustup for build_user (the guest build compiles the sr25519 initramfs
 #     signer with the pinned toolchain + musl target from src/sr25519/rust-toolchain.toml)
 
 - name: Build host setup
@@ -32,31 +32,32 @@
     # a build needs ansible/guest/, guest-tools/, charts/ and src/ too, so this is a plain full clone.
     # sek8s_repo_url / sek8s_repo_branch come from playbooks/group_vars/all.yml.
     sek8s_build_root: /opt/sek8s
+    # Account that drives the guest image build; everything per-user (rustup, checkout ownership)
+    # is provisioned for it. Root by default — nbd/cryptsetup/virsh need it anyway. Home is read
+    # from passwd, never set separately, so the two cannot disagree.
+    build_user: root
   roles:
     - role: host_mirror
     - role: host_prerequisites
   tasks:
-    # ── Source checkout ────────────────────────────────────────────────────────
-    # The build writes into its own checkout (guest-tools/image/, measurements/,
-    # tdx-image-build.log) and is driven by the unprivileged login user, so the tree is owned by
-    # that user rather than root. Resolved by running `id` unprivileged instead of reading
-    # ansible_facts.env.*, which this become: true play gathers as root.
-    - name: Resolve the unprivileged build user
-      ansible.builtin.command: id -un
-      become: false
-      changed_when: false
-      register: _build_user
-
-    - name: Resolve the build user's home directory
+    # check_mode: false — every task below needs build_user_home.
+    - name: Read the passwd database (build user home)
       ansible.builtin.getent:
         database: passwd
-        key: "{{ _build_user.stdout | trim }}"
+      check_mode: false
 
-    - name: Set build user facts
+    - name: Assert the build user has a passwd entry
+      ansible.builtin.assert:
+        that: build_user in ansible_facts.getent_passwd
+        fail_msg: >-
+          build_user '{{ build_user }}' has no passwd entry on this host, so its home directory
+          cannot be resolved. Set build_user to an account that exists here.
+
+    - name: Resolve the build user's home
       ansible.builtin.set_fact:
-        build_user: "{{ _build_user.stdout | trim }}"
-        build_user_home: "{{ ansible_facts.getent_passwd[_build_user.stdout | trim][4] }}"
+        build_user_home: "{{ ansible_facts.getent_passwd[build_user][4] }}"
 
+    # ── Source checkout ────────────────────────────────────────────────────────
     - name: Create the sek8s checkout directory owned by the build user
       ansible.builtin.file:
         path: "{{ sek8s_build_root }}"
@@ -65,11 +66,8 @@
         group: "{{ build_user }}"
         mode: "0755"
 
+    # update: false — bootstrap only; a re-run must not move the operator's branch.
     - name: Clone the sek8s repo the build runs from
-      # Cloned as the build user so its own git credentials authenticate the private repo, and so
-      # it can `git pull` / switch branches afterwards without sudo. update: false — this is
-      # one-time bootstrap; once the checkout exists the operator drives git themselves, and a
-      # re-run of build-setup must not move their branch or discard work in progress.
       ansible.builtin.git:
         repo: "{{ sek8s_repo_url }}"
         dest: "{{ sek8s_build_root }}"
@@ -77,7 +75,7 @@
         update: false
       environment:
         GIT_TERMINAL_PROMPT: "0"   # fail fast on missing credentials instead of hanging on a prompt
-      become: false
+      become_user: "{{ build_user }}"
 
     - name: Report the build checkout
       ansible.builtin.debug:
@@ -114,14 +112,10 @@
         state: present
         update_cache: true
 
+    # Only rustup honors the pinned toolchain + musl target in src/sr25519/rust-toolchain.toml.
+    # --default-toolchain none: the sr25519 role installs the pinned one on first build.
+    # --no-modify-path: that role puts ~/.cargo/bin on PATH itself.
     - name: Install rustup for the build user (sr25519 guest-image signer)
-      # The sr25519 initramfs signer (src/sr25519) is built with a pinned toolchain + the musl
-      # target from its rust-toolchain.toml; only rustup honors that, and the guest build runs
-      # cargo as this (non-root) build user — so rustup is installed per-user here. The pinned
-      # toolchain and its musl target are provisioned on first build by the sr25519 role (in the
-      # crate dir, resolving rust-toolchain.toml), so no version is duplicated here. Installed with
-      # --default-toolchain none (the crate pins it) and --no-modify-path (the sr25519 role puts
-      # ~/.cargo/bin on PATH itself). Idempotent via `creates`.
       ansible.builtin.shell: |
         set -o pipefail
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -129,7 +123,26 @@
       args:
         creates: "{{ build_user_home }}/.rustup"
         executable: /bin/bash
-      become: false
+      become_user: "{{ build_user }}"
+      environment:
+        HOME: "{{ build_user_home }}"
+        RUSTUP_HOME: "{{ build_user_home }}/.rustup"
+        CARGO_HOME: "{{ build_user_home }}/.cargo"
+
+    # Otherwise a wrong-user rustup only surfaces ~30 min into a build, as an sr25519 failure.
+    - name: Verify rustup is usable by the build user
+      ansible.builtin.command: "{{ build_user_home }}/.cargo/bin/rustup --version"
+      become_user: "{{ build_user }}"
+      environment:
+        RUSTUP_HOME: "{{ build_user_home }}/.rustup"
+        CARGO_HOME: "{{ build_user_home }}/.cargo"
+      changed_when: false
+
+    - name: Report the rustup install
+      ansible.builtin.debug:
+        msg: >-
+          rustup ready for {{ build_user }} at {{ build_user_home }}/.cargo/bin —
+          run the guest image build as {{ build_user }}.
 
     # NOTE: chutes-cvm is NOT installed here. The guest build (chutes-miner-vm.yml)
     # self-installs it from its own checkout (`pip install -e {{ repo_root }}/src/chutes-cvm`)

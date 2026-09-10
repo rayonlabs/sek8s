@@ -47,10 +47,8 @@ ubuntu_minor: "04"
 # baseline. Pinning it to an exact version makes the guest kernel reproducible and
 # bumps deliberate. Trade-off: opts out of automatic HWE kernel security updates.
 # MUST stay >= 6.16 (RTMR3 depends on the tsm-mr sysfs interface merged in 6.16).
-# This pin EXPIRES: noble-updates/-security carry only the newest HWE ABI, so a superseded
-# version stops resolving and the build fails with "no available installation candidate".
-# Check what the archive currently has before bumping:
-#   curl -s "https://people.canonical.com/~ubuntu-archive/madison.cgi?package=linux-image-generic-hwe-24.04&a=amd64&s=noble-updates&text=on"
+# Expires: the pocket keeps only the newest HWE ABI, so a superseded pin stops resolving. Current
+# version: people.canonical.com/~ubuntu-archive/madison.cgi?package=linux-image-generic-hwe-24.04
 guest_hwe_kernel_version: "7.0.0-31.31~24.04.1"
 # CUDA version - leave as-is unless skipping CUDA entirely (skip_cuda: true) for providers with pre-installed drivers
 cuda_version: "13-2"

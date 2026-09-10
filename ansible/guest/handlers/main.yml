@@ -34,11 +34,8 @@
   ansible.builtin.command:
     cmd: update-initramfs -u -k all
 
-# Ubuntu ships modular libvirt (virtqemud) on 24.04+ and monolithic libvirtd before it, so
-# restart whichever is present. These are two flat handlers sharing a `listen` topic rather than
-# one named block: a block in a handlers file is not notifiable by name — `notify: restart
-# libvirtd` fails with "The requested handler ... was not found". Handlers on a topic run in file
-# order, so the fallback still sees virtqemud_restart.
+# Modular libvirt (virtqemud) on 24.04+, monolithic before it. Two handlers on a `listen` topic,
+# not one named block — a block in a handlers file is not notifiable by name.
 - name: Restart virtqemud if present (modular libvirt)
   ansible.builtin.systemd:
     name: virtqemud

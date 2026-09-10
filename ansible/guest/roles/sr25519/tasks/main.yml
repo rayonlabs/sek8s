@@ -26,10 +26,12 @@
     - name: Require rustup (the pinned toolchain + musl target need it)
       ansible.builtin.fail:
         msg: >-
-          rustup not found on the build host. The sr25519 signer pins toolchain 1.94.0 and the
-          {{ sr25519_musl_target }} target via src/sr25519/rust-toolchain.toml — only rustup honors
-          that (apt's cargo ignores it and has no musl std, giving "can't find crate for core").
-          Provision it with `ansible-playbook playbooks/build-setup.yml`, then re-run.
+          rustup not found for {{ lookup('env', 'USER') | default('this account', true) }}
+          (searched {{ lookup('env', 'HOME') }}/.cargo/bin). rustup is per-user — build-setup.yml
+          installs it for build_user, so run the build as that account, or install it here:
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none.
+          Only rustup honors the pinned toolchain + {{ sr25519_musl_target }} target in
+          src/sr25519/rust-toolchain.toml (apt's cargo gives "can't find crate for core").
       when: _sr_rustup.rc != 0
 
     # In the crate dir so rustup resolves the pinned channel from rust-toolchain.toml and adds the
