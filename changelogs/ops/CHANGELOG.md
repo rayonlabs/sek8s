@@ -61,6 +61,12 @@ Versioned with CalVer `YYYY.MM.PATCH` via `changelogs/ops/VERSION`. Run `make pr
   Chutes API's accepted RC measurement). Thin `openssl` wrapper (`genpkey` + `pkey -pubout`) whose
   keys are compatible with the initramfs `rc-sign` signer and the API verifier
   (`openssl dgst -sha256 -sign`/`-verify`); it writes no config and registers nothing.
+- `build-setup.yml` now clones the sek8s repo the build runs from, into `sek8s_build_root`
+  (default `/opt/sek8s`) owned by the unprivileged login user. Provisioning a build host
+  previously left out the one thing the build needs most, so the source had to be fetched by
+  hand. The clone does not update an existing checkout — once it is there the operator owns
+  the branch — and it runs as the login user so that user's git credentials authenticate the
+  private repo.
 
 ### Changed
 - Pin host kernel to `linux-image-6.17.0-35-generic` in both Ubuntu 25.10 and
@@ -156,6 +162,13 @@ Versioned with CalVer `YYYY.MM.PATCH` via `changelogs/ops/VERSION`. Run `make pr
   phase to the os_upgrade role (runs on the new OS after reboot, before
   `setup-tdx-host`).
 - Add `xfsprogs` to host prerequisites so `mkfs.xfs` is available when `create-cache.sh` creates the storage volume (regression introduced in #34 when the storage volume format was switched from ext4 to XFS)
+- `build-setup.yml` reinstalled rustup on every run, and would have skipped installing it for
+  the build user entirely had root ever had a `~/.rustup`. The idempotency check read
+  `ansible_facts.env.HOME`, which a `become: true` play gathers as root's home, while the
+  install itself runs unprivileged. Both now resolve the build user and its home explicitly.
+- `build-setup.yml`'s header said to run `setup.yml` first. That playbook provisions a
+  bare-metal host to *run* the guest VM — TDX bootstrap, PCCS, a host-tools-only checkout —
+  and has no place on a build host. The header now says the build-host setup is standalone.
 
 ### Removed
 - The bare-qcow2 launch path and `quick-launch --skip-checksum`. Every image — including

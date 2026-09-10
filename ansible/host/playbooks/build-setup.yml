@@ -1,11 +1,16 @@
 ---
 # One-time setup for a host used to build guest VM images.
-# Run this after setup.yml when provisioning a new build host.
+#
+# STANDALONE. A build host is not a miner TEE host: do NOT run setup.yml here. setup.yml
+# provisions a bare-metal host to *run* the guest VM (TDX bootstrap, PCCS, a sparse
+# host-tools-only checkout at /opt/sek8s); this playbook provisions a host to *build* the
+# image, and owns everything that needs, including the full sek8s checkout it builds from.
 #
 # Usage (from repo root or ansible/host):
 #   ansible-playbook -i inventory/hosts.yml playbooks/build-setup.yml
 #
 # What this does:
+#   - Clones the full sek8s repo the build runs from (see sek8s_build_root below)
 #   - Benchmarks Ubuntu apt mirrors and selects the fastest one
 #   - Installs host script dependencies (git, aria2, python3-yaml, python3-venv)
 #   - Installs Ansible for running the guest image build locally
@@ -20,10 +25,67 @@
   hosts: td_hosts
   gather_facts: true
   become: true
+  vars:
+    # Full checkout the guest image build runs from (`cd {{ sek8s_build_root }}/ansible/guest &&
+    # ansible-playbook playbooks/chutes-miner-vm.yml`). Distinct in purpose from the miner host's
+    # sek8s_remote_root, which install.sh sparse-fetches to host-tools/ + firmware/ + src/chutes-cvm/;
+    # a build needs ansible/guest/, guest-tools/, charts/ and src/ too, so this is a plain full clone.
+    # sek8s_repo_url / sek8s_repo_branch come from playbooks/group_vars/all.yml.
+    sek8s_build_root: /opt/sek8s
   roles:
     - role: host_mirror
     - role: host_prerequisites
   tasks:
+    # ── Source checkout ────────────────────────────────────────────────────────
+    # The build writes into its own checkout (guest-tools/image/, measurements/,
+    # tdx-image-build.log) and is driven by the unprivileged login user, so the tree is owned by
+    # that user rather than root. Resolved by running `id` unprivileged instead of reading
+    # ansible_facts.env.*, which this become: true play gathers as root.
+    - name: Resolve the unprivileged build user
+      ansible.builtin.command: id -un
+      become: false
+      changed_when: false
+      register: _build_user
+
+    - name: Resolve the build user's home directory
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ _build_user.stdout | trim }}"
+
+    - name: Set build user facts
+      ansible.builtin.set_fact:
+        build_user: "{{ _build_user.stdout | trim }}"
+        build_user_home: "{{ ansible_facts.getent_passwd[_build_user.stdout | trim][4] }}"
+
+    - name: Create the sek8s checkout directory owned by the build user
+      ansible.builtin.file:
+        path: "{{ sek8s_build_root }}"
+        state: directory
+        owner: "{{ build_user }}"
+        group: "{{ build_user }}"
+        mode: "0755"
+
+    - name: Clone the sek8s repo the build runs from
+      # Cloned as the build user so its own git credentials authenticate the private repo, and so
+      # it can `git pull` / switch branches afterwards without sudo. update: false — this is
+      # one-time bootstrap; once the checkout exists the operator drives git themselves, and a
+      # re-run of build-setup must not move their branch or discard work in progress.
+      ansible.builtin.git:
+        repo: "{{ sek8s_repo_url }}"
+        dest: "{{ sek8s_build_root }}"
+        version: "{{ sek8s_repo_branch | default('main') }}"
+        update: false
+      environment:
+        GIT_TERMINAL_PROMPT: "0"   # fail fast on missing credentials instead of hanging on a prompt
+      become: false
+
+    - name: Report the build checkout
+      ansible.builtin.debug:
+        msg: >-
+          Build from: cd {{ sek8s_build_root }}/ansible/guest &&
+          ansible-playbook playbooks/chutes-miner-vm.yml
+
+    # ── Build toolchain ────────────────────────────────────────────────────────
     - name: Install Ansible
       ansible.builtin.apt:
         name: ansible
@@ -65,7 +127,7 @@
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
           | sh -s -- -y --no-modify-path --default-toolchain none
       args:
-        creates: "{{ ansible_facts.env.HOME }}/.rustup"
+        creates: "{{ build_user_home }}/.rustup"
         executable: /bin/bash
       become: false
 

@@ -533,6 +533,12 @@ Both failures were invisible on debug images, which load the sek8s profiles in c
   unless the unit happened to run before AppArmor loaded. `registry-tls-config` was not
   failing — all its arguments are named paths — but the trap is removed so a future recursive
   change cannot hit it, where the group it sets is load-bearing.
+- The guest image build no longer aborts at "Configure libvirt to enable dynamic ownership"
+  with `The requested handler 'restart libvirtd' was not found`. The handler that restarts
+  libvirt was written as a named block, and a block in a handlers file is not notifiable by
+  name — so the very first build task that touched libvirt config failed the run outright. It
+  is now two handlers sharing a `listen` topic, which keeps the existing modular-libvirt
+  (`virtqemud`) first, monolithic (`libvirtd`) fallback behaviour.
 
 ### Removed
 - Hard-coded validator SS58 (`5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ`) removed from all Ansible role defaults (`common`, `admission-controller`, `attestation-service`, `system-manager`) and inventory files (`ansible/guest/inventory.yml`, `local/inventory.prod.yml`). The `validator` Ansible variable is no longer used anywhere in the guest image build.
