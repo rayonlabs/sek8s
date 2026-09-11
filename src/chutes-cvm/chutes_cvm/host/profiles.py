@@ -78,13 +78,11 @@ class HostProfile(ABC):
     @property
     @abstractmethod
     def kernel_package(self) -> str:
-        """Pinned kernel image package (e.g. 'linux-image-6.17.0-35-generic').
+        """Pinned kernel image package (e.g. 'linux-image-7.0.0-31-generic').
 
-        Must be a concrete versioned package, not a metapackage like
-        linux-image-generic, so that every host in the fleet installs the
-        exact same kernel.  RTMR0 measurements depend on the host kernel
-        version — unpinned kernels cause attestation failures when hosts
-        diverge after routine apt upgrades.
+        Concrete version, not a metapackage, so the whole fleet runs the identical kernel.
+        Fleet determinism only — the host kernel is not an RTMR0 input. Expires when the
+        pocket drops the ABI; `apt-cache policy linux-image-generic` finds the current one.
         """
         ...
 
@@ -145,7 +143,7 @@ class Ubuntu2604Profile(HostProfile):
 
     @property
     def kernel_package(self) -> str:
-        return "linux-image-6.17.0-35-generic"
+        return "linux-image-7.0.0-31-generic"
 
     @property
     def packages(self) -> list[str]:

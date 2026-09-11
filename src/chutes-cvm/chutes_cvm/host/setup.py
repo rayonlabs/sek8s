@@ -30,6 +30,22 @@ def _run(cmd: list[str], **kwargs):
     proc.run(cmd, check=True, **kwargs)
 
 
+def _assert_kernel_available(kernel_package: str) -> None:
+    """Fail legibly when the pinned kernel has aged out of the archive."""
+    result = proc.run(
+        ["apt-cache", "show", kernel_package], capture_output=True, text=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise SystemExit(
+            f"ERROR: the pinned kernel {kernel_package} is not available in this release's "
+            "archive.\n"
+            "       Pockets carry only the newest kernel ABI, so exact pins expire.\n"
+            "       Find the current one:  apt-cache policy linux-image-generic\n"
+            "       Then update kernel_package for this profile in "
+            "chutes_cvm/host/profiles.py."
+        )
+
+
 def _add_repo(repo: APTRepo):
     """Add a generic APT repository with DEB822 sources and pinning.
 
@@ -162,17 +178,16 @@ def _write_system_file(path: str, content: str):
     )
 
 
-def _get_kernel_version(kernel_package: str) -> str:
-    """Extract the kernel version string from a pinned package name.
+_CONCRETE_KERNEL_RE = re.compile(r"linux-image-(\d+\.\d+\.\d+-\d+-[a-z0-9-]+)")
 
-    Expects a concrete package like ``linux-image-6.17.0-35-generic``.
-    Raises if the name doesn't match the expected pattern.
-    """
-    match = re.match(r"linux-image-(\d+\.\d+\.\d+-\d+-\S+)", kernel_package)
+
+def _get_kernel_version(kernel_package: str) -> str:
+    """Extract the kernel version from a pinned package name (e.g. '7.0.0-31-generic')."""
+    match = _CONCRETE_KERNEL_RE.match(kernel_package)
     if not match:
         raise ValueError(
             f"kernel_package must be a pinned version "
-            f"(e.g. 'linux-image-6.17.0-35-generic'), got '{kernel_package}'"
+            f"(e.g. 'linux-image-7.0.0-31-generic'), got '{kernel_package}'"
         )
     return match.group(1)
 
@@ -671,12 +686,11 @@ def setup_host(profile: HostProfile, noninteractive: bool = False):
         print("Error: this script must be run as root (sudo).", file=sys.stderr)
         sys.exit(1)
 
-    if not re.match(r"linux-image-\d+\.\d+\.\d+-\d+-\S+", profile.kernel_package):
+    if not _CONCRETE_KERNEL_RE.match(profile.kernel_package):
         print(
             f"Error: kernel_package must be a pinned version "
-            f"(e.g. 'linux-image-6.17.0-35-generic'), "
-            f"got '{profile.kernel_package}'.\n"
-            f"Unpinned metapackages cause RTMR0 measurement drift.",
+            f"(e.g. 'linux-image-7.0.0-31-generic'), "
+            f"got '{profile.kernel_package}'.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -704,6 +718,7 @@ def setup_host(profile: HostProfile, noninteractive: bool = False):
 
     # 3. Install kernel + packages (base_packages = the folded-in host deps: chrony/aria2/xfsprogs)
     print(f"\nStep 3: Installing kernel ({profile.kernel_package}) and packages...")
+    _assert_kernel_available(profile.kernel_package)
     all_packages = [profile.kernel_package] + profile.base_packages + profile.packages
     _run(["apt", "install", "--yes", "--allow-downgrades"] + all_packages)
 

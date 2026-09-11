@@ -175,7 +175,7 @@ def test_2604_has_intel_sgx_repo():
 
 def test_2604_pins_kernel_package():
     profile = Ubuntu2604Profile()
-    assert profile.kernel_package == "linux-image-6.17.0-35-generic"
+    assert profile.kernel_package == "linux-image-7.0.0-31-generic"
 
 
 def test_2604_enables_kvm_intel_tdx():
