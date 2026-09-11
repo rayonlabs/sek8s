@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Version source of truth: `ansible/guest/VERSION`
 
-## [1.4.0] - 2026-09-10
+## [1.4.0] - 2026-09-11
 
 ### Added
 - **Boot-time miner-hotkey proof-of-possession (guest side).** A small, static, pinned-toolchain (musl) sr25519 signer (`src/sr25519`; Schnorr/Ristretto, which openssl cannot do) is built and staged into the guest initramfs (measured into RTMR2). The boot flow now derives the hotkey from the config-volume seed (`/run/tdx-config/miner-seed`) rather than trusting the claimed `miner-ss58`, and signs each chained server nonce — `/boot/attestation`, `/provision`, and `/provision/confirm` — sending the sr25519 proof in `X-Chutes-Signature`. This closes a cross-miner LUKS-brick vector where a peer could assert a victim's `(hotkey, vm_name)` and rotate its passphrase. The seed is stashed to `/run` for the init-bottom calls and shredded before the initramfs `/run` is moved into userspace. Pairs with a matching server-side signature check (chutes-api). Also fixes a migration miss: root-rotation confirm now uses `/provision/confirm` (the legacy `/luks/confirm` is deprecated).
@@ -549,6 +549,10 @@ Both failures were invisible on debug images, which load the sek8s profiles in c
   path it searched, and gives the command to install rustup for that account. rustup is a
   per-user install, so the previous advice — run `build-setup.yml` — was a dead end for the case
   that actually produces this error: build-setup having already run, for a different user.
+- The build no longer fails at "rtmr3-measure : Install tdx-measure" with `'repo_root' is
+  undefined`. `repo_root` was defined in `host` group scope but that role runs in a `vm` play,
+  so it resolved nowhere. It now lives in `all` scope, which also removes the `playbook_dir`
+  workaround the sr25519 role was carrying for the same reason.
 
 ### Removed
 - Hard-coded validator SS58 (`5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ`) removed from all Ansible role defaults (`common`, `admission-controller`, `attestation-service`, `system-manager`) and inventory files (`ansible/guest/inventory.yml`, `local/inventory.prod.yml`). The `validator` Ansible variable is no longer used anywhere in the guest image build.
