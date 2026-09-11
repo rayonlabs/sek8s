@@ -131,7 +131,21 @@ fi
 # ── Virtualenv + package install ───────────────────────────────────────────────
 log "venv: $VENV_DIR"
 $SUDO mkdir -p "$(dirname "$VENV_DIR")"
-$SUDO python3 -m venv "$VENV_DIR"            # reuses an existing venv without clobbering it
+
+# A venv is bound to the minor version that built it. After a Python upgrade (an OS release
+# upgrade, typically) the new interpreter never looks at the old site-packages, so reusing the
+# venv yields a chutes-cvm on PATH that cannot import its own package. Recreate on mismatch.
+PY_TAG="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+if [ -f "$VENV_DIR/pyvenv.cfg" ]; then
+    VENV_TAG="$(sed -n 's/^version[[:space:]]*=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+                "$VENV_DIR/pyvenv.cfg")"
+    if [ -n "$VENV_TAG" ] && [ "$VENV_TAG" != "$PY_TAG" ]; then
+        log "existing venv is python $VENV_TAG, this is $PY_TAG — recreating"
+        $SUDO rm -rf "$VENV_DIR"
+    fi
+fi
+
+$SUDO python3 -m venv "$VENV_DIR"            # reuses an existing venv of the same version
 $SUDO "$VENV_DIR/bin/python3" -m pip install --quiet --upgrade pip
 
 if [ "$MODE" = "pypi" ]; then
@@ -147,6 +161,16 @@ else
         log "install: $PKG_DIR (checkout, non-editable — source is disposable)"
         $SUDO "$VENV_DIR/bin/python3" -m pip install --quiet "$PKG_DIR"
     fi
+fi
+
+# ── Verify the package actually imports ────────────────────────────────────────
+# The shim is written below unconditionally, so without this an install that left the package
+# unimportable (version-mismatched venv, editable install whose source moved) still reports
+# success and puts a broken chutes-cvm on PATH.
+if ! $SUDO "$VENV_DIR/bin/python3" -c 'import chutes_cvm' 2>/dev/null; then
+    echo "ERROR: chutes_cvm is not importable from $VENV_DIR after install." >&2
+    echo "       Remove the venv and re-run: sudo rm -rf $VENV_DIR" >&2
+    exit 1
 fi
 
 # ── Guest firmware (non-editable installs only) ────────────────────────────────
