@@ -29,7 +29,7 @@
     # initramfs measurer runs at boot, so this manifest cannot disagree with what
     # RTMR3 is actually extended with. It owns the parse, the LC_ALL=C ordering, the
     # symlinked-entry refusal and the content-only `sha384sum < file` hashing; this
-    # task only swaps the two fields into the manifest's <path> <hash> layout.
+    # task only swaps the two fields into the <path> <hash> manifest layout.
     # Hashing BEFORE touching $out so a bad conf fails the build with the previous
     # manifest intact — build is where such a problem should surface, not boot.
     hashes=$(mktemp)
