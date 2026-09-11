@@ -1,4 +1,3 @@
-repo_root: "{{ playbook_dir }}/../../.."
 ubuntu_version: "24.04"
 img_dir: "{{ repo_root }}/guest-tools/image"
 # VM image release version from repo root (distinct from Python package version)

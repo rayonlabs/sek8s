@@ -1,6 +1,10 @@
 ---
 # Common variables for all hosts
 
+# Checkout root. In `all` (not `host`) scope so roles running in the `vm` plays resolve
+# control-host paths too — they read files from this checkout via `copy: src=`.
+repo_root: "{{ playbook_dir }}/../../.."
+
 # Build control
 no_cache: "{{ lookup('env', 'NO_CACHE') | default('false', true) | lower }}"
 
