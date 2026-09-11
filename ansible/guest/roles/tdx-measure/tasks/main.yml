@@ -14,11 +14,16 @@
 - name: Provision tdx-measure from source (skipped when tdx_measure_bin is preset)
   when: (tdx_measure_bin | default('')) | length == 0
   # The clone + cargo build run in user space (per-user rust toolchain / build tree);
-  # the apt installs below opt back into root per-task.
+  # the apt install below opts back into root per-task.
   become: false
+  # rustup's shims live in ~/.cargo/bin, which a non-login ansible shell need not have
+  # on PATH — prepend it so `rustup`/`cargo` resolve to the rustup toolchain rather
+  # than an apt cargo. Harmless when the dir is absent.
+  environment:
+    PATH: "{{ lookup('env', 'HOME') }}/.cargo/bin:{{ lookup('env', 'PATH') }}"
   block:
     # This role is invoked become: false (the build tree is per-user), so the apt
-    # installs opt back into root per-task. git clones the fork; cargo builds it.
+    # install opts back into root per-task. git clones the fork; cargo builds it.
     - name: Ensure git is installed
       ansible.builtin.apt:
         name: git
@@ -26,21 +31,40 @@
         update_cache: true
       become: true
 
-    # Detect cargo as the build user (respect an existing rustup toolchain in
-    # ~/.cargo/bin) and only apt-install if truly absent — never clobber a newer
-    # rustup cargo with the older apt one.
-    - name: Detect cargo on the build user's PATH
-      ansible.builtin.command: which cargo
-      register: _tdxm_cargo
+    # rustup, not apt, is the toolchain source for this build (build-setup.yml installs
+    # it per build user; the sr25519 role requires it the same way). apt's cargo is
+    # routinely too old for the fork's dependency tree — crates now ship edition2024,
+    # which needs cargo >= 1.85, and Ubuntu's 1.84.1 dies at manifest parse ("feature
+    # `edition2024` is required"). Requiring rustup here fails fast with a fix instead
+    # of installing a cargo that cannot build the tree.
+    - name: Detect rustup on the build user's PATH
+      ansible.builtin.command: which rustup
+      register: _tdxm_rustup
       changed_when: false
       failed_when: false
 
-    - name: Install a cargo toolchain when the build user has none
-      ansible.builtin.apt:
-        name: cargo
-        state: present
-      become: true
-      when: _tdxm_cargo.rc != 0
+    - name: Require rustup (apt's cargo is too old to build the fork)
+      ansible.builtin.fail:
+        msg: >-
+          rustup not found for {{ lookup('env', 'USER') | default('this account', true) }}
+          (searched {{ lookup('env', 'HOME') }}/.cargo/bin). rustup is per-user —
+          build-setup.yml installs it for build_user, so run the build as that account,
+          or install it here:
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none.
+          The tdx-measure fork's dependencies need cargo >= 1.85 (edition2024); apt ships
+          1.84.1, which fails at manifest parse.
+      when: _tdxm_rustup.rc != 0
+
+    # build-setup.yml installs rustup with --default-toolchain none, so the shims exist
+    # but no toolchain does; the fork pins none of its own (no rust-toolchain.toml), so
+    # name one here and build under it explicitly. Idempotent — rustup no-ops when the
+    # toolchain is already present. If the fork ever pins a toolchain, set
+    # tdx_measure_toolchain to match it.
+    - name: Ensure the tdx-measure toolchain is installed
+      ansible.builtin.command:
+        cmd: rustup toolchain install {{ tdx_measure_toolchain }} --profile minimal
+      register: _tdxm_toolchain
+      changed_when: "'installing' in _tdxm_toolchain.stderr"
 
     - name: Clone and fast-forward the tdx-measure fork to the pinned ref
       # update: true + force: true — always advance an existing checkout to
@@ -81,7 +105,7 @@
 
     - name: Build the tdx-measure CLI (release)
       ansible.builtin.command:
-        cmd: cargo build --release
+        cmd: cargo +{{ tdx_measure_toolchain }} build --release
         chdir: "{{ tdx_measure_src_dir }}/cli"
       changed_when: true
 

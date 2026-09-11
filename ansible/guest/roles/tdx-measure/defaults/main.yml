@@ -6,3 +6,6 @@ tdx_measure_ref: "main"
 # Defaults to a sibling checkout of this repo (the common local-dev layout); an
 # existing checkout here is used as-is (never clobbered — see update: false).
 tdx_measure_src_dir: "{{ repo_root }}/../tdx-measure"
+# rustup toolchain the fork is built with. The fork pins none itself, and its
+# dependencies need edition2024 support (cargo >= 1.85), which apt's cargo lacks.
+tdx_measure_toolchain: "stable"
