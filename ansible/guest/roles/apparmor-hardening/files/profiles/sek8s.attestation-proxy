@@ -1,0 +1,100 @@
+# vim: ft=apparmor
+# sek8s.attestation-proxy — AppArmor profile for the attestation-proxy container.
+# Applied via Kubernetes annotation (not auto-attached).
+#
+# Posture: default-deny, explicit allowlist only.
+# /run/chutes/ is never granted — the proxy reads its TLS certs only via the
+# volume-mounted path /etc/ssl/host-certs/. No deny rules are needed because
+# what is not allowed is denied by omission.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# attach_disconnected: the attestation socket is a hostPath BIND MOUNT, so its inode is
+# "disconnected" from this profile's mount-namespace root. Without this flag AppArmor fails the
+# path lookup on connect() ("Failed name lookup - disconnected path") and returns EACCES before any
+# rule is evaluated — even in complain mode. The flag reattaches such paths to / so the socket rule
+# below can match (this is why Docker's default profile carries it).
+profile sek8s.attestation-proxy flags=(enforce, attach_disconnected) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+  include <abstractions/python>
+
+  # Python interpreter + app code. The proxy runs its OWN lean image, NOT the /opt/sek8s guest
+  # layout: the interpreter is /usr/local/bin/python3.12 and the code + venv live under
+  # /app/src/attestation-proxy. (Confirmed against the live container's AppArmor audit; the old
+  # /opt/sek8s paths never matched, so in enforce the proxy couldn't read its own code.) mr because
+  # C-extension .so files are mmap'd.
+  /usr/local/bin/python3.12 mrix,
+  /usr/local/bin/python3{,.*} mrix,
+  # The image bundles both the proxy and the shared sek8s-common package under /app/src.
+  /app/src/ r,
+  /app/src/** mr,
+
+  # Proxy server TLS certs
+  /etc/ssl/host-certs/server.crt r,
+  /etc/ssl/host-certs/server.key r,
+
+  # System CA bundle for outbound TLS verification
+  /etc/ssl/certs/ r,
+  /etc/ssl/certs/** r,
+
+  # Service config (read-only)
+  /etc/attestation-service/ r,
+  /etc/attestation-service/** r,
+
+  # Attestation unix socket (host-side attestation service).
+  # It is bind-mounted from the host, so with attach_disconnected (above) AppArmor reattaches it
+  # under its SOURCE path — /run/attestation-service/... — which is the name that shows in the
+  # audit log, not the pod mount point (/var/run/attestation -> /run/attestation). Grant the source
+  # path for the connect (rw = write is what connect() to a pathname socket needs); the mount-point
+  # paths are kept as a belt-and-suspenders in case a kernel resolves it differently.
+  /run/attestation-service/ r,
+  /run/attestation-service/** rw,
+  /run/attestation/ r,
+  /run/attestation/** rw,
+
+  # Bittensor data dir (emptyDir mount in k8s pod)
+  /home/chutes/.bittensor/ rw,
+  /home/chutes/.bittensor/** rwlk,
+
+  # Temp dir (emptyDir mount in k8s pod)
+  /tmp/ r,
+  /tmp/** rwlk,
+
+  # System libraries
+  /usr/lib/** rm,
+  /usr/local/lib/** rm,
+  /etc/ld.so.cache r,
+  /etc/ld.so.conf r,
+  /etc/ld.so.conf.d/ r,
+  /etc/ld.so.conf.d/** r,
+
+  # Minimal /proc access for the process itself
+  @{PROC}/@{pid}/fd/ r,
+  @{PROC}/@{pid}/maps r,
+  @{PROC}/@{pid}/status r,
+  @{PROC}/sys/kernel/ngroups_max r,
+  @{PROC}/sys/kernel/overflowgid r,
+  @{PROC}/sys/kernel/overflowuid r,
+  # cgroup CPU-limit detection at startup (thread-pool sizing).
+  @{PROC}/1/cgroup r,
+  /sys/fs/cgroup/ r,
+  /sys/fs/cgroup/** r,
+  /dev/null rw,
+  /dev/urandom r,
+
+  # Logging
+  /dev/log w,
+  /run/systemd/journal/socket w,
+  /run/systemd/journal/dev-log w,
+
+  # Network for proxy operations (TLS + attestation socket)
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+  network unix stream,
+  network unix dgram,
+}

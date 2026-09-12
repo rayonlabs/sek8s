@@ -413,6 +413,23 @@
         - /etc/pam.d/common-session
         - /etc/pam.d/common-session-noninteractive
 
+- name: Blacklist in-tree GPU drivers that race the NVIDIA driver
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/blacklist-gpu-guest.conf
+    content: |
+      # On kernel 7.0+ the in-tree Rust nova_core (and nvidiafb/nouveau) match the
+      # GPU PCI class and claim the passthrough GPUs before the 595 nvidia driver,
+      # leaving them unbound (no /dev/nvidia0) so the NVLink fabric never completes
+      # SOE/TNVL training. Mirror of the host blacklist (chutes_cvm.host.setup).
+      blacklist nova_core
+      blacklist nouveau
+      blacklist nvidiafb
+      options nouveau modeset=0
+    mode: '0644'
+    owner: root
+    group: root
+  notify: update initramfs
+
 - name: Blacklist nvidia-drm module
   ansible.builtin.copy:
     dest: /etc/modprobe.d/blacklist-nvidia-drm.conf

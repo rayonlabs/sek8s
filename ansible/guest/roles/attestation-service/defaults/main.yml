@@ -1,12 +1,14 @@
-# ansible/guest/roles/admission-controller/defaults/main.yml
+# ansible/guest/roles/attestation-service/defaults/main.yml
 
 # Attestation Service settings
 admission_bind_address: "0.0.0.0"
 admission_port: 8080
 
-# Chutes config
-validator: 5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ
-
 # Sek8s image configuration
 # Override via inventory to use dev/test images (e.g., sek8s_image_tag: "dev-latest")
 sek8s_image_tag: "latest"
+
+# Busybox image for the attestation-proxy wait-for-socket init container
+# (parachutes/busybox — a signed shell image, cosign-signed with dockerhub.pub).
+# Override via inventory to pin to a specific built+signed tag (e.g., busybox_image_tag: "1.37")
+busybox_image_tag: "latest"

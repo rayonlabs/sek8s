@@ -1,0 +1,7 @@
+# Pinned so the shipped binary is reproducible: it is copied into the guest
+# initramfs and therefore measured into the guest RTMR. A toolchain bump changes
+# the bytes, which changes the measurement — treat it as a deliberate, versioned
+# change (bump ansible/guest/VERSION and republish measurements), never a drive-by.
+[toolchain]
+channel = "1.94.0"
+targets = ["x86_64-unknown-linux-musl"]

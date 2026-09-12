@@ -3,6 +3,203 @@
 Operational tooling changes: `ansible/host/`, `host-tools/`, `.github/workflows/`.
 Versioned with CalVer `YYYY.MM.PATCH` via `changelogs/ops/VERSION`. Run `make promote-changelogs` to aggregate fragments into the current version section.
 
+## [2026.09.1] - 2026-09-10
+
+### Added
+- `make publish-guest` / `make publish-guest-debug` — upload a built guest image **and
+  its direct-boot artifacts** to R2 in one step (via `publish-image.sh` + rclone),
+  replacing the manual per-file `rclone copyto`. Uploads
+  `<version>[-debug].{qcow2,vmlinuz,initrd,cmdline}` to the canonical
+  `tdx-guest[-debug].{qcow2,vmlinuz,initrd,cmdline}` R2 objects that
+  `quick-launch --download` fetches; pre-flight fails if any of the four is missing, so a
+  qcow2 is never published without its matching boot artifacts. Prompts once for the
+  rclone config password (`RCLONE_CONFIG_PASS`).
+- `build-setup.yml` now installs and enables Docker **with the buildx plugin** on build
+  hosts. Offline RTMR0 generation (the `compute-rtmr0` role) builds the tdx-measure fork's
+  patched QEMU via `docker build --progress plain`, which needs BuildKit/buildx. A build host
+  without it reported every profile PENDING with "Failed to invoke `docker build`" (no
+  docker) or "unknown flag: --progress" (no buildx).
+- Image-set coherence checking, as the single image format. A VM image is a set — the
+  qcow2 plus its direct-boot `.vmlinuz`/`.initrd`/`.cmdline` and a `manifest.json` (sha256 +
+  size per artifact) — verified as a matched unit against the manifest at download (full
+  hash) and at launch (presence/size). A stale or mismatched artifact now fails with a clear
+  "out of sync" error instead of an opaque boot/attestation failure. `chutes.guest.image_set`
+  is the single manifest generator/verifier, used by the build, `publish-image.sh`, and the
+  launcher; the boot artifacts previously had no integrity link at all.
+- `make images` builds **standalone docker images** — `docker/<name>` dirs that have a
+  `Dockerfile` but no matching `src/` package (e.g. `docker/busybox`). Build all, or one by
+  name: `make images busybox`. Images are tagged with a `latest`-style tag (`latest` on
+  `main`, `<branch>-latest` otherwise), and `tag`/`push`/`sign` now work for these
+  standalone images too (versioned `dev` when no package `VERSION` applies).
+- **RC-gate operator signing key injection.** `config.yaml` gains an optional `rc.operator_signing_key`
+  (host path to the operator RSA private key), also settable via `quick-launch.sh --operator-signing-key`.
+  The referenced key is copied onto the per-VM config volume as `operator-signing-key.pem` (mode 0600),
+  where the RTMR2-measured initramfs (`rc-sign`) signs the attestation nonce with it for `rc=true`
+  measurements — the API verifies with the matching public key. The key is referenced by path (never
+  inlined in the config), and never leaves the config volume + initramfs `/run` tmpfs. Completes the
+  producer side of the RC-gate flow (the initramfs consumer already existed).
+- **`chutes-cvm` CLI (seed).** A stdlib-based Python CLI (`chutes.guest.cli`) as the eventual
+  single entry point for confidential-VM host operations, growing gradually to subsume the
+  host-tools bash scripts. First command: `chutes-cvm verify-host` (wraps the existing
+  host-readiness gates with a colored, TTY-aware result banner; `--target-os` for a
+  pre-upgrade check). No new runtime dependency — verify-host is pure stdlib.
+- **`host-tools/provision/setup-chutes-cvm.sh`.** Idempotent, self-contained bootstrap: creates
+  a venv with the CLI's deps and installs the `chutes-cvm` shim (`→ python3 -m chutes.guest.cli`)
+  pointing at this checkout. A miner can run it directly (no Ansible required), and Ansible
+  host-setup can invoke the same script — one source of truth for CLI setup. Paths are
+  overridable via `CHUTES_CVM_VENV` / `CHUTES_CVM_BIN`.
+- **`chutes-cvm discover-profile`.** New CLI command that captures this host's GPU/CPU/NUMA
+  profile (delegating to `discover-profile.sh` for now), so `chutes-cvm` is the front door
+  for both host inspection commands (`verify-host`, `discover-profile`). `--json-only` /
+  `--no-json` forward to the underlying script.
+- **`chutes-cvm image-set` / `chutes-cvm config` / `chutes-cvm vfio-wedged`** — the
+  image-set manifest tool, the config renderer, and the PCI-passthrough-wedged check are
+  now first-class subcommands, so every caller routes through the one console script.
+- **`host-tools/scripts/generate-operator-signing-key.sh`** — standalone helper to mint an
+  RC-gate operator RSA key pair for testing. Writes the PRIVATE key (referenced from
+  `config.yaml` as `rc.operator_signing_key`) and the matching PUBLIC key (to register with the
+  Chutes API's accepted RC measurement). Thin `openssl` wrapper (`genpkey` + `pkey -pubout`) whose
+  keys are compatible with the initramfs `rc-sign` signer and the API verifier
+  (`openssl dgst -sha256 -sign`/`-verify`); it writes no config and registers nothing.
+- `build-setup.yml` now clones the sek8s repo the build runs from, into `sek8s_build_root`
+  (default `/opt/sek8s`) owned by the unprivileged login user. Provisioning a build host
+  previously left out the one thing the build needs most, so the source had to be fetched by
+  hand. The clone does not update an existing checkout — once it is there the operator owns
+  the branch — and it runs as the login user so that user's git credentials authenticate the
+  private repo.
+
+### Changed
+- Pin host kernel to `linux-image-6.17.0-35-generic` in both Ubuntu 25.10 and
+  26.04 host profiles to guarantee RTMR0 measurement consistency across the
+  fleet. Previously the `linux-image-generic` metapackage was used, which
+  allowed hosts to silently diverge after routine apt upgrades, causing
+  attestation failures.
+- Host setup now enforces that `kernel_package` is a pinned versioned package
+  and rejects metapackages (e.g. `linux-image-generic`) at startup.
+- `_get_kernel_version()` in host setup now handles pinned kernel package names
+  directly instead of requiring `apt show` resolution via Depends.
+- Pin SMBIOS type 1/2/3 (system/baseboard/chassis identity) to static values in
+  the QEMU launch. TDVF folds the fw_cfg `etc/smbios/smbios-tables` blob into
+  RTMR0, so motherboard-identity fields previously made two servers of the same
+  profile produce different RTMR0 values; pinning them removes that per-server
+  drift. This does not make RTMR0 host-independent — type 4/17 (processor/memory)
+  tables still vary with `-smp`/`-m`/topology, absorbed by the per-profile
+  measurement baseline, and type 0 (BIOS) is not overridden.
+- Apply the same SMBIOS pinning in `extract-acpi.sh` so the extracted golden
+  RTMR0 matches what is launched.
+- The TDX launcher now **direct-boots** the guest (1.4.0+, required — no GRUB fallback):
+  OVMF boots the image's kernel/initrd directly via QEMU `-kernel`/`-initrd`/`-append`
+  instead of GRUB, dropping GRUB/shim from the measured boot chain (TCB reduction).
+  `build_base_cmd` always emits the direct-boot args and drops `bootindex` from the disk
+  device — the qcow2 stays attached as the LUKS root, just not the boot device. There is
+  deliberately no GRUB path: a second boot method would produce a second,
+  network-inconsistent set of measurements. The offline ACPI-dump path passes placeholders
+  (RTMR0 is boot-method independent).
+- Direct-boot artifacts (`<image>.vmlinuz` / `.initrd` / `.cmdline`) are produced once at
+  build time and published to R2 alongside the qcow2. `quick-launch --download` /
+  `--download-debug` fetch them next to the image, and `chutes.guest.direct_boot` resolves
+  them at launch — no per-launch extraction and no `guestfish` on fleet hosts. The launcher
+  and the build read the *same* staged files, so the pinned RTMR1/2 match the running VM.
+- `base_image` is a published **image-set directory** (qcow2 + boot artifacts +
+  `manifest.json`), not a bare qcow2 — the only supported format. `quick-launch --download` /
+  `--download-debug` fetch the whole set into `/var/lib/chutes/base-images/<variant>/` and
+  verify it; the build (ansible) emits the per-variant `manifest.json` for both debug and
+  prod. Keeping an old build means moving its directory aside before re-downloading
+  (downloads overwrite in place).
+- Launch is decoupled from download: a missing image set fails with a clear remediation
+  message rather than being auto-downloaded. Stage sets explicitly with `--download` (or, in
+  a build, via ansible).
+- Base-image integrity is carried entirely by the manifest instead of a hand-maintained
+  `EXPECTED_BASE_SHA256` (removed) — no per-release hash bump, no per-launch re-hash of the
+  multi-GB image, and per-variant shas for debug and prod (the old single constant could
+  represent only one).
+- The 25.10 → 26.04 upgrade path is untouched: `upgrade-host.yml`, the
+  `os_upgrade_path` hops, and the `pre_2510` / `init_2604` hooks all still run, so
+  existing hosts can advance. 25.10 is now an upgrade waypoint only — from 25.04
+  always run with `-e target_version=26.04`, since a run whose final hop is 25.10 is
+  refused by the `verify-host` pre-flight (no baselined QEMU for that release).
+- **Consolidated the host entrypoint scripts into the `chutes-cvm` CLI.** The thin wrapper
+  scripts `run-td`, `verify-host`, `setup-tdx-host`, `tune-host.sh`, `restore-host.sh` and the
+  `host-tools/bin/chutes-*` PATH delegators are removed; their operations are now `chutes-cvm`
+  subcommands: `launch`, `verify-host`, `setup-host`, `tune-host`, `restore-host`, `reset-gpus`
+  (plus `discover-profile`). Logic still lives in the `chutes.guest` / `chutes.host` modules;
+  the CLI is a thin front door. `discover-profile.sh` is deliberately kept as a standalone
+  script. Ansible invokes the bootstrap-free `python3 -m chutes.guest.cli <cmd>` form (no venv
+  needed); host setup installs the `chutes-cvm` shim via `setup-chutes-cvm.sh` instead of
+  symlinking `bin/`.
+- **`chutes-cvm` is now a real Python package under `src/chutes-cvm/`** (import
+  `chutes_cvm`, published to PyPI), instead of a loose module tree on `PYTHONPATH` at
+  `host-tools/scripts/chutes/`. The rename from `chutes` to `chutes_cvm` avoids colliding
+  with the Chutes platform SDK once installed. The offline measurement engine
+  (`guest-tools/measurement/*.py`) moved into `chutes_cvm.measurement`, dropping its
+  `sys.path` shims.
+- **Host provisioning installs the package** — `host_tools` now runs `setup-chutes-cvm.sh`,
+  which `pip install -e`'s the package into a venv and puts the `chutes-cvm` console script on
+  PATH (with its deps: pyyaml/jsonschema/substrate-interface). Host ansible + `quick-launch.sh`
+  call `chutes-cvm <command>` instead of `python3 -m chutes.guest.*`, so dependency-bearing
+  commands (`config`, and the upcoming `preflight`) run with their deps available. The sparse
+  checkout now includes `src/chutes-cvm/`. Guest image build keeps `PYTHONPATH` (stdlib commands
+  only). Set `CHUTES_CVM_PYPI=1` to install from PyPI instead of the checkout.
+- `host-tools/scripts/prepare-vm-image.sh`: replaced QEMU qcow2 overlay creation with a full `cp` of the base image into a per-VM file; added stale-image cleanup for previous base image versions.
+- `host-tools/scripts/quick-launch.sh`: renamed `--overlay-dir` to `--vm-image-dir`; default directory changed from `/var/lib/chutes/vm-overlays/` to `/var/lib/chutes/vm-images/`.
+- Config key `overlay_directory` renamed to `vm_image_directory` in schemas, templates, example configs, `config.py`, and `CONFIG-GUIDE.md`.
+- The host setup guide no longer tells operators to print a topology matrix from the repo.
+  That command was removed along with the built-in matrix it read; host support is now
+  determined by querying the host directly rather than by consulting a checked-in table.
+
+### Fixed
+- 25.10 → 26.04 host upgrade no longer stalls on `sgx-dcap-pccs`. Intel's
+  `noble`-suite PCCS now depends on `nodejs (>= 22.13)`, which is unsatisfiable
+  on 25.10 (questing ships nodejs 20.x), so apt parks it as permanently
+  "kept back" and `do-release-upgrade` refuses to proceed (holding the package
+  does not help — `do-release-upgrade` also refuses with held packages).
+  `pre_2510` now backs up the PCCS artifacts (`config/`, `ssl_key/` — API key,
+  token hashes, TLS cert, cached collateral) and removes the package before the
+  upgrade; a new `init_2604` hook restores them on the upgraded OS *before*
+  `setup-tdx-host` reinstalls PCCS from the `resolute` suite, so the reinstall's
+  post-install brings the service up already configured and registration is
+  preserved without manual steps. Adds a target-keyed `init_<version>` hook
+  phase to the os_upgrade role (runs on the new OS after reboot, before
+  `setup-tdx-host`).
+- Add `xfsprogs` to host prerequisites so `mkfs.xfs` is available when `create-cache.sh` creates the storage volume (regression introduced in #34 when the storage volume format was switched from ext4 to XFS)
+- `build-setup.yml` reinstalled rustup on every run, and would have skipped installing it for
+  the build user entirely had root ever had a `~/.rustup`. The idempotency check read
+  `ansible_facts.env.HOME`, which a `become: true` play gathers as root's home, while the
+  install itself runs unprivileged. Both now resolve the build user and its home explicitly.
+- `build-setup.yml`'s header said to run `setup.yml` first. That playbook provisions a
+  bare-metal host to *run* the guest VM — TDX bootstrap, PCCS, a host-tools-only checkout —
+  and has no place on a build host. The header now says the build-host setup is standalone.
+- `build-setup.yml` provisioned rustup for the account Ansible connects as, which is not
+  necessarily the account that runs the build. Builds are normally driven as root — most of the
+  build needs it anyway (nbd, cryptsetup, virsh, libvirt) — so rustup landed in the login user's
+  home and the build failed half an hour in, at the sr25519 signer, with an error that read like
+  the host had never been provisioned. The playbook now takes a single `build_user` (default
+  `root`) and provisions everything per-user for that account: rustup, and ownership of the
+  checkout. Override it to build unprivileged: `-e build_user=ubuntu`.
+- `build-setup.yml` now verifies rustup is usable by the build user before it finishes, rather
+  than leaving the mismatch to surface mid-build. The build user's home is read from passwd
+  rather than carried in a second variable, so the account and its home cannot disagree, and the
+  idempotency check no longer reads `ansible_facts.env.HOME` — which a `become: true` play
+  gathers as root's home regardless of which account the install actually ran as.
+
+### Removed
+- The bare-qcow2 launch path and `quick-launch --skip-checksum`. Every image — including
+  benchmark and custom images — is consumed as a verified image set.
+- **Ubuntu 25.10 host support — 26.04 is the only supported host OS.**
+  - `support_matrix.py` and the host-tools README table list 26.04 only (H200 /
+    B200 / RTX Pro 6000, 8-GPU); the three `25.10` rows are gone, so
+    `setup-tdx-host --topology-matrix` shows 26.04 exclusively.
+  - `Ubuntu2510Profile` and its `HOST_PROFILES["25.10"]` entry are deleted:
+    `setup-tdx-host` now fails with "Unsupported Ubuntu version" on a 25.10 host
+    instead of provisioning it.
+  - `SUPPORTED_QEMU_BY_OS` drops `25.10 -> 10.1.0`, and the `"10.1.0"` keys are
+    removed from `baselined_measurements` (H200, B200_XEON6, RTX_PRO_6000). A host
+    still on 25.10 is refused at launch by the QEMU host-readiness gate, and
+    `verify-host` reports BLOCKED. This also retires the fingerprints that were
+    only ever baselined at 10.1.0 — flat-path H200 (>2 NUMA nodes) and SNC3
+    B200_XEON6 — since neither has a registered 10.2.1 RTMR0 and so could not
+    attest on 26.04 anyway.
+
 ## [2026.09.0] - 2026-09-03
 
 ### Added

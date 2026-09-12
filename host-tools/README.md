@@ -7,33 +7,24 @@ This guide covers setting up a baremetal host to launch TDX-enabled VMs with GPU
 ## Prerequisites
 
 - **Hardware**: Intel TDX-capable CPU and NVIDIA GPUs. See [Validated host topologies](#validated-host-topologies).
-- **OS**: Ubuntu **25.10** or **26.04** — both validated end-to-end. Ubuntu 25.04 is EOL and has no setup profile; use `upgrade-host.yml` to advance to 25.10 first.
+- **OS**: Ubuntu **26.04** — the only supported host OS. `chutes-cvm host setup` has no profile for 25.10 or 25.04, and no other release ships a baselined QEMU; advance an existing host with `upgrade-host.yml -e target_version=26.04` before setup.
 - **Access**: Root/sudo privileges on the host; SSH access from the Ansible control machine.
 
 ### Validated host topologies
 
-**Validated** means end-to-end tested (TDX host + VM + GPU passthrough). A profile existing in `setup-tdx-host` does **not** imply validation.
+**Validated** means end-to-end tested (TDX host + VM + GPU passthrough). A profile existing in `chutes-cvm host setup` does **not** imply validation.
 
 | Ubuntu | GPU SKU      | GPU count | Status              | Notes |
 |--------|--------------|-----------|---------------------|-------|
-| 25.10  | H200         | 8         | Validated           | NVSwitch required. Intel DCAP attestation. |
-| 25.10  | B200         | 8         | Validated           | Host-side Fabric Manager. CX7 NVSwitch bridge PFs stay on host. See [Blackwell HGX notes](#blackwell-hgx-notes). |
-| 25.10  | RTX Pro 6000 | 8         | Validated           | No NVSwitch. Intel DCAP attestation. |
 | 26.04  | H200         | 8         | Validated           | NVSwitch required. Intel DCAP attestation. |
 | 26.04  | B200         | 8         | Validated           | Host-side Fabric Manager. CX7 NVSwitch bridge PFs stay on host. See [Blackwell HGX notes](#blackwell-hgx-notes). |
 | 26.04  | RTX Pro 6000 | 8         | Validated           | No NVSwitch. Intel DCAP attestation. |
 
-Print the canonical matrix from the repo:
-```bash
-cd host-tools/scripts
-./setup-tdx-host --topology-matrix
-```
-
 #### Blackwell HGX notes
 
-B200 and B300 use a different NVSwitch architecture from H100/H200. `setup-tdx-host` detects and configures both, but only **B200** is in the [validated topologies](#validated-host-topologies) above — B300 host setup works the same way but has not yet been validated end-to-end. Key differences that affect host setup:
+B200 and B300 use a different NVSwitch architecture from H100/H200. `chutes-cvm host setup` detects and configures both, but only **B200** is in the [validated topologies](#validated-host-topologies) above — B300 host setup works the same way but has not yet been validated end-to-end. Key differences that affect host setup:
 
-- **Host-side Fabric Manager**: NVSwitches are not PCIe devices visible to the guest. `nvidia-fabricmanager` and `nvlsm` run on the *host* and are installed automatically by `setup-tdx-host` when B200 or B300 GPUs are detected. The guest's Fabric Manager is masked.
+- **Host-side Fabric Manager**: NVSwitches are not PCIe devices visible to the guest. `nvidia-fabricmanager` and `nvlsm` run on the *host* and are installed automatically by `chutes-cvm host setup` when B200 or B300 GPUs are detected. The guest's Fabric Manager is masked.
 - **CX7 NVSwitch bridge PFs stay on the host**: ConnectX-7 devices acting as the host interface to NVSwitches (identified by `SMDL=SW_MNG` in PCIe VPD) are excluded from VFIO passthrough. Regular CX7 NIC PFs are still passed through normally.
 - **Encrypted NVLink (MPT CC mode)**: NVLink traffic between GPUs and the host Fabric Manager is encrypted, so host-side FM does not compromise the zero-trust security model.
 - **`nvidia-open` driver**: Required on both host and guest for Blackwell (already the default in the guest image).
@@ -64,7 +55,7 @@ A reboot is triggered automatically if a new kernel was installed.
 ansible-playbook -i ~/chutes/my-inventory.yml playbooks/launch.yml
 ```
 
-This renders `config.yaml` on the host, downloads the base image if missing, verifies its checksum, and launches the VM via `quick-launch.sh`.
+This renders `config.yaml` on the host, downloads the base image if missing, verifies its checksum, and launches the VM via `chutes-cvm guest launch`.
 
 ### Subsequent updates
 
@@ -72,7 +63,7 @@ This renders `config.yaml` on the host, downloads the base image if missing, ver
 # Update guest image and relaunch:
 ansible-playbook -i ~/chutes/my-inventory.yml playbooks/upgrade-guest.yml
 
-# Upgrade host OS (e.g. 25.10 → 26.04 when validated):
+# Upgrade host OS (e.g. 25.10 → 26.04):
 ansible-playbook -i ~/chutes/my-inventory.yml playbooks/upgrade-host.yml
 ```
 
@@ -89,7 +80,7 @@ Use these steps if you are not using Ansible or are working directly on the host
 ```bash
 git clone https://github.com/chutesai/sek8s.git
 cd sek8s/host-tools/scripts
-sudo ./setup-tdx-host
+sudo chutes-cvm host setup
 sudo reboot
 ```
 
@@ -118,7 +109,7 @@ sudo PCKIDRetrievalTool \
 
 Obtain your Intel API key from [api.portal.trustedservices.intel.com](https://api.portal.trustedservices.intel.com/).
 
-**Note:** If PCCS was installed non-interactively (e.g. via `setup-tdx-host --noninteractive`) and the service fails with `Cannot find package 'config'`, run:
+**Note:** If PCCS was installed non-interactively (e.g. via `chutes-cvm host setup --noninteractive`) and the service fails with `Cannot find package 'config'`, run:
 ```bash
 cd /opt/intel/sgx-dcap-pccs && npm install
 systemctl restart pccs
@@ -128,7 +119,7 @@ systemctl restart pccs
 
 ```bash
 cd host-tools/scripts
-./quick-launch.sh --download
+chutes-cvm image download
 ```
 
 Images are saved to `/var/lib/chutes/base-images/`.
@@ -136,7 +127,7 @@ Images are saved to `/var/lib/chutes/base-images/`.
 ### Step 4: Create configuration file
 
 ```bash
-./quick-launch.sh --template
+chutes-cvm config init
 # Edit config.yaml with your settings
 ```
 
@@ -150,10 +141,10 @@ See [`scripts/config/CONFIG-GUIDE.md`](scripts/config/CONFIG-GUIDE.md) for the f
 ### Step 5: Launch the VM
 
 ```bash
-./quick-launch.sh config.yaml
+chutes-cvm guest launch config.yaml
 ```
 
-The script validates TDX, prepares volumes, configures networking, binds GPUs to `vfio-pci`, and starts the VM.
+The launcher validates TDX, prepares volumes, configures networking, binds GPUs to `vfio-pci`, and starts the VM.
 
 ---
 
@@ -168,7 +159,7 @@ cat /tmp/qemu.log
 
 ### Stop and clean up
 ```bash
-./quick-launch.sh --clean
+chutes-cvm guest down
 ```
 Removes the VM process, bridge, TAP interfaces, and NAT rules. Volume files are preserved.
 
@@ -178,7 +169,7 @@ Removes the VM process, bridge, TAP interfaces, and NAT rules. Volume files are 
 sudo nvidia-gpu-tools --query-cc-mode
 
 # Secondary Bus Reset (all GPUs — stop VM first)
-chutes-reset-gpus
+chutes-cvm host reset-gpus
 
 # Recover a broken GPU
 sudo nvidia-gpu-tools --recover-broken-gpu --gpu-bdf=<bdf>
@@ -186,7 +177,7 @@ sudo nvidia-gpu-tools --recover-broken-gpu --gpu-bdf=<bdf>
 
 Refresh host dependencies on an existing machine (no full re-setup needed):
 ```bash
-sudo ./setup-tdx-host --install-tools-only
+sudo chutes-cvm host setup
 ```
 
 ---
@@ -201,7 +192,7 @@ Caused by non-interactive install skipping the `npm install` post-install step.
 
 **GPU stuck or unhealthy**
 
-If `quick-launch` or `chutes-reset-gpus` hangs, check for wedged PCI tasks:
+If `chutes-cvm guest launch` or `chutes-cvm host reset-gpus` hangs, check for wedged PCI tasks:
 ```bash
 ps aux | awk '$8 ~ /D/ && /nvidia-gpu-tools|vfio-pci\/unbind/'
 ```
@@ -209,7 +200,7 @@ When that shows D-state processes, **reboot the host** before retrying — SBR c
 
 B200/B300 use CC mode (not PPCIe); use CC-mode SBR flags:
 ```bash
-chutes-reset-gpus    # auto-selects flags from detected GPU type
+chutes-cvm host reset-gpus    # auto-selects flags from detected GPU type
 sudo nvidia-gpu-tools --reset-with-sbr --reset-after-cc-mode-switch --gpu-bdf=<bdf>
 ```
 H200 8-GPU PPCIe configs:
@@ -220,7 +211,7 @@ sudo nvidia-gpu-tools --reset-with-sbr --reset-after-ppcie-mode-switch --gpu-bdf
 **TDX not initialized after reboot**
 ```bash
 dmesg | grep -i tdx
-# If blank: verify GRUB entry via `grub-editenv list`; re-run setup-tdx-host if needed
+# If blank: verify GRUB entry via `grub-editenv list`; re-run chutes-cvm host setup if needed
 ```
 
 **Network not accessible**
@@ -235,14 +226,18 @@ sudo sysctl net.ipv4.ip_forward       # should be 1
 
 | Path | Description |
 |------|-------------|
-| `/var/lib/chutes/base-images/tdx-guest.qcow2` | Base VM image |
-| `/var/lib/chutes/vm-overlays/tdx-<hostname>-<sha>.qcow2` | Per-launch overlay |
-| `host-tools/scripts/cache-<hostname>.raw` | HF/model cache volume (XFS) |
-| `host-tools/scripts/storage-<hostname>.raw` | k3s/containerd/kubelet volume |
-| `host-tools/scripts/config-<hostname>.qcow2` | Credentials config volume |
+| `/var/lib/chutes/base-images/tdx-guest/` | Base VM image set (qcow2 + boot artifacts + manifest.json) |
+| `/var/lib/chutes/vm-images/tdx-<hostname>-<sha>.qcow2` | Per-VM image copy |
+| `<volumes.cache.path>` (e.g. `/data/prod/cache.raw`) | HF/model cache volume (XFS) |
+| `<volumes.storage.path>` (e.g. `/data/prod/storage.raw`) | k3s/containerd/kubelet volume |
+| `<volumes.config.path>` (e.g. `/data/prod/config.qcow2`) | Credentials config volume |
 | `/tmp/tdx-guest-td.log` | VM serial console log |
 | `/tmp/qemu.log` | QEMU debug log |
 | `/tmp/tdx-td-pid.pid` | VM process PID |
+
+Set absolute `volumes.*.path` values in `config.yaml` (the Ansible-rendered config does).
+An empty `path:` auto-generates `cache-<hostname>.raw` etc. **relative to the launch working
+directory**, so prefer absolute paths for anything long-lived.
 
 ---
 

@@ -1,9 +1,0 @@
----
-- name: Ensure Chutes image and overlay directories exist
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: directory
-    mode: "0755"
-  loop:
-    - /var/lib/chutes/base-images
-    - /var/lib/chutes/vm-overlays

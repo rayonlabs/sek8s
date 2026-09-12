@@ -1,0 +1,31 @@
+[package]
+name = "sr25519"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Substrate-compatible sr25519 signer for the sek8s guest initramfs"
+publish = false
+
+[[bin]]
+name = "sr25519"
+path = "src/main.rs"
+
+[dependencies]
+# sr25519 = Schnorr over Ristretto25519. This is the same primitive (and the same
+# crate) that Substrate's sr25519 and py-sr25519-bindings are built on.
+# Default features keep `getrandom`, which schnorrkel uses for signature witness
+# generation -- matching py-sr25519-bindings' randomized signing exactly.
+schnorrkel = "0.11"
+# blake2b-512 for the SS58 checksum. Not used for any signing operation.
+blake2 = "0.10"
+# base58 for SS58 address encoding.
+bs58 = "0.5"
+
+# Tuned for a small, dependency-free binary that gets copied into the measured
+# initramfs. Build with --target x86_64-unknown-linux-musl for a static binary
+# with no libc coupling to the guest base image.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

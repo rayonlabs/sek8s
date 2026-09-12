@@ -2,7 +2,7 @@
 vm:
   hostname: {{ chutes_effective_vm_hostname | to_json }}
   base_image: {{ chutes_vm_base_image | to_json }}
-  overlay_directory: {{ chutes_vm_overlay_directory | to_json }}
+  vm_image_directory: {{ chutes_vm_image_directory | to_json }}
 
 miner:
   ss58: {{ chutes_miner_ss58 | to_json }}

@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from chutes.guest.post_launch import (
+from chutes_cvm.guest.post_launch import (
     apply_post_launch_tuning,
     expand_cpulist,
     find_qemu_pid,
@@ -42,7 +42,7 @@ def test_find_qemu_pid_returns_pid_when_pidfile_and_proc_exist(tmp_path):
     pidfile = tmp_path / "td.pid"
     pidfile.write_text("12345\n")
 
-    with patch("chutes.guest.post_launch.os.path.exists", return_value=True):
+    with patch("chutes_cvm.guest.post_launch.os.path.exists", return_value=True):
         pid = find_qemu_pid(pidfile=str(pidfile))
 
     assert pid == 12345
@@ -56,7 +56,7 @@ def test_find_qemu_pid_returns_none_when_process_gone(tmp_path):
     pidfile = tmp_path / "td.pid"
     pidfile.write_text("99999\n")
 
-    with patch("chutes.guest.post_launch.os.path.exists", return_value=False):
+    with patch("chutes_cvm.guest.post_launch.os.path.exists", return_value=False):
         pid = find_qemu_pid(pidfile=str(pidfile))
 
     assert pid is None
@@ -77,9 +77,9 @@ def test_apply_pins_threads_when_pid_found():
     pin = MagicMock()
 
     with (
-        patch("chutes.guest.post_launch.find_qemu_pid", return_value=42),
-        patch("chutes.guest.post_launch.pin_qemu_threads", pin),
-        patch("chutes.guest.post_launch.time.sleep"),
+        patch("chutes_cvm.guest.post_launch.find_qemu_pid", return_value=42),
+        patch("chutes_cvm.guest.post_launch.pin_qemu_threads", pin),
+        patch("chutes_cvm.guest.post_launch.time.sleep"),
     ):
         apply_post_launch_tuning(
             pidfile="/tmp/fake.pid",
@@ -95,8 +95,8 @@ def test_apply_skips_pin_when_pin_threads_false():
     pin = MagicMock()
 
     with (
-        patch("chutes.guest.post_launch.pin_qemu_threads", pin),
-        patch("chutes.guest.post_launch.time.sleep"),
+        patch("chutes_cvm.guest.post_launch.pin_qemu_threads", pin),
+        patch("chutes_cvm.guest.post_launch.time.sleep"),
     ):
         apply_post_launch_tuning(
             pidfile="/tmp/fake.pid",
@@ -112,9 +112,9 @@ def test_apply_warns_when_pid_not_found(capsys):
     pin = MagicMock()
 
     with (
-        patch("chutes.guest.post_launch.find_qemu_pid", return_value=None),
-        patch("chutes.guest.post_launch.pin_qemu_threads", pin),
-        patch("chutes.guest.post_launch.time.sleep"),
+        patch("chutes_cvm.guest.post_launch.find_qemu_pid", return_value=None),
+        patch("chutes_cvm.guest.post_launch.pin_qemu_threads", pin),
+        patch("chutes_cvm.guest.post_launch.time.sleep"),
     ):
         apply_post_launch_tuning(
             pidfile="/tmp/fake.pid",

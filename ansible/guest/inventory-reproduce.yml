@@ -1,0 +1,35 @@
+---
+# inventory-reproduce.yml
+#
+# Reproduce the Chutes production guest image and its measurements as an independent third party.
+# Identical to inventory.yml except it needs NONE of our secrets:
+#   * luks_passphrase is a hardcoded, published constant (below) instead of the LUKS_PASSPHRASE env.
+#     It does NOT affect the measured registers — MRTD/RTMR0-3 cover the firmware, kernel, initrd,
+#     cmdline and the baked configs (incl. the root key), not the LUKS container — so any value
+#     yields the same measurements; first-boot rotation replaces it anyway.
+#   * The root RSA PUBLIC key is fetched from R2 (root_signing_key_url), same as our own builds.
+# Everything else is the standard prod build. Build, then compare your measurements to the published
+# ones at GET https://api.chutes.ai/servers/tee/measurements.
+all:
+  children:
+    vm:
+      hosts: # Dynamically populated by playbook
+    host:
+      hosts:
+        localhost:
+          ansible_connection: local
+
+  vars:
+    ansible_user: "{{ lookup('env', 'USER') }}"
+    # Root RSA PUBLIC key — fetched from R2 (public), baked into the image, measured into RTMR3.
+    root_signing_key_url: "https://vm.chutes.ai/root-signing-key.pem"
+    root_signing_key_path: "/tmp/chutes-root-signing-key.pem"
+    # Published constant — intentionally NOT a secret (does not affect measurements; see header).
+    luks_passphrase: "chutes"
+    tdx_base_url: "https://cvm.chutes.ai"
+    validator_base_url: "https://api.chutes.ai"
+    build_env: "prod"
+    prime_wait_timeout: 300
+
+    debug_build: false
+    guest_ssh_keys: []

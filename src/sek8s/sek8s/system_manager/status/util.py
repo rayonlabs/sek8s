@@ -116,7 +116,10 @@ def resolve_service(service_id: str) -> ServiceDefinition:
     return SERVICE_ALLOWLIST[service_id]
 
 
-def is_service_healthy(status: ServiceStatus) -> bool:
+def is_service_healthy(status: ServiceStatus, *, masked_ok: bool = False) -> bool:
+    # A masked unit is intentionally disabled — treat as healthy when permitted.
+    if status.unit_file_state == "masked":
+        return masked_ok
     if status.load_state != "loaded" or status.active_state != "active":
         return False
     if status.sub_state in {"running", "listening", None}:
@@ -211,7 +214,7 @@ async def collect_service_status(
             description=service.description,
         ),
         status=status,
-        healthy=is_service_healthy(status),
+        healthy=is_service_healthy(status, masked_ok=service.masked_ok),
         error=None,
     )
 

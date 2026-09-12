@@ -1,0 +1,191 @@
+# /etc/initramfs-tools/scripts/provision-common
+#
+# Shared init-bottom /provision flow, sourced by the prod and debug setup_storage
+# entry scripts. Identical implementation for both: load the VM identity written by
+# fetch_key_and_unlock, generate the runtime (RTMR3-extended) quote, POST /provision
+# (which registers the VM root CA and — for prod — rotates volume passphrases), and
+# write the k3s EncryptionConfiguration. The prod/debug difference lives in one entry hook,
+# so no fail-open code appears here or in prod:
+#
+#   handle_failure <reason>   fatal-error behavior. Prod: poweroff -f (fail closed).
+#                             Debug: log and continue (fail open). Default here is
+#                             fail-closed, so a missing override can only fail safe.
+#
+# Volume LUKS (device detection, luksOpen/format, passphrase rotation) is NOT here —
+# it is prod-only and lives in the prod setup_storage entry. Debug has no encrypted
+# volumes; it calls provision_request with an empty volume list (CA registration only)
+# and supplies its own static k3s key.
+
+# sr25519 miner-hotkey signer (hotkey_sign → X-Chutes-Signature), sourced so the init-bottom
+# /provision flow proves hotkey possession over the chained quote nonce. Derives from the seed
+# stashed to /run tmpfs by init-premount (read_hotkey), which persists across the invocations.
+. /scripts/hotkey-sign
+
+# ── Shared globals ────────────────────────────────────────────────────────────
+VM_NAME=""
+HOTKEY=""
+K3S_ENCRYPTION_KEY=""      # prod: from the /provision response; debug: static (set by entry)
+STORAGE_LABEL="${STORAGE_LABEL:-storage}"
+CACHE_LABEL="${CACHE_LABEL:-tdx-cache}"
+PROVISION_RESPONSE="/tmp/luks_response"   # written by provision_request; parsed by prod entry
+
+# ── Hook defaults (entry scripts override) ────────────────────────────────────
+handle_failure() {
+    log_failure_msg "storage/provision failed: $1"
+    echo "PROVISION-FAILED: $1" > /dev/kmsg 2>/dev/null || true
+    sleep 10
+    poweroff -f
+}
+
+# ── VM identity (written to /run/chutes by fetch_key_and_unlock) ───────────────
+load_vm_data() {
+    if [ ! -f /run/chutes/vm-name ]; then
+        log_failure_msg "VM name not found in /run/chutes/vm-name"
+        return 1
+    fi
+    VM_NAME=$(cat /run/chutes/vm-name)
+
+    if [ ! -f /run/chutes/hotkey ]; then
+        log_failure_msg "Hotkey not found in /run/chutes/hotkey"
+        return 1
+    fi
+    HOTKEY=$(cat /run/chutes/hotkey)
+
+    log_success_msg "Loaded VM name: $VM_NAME, hotkey loaded from config"
+    return 0
+}
+
+# ── /provision POST ───────────────────────────────────────────────────────────
+# provision_request <volumes_json>
+#   volumes_json: comma-separated quoted labels, e.g. '"storage","tdx-cache"' for prod,
+#   or '' for debug (register the CA only, no volume secrets). Generates the runtime
+#   quote (RTMR3 extended by rtmr3-measure before this runs) bound to the boot's
+#   luks-quote-nonce + cert-hash, adds the miner-hotkey proof header (hotkey_sign), POSTs,
+#   and leaves the response at $PROVISION_RESPONSE for the caller to parse. Returns 0 on 200/201.
+provision_request() {
+    local volumes_json="$1"
+    local quote_file="/tmp/luks_quote.bin"
+
+    if [ -z "$TDX_BASE_URL" ]; then
+        log_failure_msg "TDX_BASE_URL not configured in /etc/tdx-luks.conf"
+        return 1
+    fi
+
+    local timeout="${TDX_TIMEOUT:-30}"
+    local ca_cert="/etc/ssl/certs/ca-certificates.crt"
+    local client_cert="/run/chutes/vm-root-ca/ca.crt"
+    local client_key="/run/chutes/vm-root-ca/ca.key"
+    local endpoint_url="${TDX_BASE_URL}/servers/${VM_NAME}/provision"
+
+    # Single-use nonce issued at boot attestation; bound into REPORTDATA and sent as
+    # X-Quote-Nonce so the API can validate/consume it without decoding the quote.
+    local quote_nonce
+    quote_nonce=$(cat /run/chutes/luks-quote-nonce 2>/dev/null | tr -d '\n')
+    if [ -z "$quote_nonce" ]; then
+        log_failure_msg "luks-quote-nonce not found — boot attestation did not provide it"
+        return 1
+    fi
+
+    # cert-hash binds this /provision quote to the same VM root CA used at boot.
+    local cert_hash
+    cert_hash=$(cat /run/chutes/cert-hash 2>/dev/null | tr -d '\n')
+    if [ -z "$cert_hash" ]; then
+        log_failure_msg "cert-hash not found in /run/chutes — boot attestation did not save it"
+        return 1
+    fi
+
+    # RTMR3 is fully extended at this point (rtmr3-measure ran before setup_storage).
+    local report_data
+    report_data=$(echo -n "${quote_nonce}${cert_hash}" | cut -c1-128)
+    log_begin_msg "Generating TDX quote for /provision"
+    if ! /usr/bin/tdx-quote-generator --report-data "$report_data" --hex \
+            -o "$quote_file" 2>/dev/null; then
+        log_end_msg 1
+        log_failure_msg "Failed to generate TDX quote"
+        return 1
+    fi
+    local quote_b64
+    quote_b64=$(base64 -w 0 < "$quote_file")
+    rm -f "$quote_file"
+    log_end_msg 0
+
+    # The exact request body — built once so the hotkey signature hashes the same bytes curl sends.
+    local body
+    body="{\"quote\":\"${quote_b64}\",\"volumes\":[${volumes_json}]}"
+
+    # Miner-hotkey proof-of-possession over the chained quote nonce: sr25519 over
+    # {ss58}:{quote_nonce}:{sha256(body)}. X-Chutes-Nonce must carry the SAME nonce as X-Quote-Nonce
+    # so verify_hotkey_auth's server_nonce check passes.
+    local hk_hdr="" _hk_sig
+    _hk_sig=$(hotkey_sign "$quote_nonce" "$body")
+    [ -n "$_hk_sig" ] && hk_hdr="-H X-Chutes-Signature:$_hk_sig"
+
+    log_begin_msg "POST /provision (volumes=[${volumes_json}])"
+
+    # NO-LOG INVARIANT: the response body contains plaintext LUKS passphrases and the
+    # k3s encryption key. $PROVISION_RESPONSE must NEVER be logged or echoed. Use
+    # 'curl -s' (silent) and rm -f it before returning. Do not add -v / --verbose here.
+    http_code=$(curl -s -w "%{http_code}" \
+        -X POST \
+        -H "X-Quote-Nonce: $quote_nonce" \
+        -H "X-Chutes-Nonce: $quote_nonce" \
+        -H "X-Chutes-Hotkey: $HOTKEY" \
+        ${hk_hdr} \
+        -H "User-Agent: TDX-LUKS-Storage/1.0" \
+        -H "Content-Type: application/json" \
+        --max-time "$timeout" \
+        --retry 0 \
+        --cacert "$ca_cert" \
+        --cert "$client_cert" \
+        --key "$client_key" \
+        -d "$body" \
+        -o "$PROVISION_RESPONSE" \
+        "$endpoint_url")
+
+    if [ "$http_code" != "200" ] && [ "$http_code" != "201" ]; then
+        rm -f "$PROVISION_RESPONSE"
+        log_failure_msg "POST /provision failed (HTTP $http_code)"
+        return 1
+    fi
+
+    log_success_msg "POST /provision completed"
+    return 0
+}
+
+# ── k3s EncryptionConfiguration ───────────────────────────────────────────────
+# Writes the k8s EncryptionConfiguration to /run/chutes (tmpfs) from $K3S_ENCRYPTION_KEY.
+# k3s is pointed at this file via encryption-provider-config; /run is tmpfs so the key
+# never persists. Prod sources the key from the /provision response; debug sets a static
+# key before calling this (so k3s comes up even when the VM can't join the network). A
+# missing key routes through handle_failure — fail-closed in prod, fail-open in debug
+# (though debug always has the static key, so it never hits that path).
+write_k3s_encryption_config() {
+    local config_path="/run/chutes/k3s-encryption-config.yaml"
+    mkdir -m 0700 -p /run/chutes
+
+    if [ -z "$K3S_ENCRYPTION_KEY" ]; then
+        handle_failure "k3s encryption key not available — VM cannot run k3s securely"
+        return 1
+    fi
+
+    # NO-LOG INVARIANT: $K3S_ENCRYPTION_KEY is plaintext key material. This heredoc
+    # writes it directly to file — do NOT echo, log, or set -x around this block.
+    # identity provider last so pre-encryption secrets remain readable.
+    cat > "$config_path" << EOF
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+      - configmaps
+    providers:
+      - secretbox:
+          keys:
+            - name: key1
+              secret: ${K3S_ENCRYPTION_KEY}
+      - identity: {}
+EOF
+    chmod 600 "$config_path"
+    log_success_msg "k3s encryption config written (secretbox)"
+    return 0
+}

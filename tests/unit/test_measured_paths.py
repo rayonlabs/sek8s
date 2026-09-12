@@ -34,6 +34,15 @@ def test_privileged_boot_paths_are_measured():
         # Measured helm chart specs (versions/values/flags) and OPA policies.
         "/etc/chutes/charts",
         "/etc/opa/policies",
+        # Log shipper config: the validator URL logs egress to, the CRI endpoint pod
+        # metadata comes from, and the names deciding which pods are captured at all.
+        "/etc/chute-log-shipper",
+        # The shared libraries every confined service mmap-execs, plus the kernel
+        # modules on disk. Measuring /usr/bin without this covers execve targets
+        # only, which is half the executable surface.
+        "/usr/lib",
     }
     missing = required - measured
-    assert not missing, f"security-critical paths missing from RTMR3 measured list: {sorted(missing)}"
+    assert (
+        not missing
+    ), f"security-critical paths missing from RTMR3 measured list: {sorted(missing)}"

@@ -3,7 +3,7 @@
 #
 # This playbook is idempotent and safe to re-run at any time — including while
 # the benchmark VM is running. It does NOT build, download, or launch the VM.
-# The benchmark image is built locally and launched manually via quick-launch.sh.
+# The benchmark image is built locally and launched manually via `chutes-cvm guest launch`.
 #
 # What this playbook does:
 #   1. Syncs the latest host-tools from the sek8s repo to the host

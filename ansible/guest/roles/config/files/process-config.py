@@ -71,26 +71,38 @@ def log(message, level="INFO"):
         f.write(log_entry + "\n")
 
 def validate_ss58_address(address):
-    """Validate SS58 address format for Bittensor network"""
+    """Validate SS58 address format for Bittensor network.
+
+    This validation is intentionally duplicated in the initramfs shell script
+    ansible/guest/roles/prepare-boot-image/files/initramfs/write-validator-auth which runs
+    before Python is available.  If you change any of the three criteria below,
+    update the shell script to match.
+
+    Criteria (all three must hold):
+      1. Length: 40–50 characters
+      2. Charset: every character in the base58 alphabet
+         (123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz)
+      3. Prefix: starts with '5'  (Bittensor mainnet, network prefix 42)
+    """
     if not isinstance(address, str):
         return False, "SS58 address must be a string"
-    
-    # Remove whitespace
+
     address = address.strip()
-    
-    # SS58 addresses are base58 encoded and typically 47-48 characters
+
+    # Criterion 1: length
     if len(address) < 40 or len(address) > 50:
         return False, f"SS58 address length invalid: {len(address)} (expected 40-50 chars)"
-    
-    # SS58 uses specific character set (base58)
-    ss58_chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    if not all(c in ss58_chars for c in address):
-        return False, "SS58 address contains invalid characters"
-    
-    # Bittensor addresses typically start with '5' for mainnet
+
+    # Criterion 2: base58 charset
+    _SS58_CHARS = frozenset("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+    invalid = [c for c in address if c not in _SS58_CHARS]
+    if invalid:
+        return False, f"SS58 address contains invalid characters: {invalid}"
+
+    # Criterion 3: Bittensor mainnet prefix
     if not address.startswith('5'):
         return False, "SS58 address should start with '5' for Bittensor mainnet"
-    
+
     return True, "SS58 address is valid"
 
 def validate_seed_content(seed):

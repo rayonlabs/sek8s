@@ -205,19 +205,25 @@
   tags:
     - compute-rtmr3
   tasks:
-    - name: Compute RTMR3
-      ansible.builtin.include_role:
-        name: compute-rtmr3
+    # RTMR3 measures the partner's SSH key (+ the other tdx-measure.conf files) from the root.
+    # This build has no per-topology aggregation, so it generates only that one register.
+    - name: Compute RTMR3 (bare hex on stdout)
+      ansible.builtin.command:
+        argv:
+          - chutes-cvm
+          - measurements
+          - generate
+          - --register
+          - rtmr3
+          - --image
+          - "{{ final_img_path }}"
+      environment:
+        # LUKS_PASSPHRASE unlocks the root when the image is already encrypted.
+        LUKS_PASSPHRASE: "{{ luks_passphrase | default('') }}"
+      register: _rtmr3_compute
+      changed_when: false
 
-- name: Prime VM for stable TDX measurements
-  hosts: host
-  become: true
-  tags:
-    - prime-vm
-  tasks:
-    - name: Prime VM EFI boot variable state
-      ansible.builtin.include_role:
-        name: prime-vm
-        apply:
-          tags: prime-vm
+    - name: Show RTMR3
+      ansible.builtin.debug:
+        msg: "RTMR3={{ _rtmr3_compute.stdout | trim }}"
 

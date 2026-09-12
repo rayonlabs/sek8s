@@ -4,7 +4,7 @@ monitoring_namespace: monitoring
 # Pinned for reproducible builds. Rendered into /etc/chutes/charts/chutes-miner-gpu.conf,
 # the single source of truth reconciled at boot by 04-helm-chart-upgrade.sh.
 # Override in group_vars or host_vars for debug images (e.g. 0.1.0-dev.1).
-chutes_chart_version: "0.2.7"
+chutes_chart_version: "0.3.0"
 
 # GPU Operator chart version from the NVIDIA Helm repo (nvidia/gpu-operator).
 # Pinned for reproducible builds. Rendered into /etc/chutes/charts/gpu-operator.conf,
@@ -15,10 +15,6 @@ gpu_operator_chart_version: "v26.3.2"
 # /etc/chutes/charts/prometheus.conf (reconciled at boot). Find a version to pin with
 # `helm search repo prometheus-community/prometheus --versions`
 prometheus_chart_version: "29.12.0"
-
-# Path to Helm chart signing PGP public key (build-time, like cosign_public_key_path).
-# Required. Override in inventory or group_vars.
-helm_chart_public_key_path: "~/.chutes/helm-pubkey.gpg"
 
 # Helm repo URL for chutes-miner charts (used at build time and inherited by boot script).
 chutes_helm_repo_url: "https://chutesai.github.io/chutes-miner"

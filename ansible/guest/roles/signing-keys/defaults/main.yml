@@ -1,0 +1,5 @@
+---
+# Root RSA PUBLIC key. Fetched from R2 at build start (see the build playbook) into the local
+# cache below; both this role and chutes-gpu read it from there. Overridden by the inventory.
+root_signing_key_url: "https://vm.chutes.ai/root-signing-key.pem"
+root_signing_key_path: "/tmp/chutes-root-signing-key.pem"

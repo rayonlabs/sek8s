@@ -1,0 +1,114 @@
+#!/bin/sh
+# /etc/initramfs-tools/hooks/fetch_key
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Copy essential binaries - copy_exec handles library dependencies automatically
+copy_exec /bin/ip
+copy_exec /usr/bin/curl
+copy_exec /usr/bin/jq
+copy_exec /sbin/dhcpcd
+copy_exec /usr/sbin/cryptsetup
+copy_exec /usr/bin/tdx-quote-generator
+copy_exec /usr/bin/base64
+copy_exec /usr/bin/openssl
+copy_exec /usr/bin/chown
+copy_exec /usr/bin/sha256sum
+copy_exec /usr/bin/sha384sum
+copy_exec /usr/bin/sr25519
+
+# Tools for storage setup (init-bottom script)
+copy_exec /sbin/blkid
+copy_exec /usr/sbin/mkfs.xfs
+copy_exec /sbin/wipefs
+copy_exec /sbin/dmsetup
+
+# Text utilities the initramfs shell scripts depend on. These are NOT optional: the boot scripts
+# use head, tr, cut, sed, awk and wc for parsing network config, attestation responses and key
+# material, and a missing one aborts the unlock and powers the VM off.
+#
+# They were previously present only by accident — pulled in by another package's initramfs hook —
+# so removing an unrelated hook (overlayroot) silently broke boot with
+# "fetch_key_and_unlock: line 153: head: not found". Ubuntu initramfs ships klibc-utils rather
+# than busybox, and klibc provides none of these. This hook must declare everything its scripts
+# use rather than rely on what another hook happens to stage.
+copy_exec /usr/bin/head
+copy_exec /usr/bin/tail
+copy_exec /usr/bin/tr
+copy_exec /usr/bin/cut
+copy_exec /usr/bin/wc
+copy_exec /usr/bin/sed
+copy_exec /usr/bin/awk
+copy_exec /usr/bin/grep
+copy_exec /usr/bin/basename
+copy_exec /usr/bin/dirname
+copy_exec /usr/bin/mktemp
+copy_exec /usr/bin/dd
+copy_exec /usr/bin/cat
+copy_exec /usr/bin/cp
+copy_exec /usr/bin/rm
+copy_exec /usr/bin/mkdir
+copy_exec /usr/bin/chmod
+copy_exec /usr/bin/sleep
+
+# Network configuration
+mkdir -p $DESTDIR/etc/network
+if [ -d /etc/netplan ]; then
+    cp /etc/netplan/*.yaml $DESTDIR/etc/network/ 2>/dev/null || true
+fi
+
+# SSL certificates for HTTPS
+mkdir -p $DESTDIR/etc/ssl/certs
+cp /etc/ssl/certs/ca-certificates.crt $DESTDIR/etc/ssl/certs/
+
+# TDX configuration
+if [ -f /etc/tdx-luks.conf ]; then
+    cp /etc/tdx-luks.conf $DESTDIR/etc/
+fi
+
+# TDX attestation configuration
+if [ -f /etc/tdx-attest.conf ]; then
+    cp /etc/tdx-attest.conf $DESTDIR/etc/
+fi
+
+# Copy OpenSSL engines/modules if they exist
+for dir in /usr/lib/x86_64-linux-gnu/engines-* /usr/lib/x86_64-linux-gnu/ossl-modules; do
+    if [ -d "$dir" ]; then
+        target_dir="$DESTDIR/$dir"
+        mkdir -p "$(dirname "$target_dir")"
+        cp -r "$dir" "$(dirname "$target_dir")/" 2>/dev/null || true
+    fi
+done
+
+# Add TDX kernel module
+manual_add_modules tdx_guest
+force_load tdx_guest
+
+# Add block device and filesystem modules for cloud-init ISO
+manual_add_modules virtio_blk
+manual_add_modules iso9660
+manual_add_modules isofs
+
+# Add other kernel modules
+manual_add_modules vsock
+manual_add_modules vmw_vsock_virtio_transport
+manual_add_modules vmw_vsock_virtio_transport_common
+
+# XFS module for cache/storage volume mounts
+manual_add_modules xfs
+
+# Shared shell libraries sourced by the boot scripts (luks-helpers, attest-common,
+# provision-common, hotkey-sign). These live as regular files directly under
+# /etc/initramfs-tools/scripts/; the init-top/init-premount/init-bottom stages are
+# subdirectories staged by initramfs-tools itself, so a non-recursive regular-file glob
+# picks up only the libs. Copies exactly the libs installed for THIS image, so prod and
+# debug keep distinct measurements — the hook itself carries no variant-specific reference.
+mkdir -p "$DESTDIR/scripts"
+for _lib in /etc/initramfs-tools/scripts/*; do
+    [ -f "$_lib" ] || continue
+    cp "$_lib" "$DESTDIR/scripts/$(basename "$_lib")"
+    chmod 755 "$DESTDIR/scripts/$(basename "$_lib")"
+done

@@ -16,6 +16,9 @@ WorkingDirectory=/opt/sek8s
 # Use virtual environment
 Environment="PATH=/opt/sek8s/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="VIRTUAL_ENV=/opt/sek8s/venv"
+# Keep the RTMR3-measured /opt/sek8s/src tree free of runtime-written .pyc (see the note in
+# system-manager.service) so the measurement stays stable across reboots.
+Environment="PYTHONDONTWRITEBYTECODE=1"
 EnvironmentFile=/etc/admission-controller/admission.env
 
 # Run the admission controller
@@ -41,6 +44,9 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/log/admission-controller /run/admission-controller
 ReadOnlyPaths=/etc/admission-controller /etc/opa/policies /opt/sek8s
+# Shadow 0700 /run/chutes with a private tmpfs; the drop-ins bind their subtrees into
+# it. A bind alone cannot cross the 0700 parent. mode is explicit: tmpfs defaults to 1777.
+TemporaryFileSystem=/run/chutes:ro,mode=0755
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

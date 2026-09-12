@@ -35,6 +35,20 @@
         INSTALL_K3S_VERSION: "{{ k3s_version }}"
       changed_when: true
 
+# Unconditional (outside the version-gated block above): the script may be left over from an
+# earlier run even when this build skipped the download.
+#
+# It is fetched unpinned from get.k3s.io and is only ever used to install k3s, but it lands in
+# /usr/local/bin, which is measured wholesale into RTMR3 — so whatever upstream happened to be
+# serving at build time became part of the image's measurements, and two builds minutes apart
+# produced different RTMR2/RTMR3. Removing it makes the measurement independent of an unpinned
+# remote fetch, and drops a network-sourced script from the shipped image. The k3s BINARY stays
+# version-pinned via INSTALL_K3S_VERSION.
+- name: Remove the k3s install script (unpinned upstream fetch, not needed at runtime)
+  ansible.builtin.file:
+    path: /usr/local/bin/k3s-install.sh
+    state: absent
+
 - name: Add K3s autocomplete to user bashrc
   when: ansible_user is defined
   ansible.builtin.lineinfile:

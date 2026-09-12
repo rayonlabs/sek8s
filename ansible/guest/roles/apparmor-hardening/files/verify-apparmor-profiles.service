@@ -1,0 +1,17 @@
+[Unit]
+Description=Verify sek8s AppArmor profiles are enforcing
+After=apparmor.service
+Before=k3s.service system-manager.service setup-cache.service
+Requires=apparmor.service
+OnFailure=poweroff.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/verify-apparmor-profiles.sh
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=verify-apparmor-profiles
+
+[Install]
+WantedBy=multi-user.target

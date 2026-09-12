@@ -16,15 +16,6 @@
     mode: '0755'
     backup: yes
 
-- name: Copy TLS certificate setup script
-  ansible.builtin.copy:
-    src: service-init/setup-tls-certs.sh
-    dest: /etc/attestation-service/scripts/setup-tls-certs.sh
-    owner: tdx-attest
-    group: tdx-attest
-    mode: '0755'
-    backup: yes
-
 - name: Create attestation service init systemd unit
   ansible.builtin.copy:
     src: attestation-service-init.service

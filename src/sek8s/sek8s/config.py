@@ -104,17 +104,9 @@ class ImageConfig(AuthConfig):
     """Configuration for the images router (k3s/containerd image management)."""
 
     image_pull_allowed_registries: List[str] = Field(
-        default_factory=lambda: [
-            "localhost:30500",
-            "127.0.0.1:30500",
-        ],
+        default_factory=lambda: ["registry.chutes.ai"],
         alias="IMAGE_PULL_ALLOWED_REGISTRIES",
-        description="Comma-separated or JSON array of allowed registries for pull (validator registry only)",
-    )
-    cosign_public_key_path: Path = Field(
-        default=Path("/etc/admission-controller/cosign/cosign.pub"),
-        alias="COSIGN_PUBLIC_KEY_PATH",
-        description="Path to cosign public key for image verification",
+        description="JSON array or comma-separated list of allowed registries for image pull",
     )
     image_pull_timeout_seconds: float = Field(
         default=1200.0,
@@ -171,7 +163,7 @@ class AdmissionConfig(ServerConfig):
 
     # Registry allowlist - expects JSON array from environment
     allowed_registries: List[str] = Field(
-        default=["docker.io", "gcr.io", "quay.io", "localhost:30500"],
+        default=["docker.io", "gcr.io", "quay.io", "registry.chutes.ai"],
         alias="ALLOWED_REGISTRIES",
         description="JSON array of allowed registries",
     )
@@ -202,16 +194,23 @@ class AdmissionConfig(ServerConfig):
     # Authorization webhook: pod name prefixes the miner is allowed to read logs
     # from in the chutes namespace. All other pod logs are denied for the miner.
     authz_allowed_log_prefixes: List[str] = Field(
-        default=["agent-", "registry-", "failed-chute-cleanup-"],
+        default=["agent-", "chutes-registry-", "failed-chute-cleanup-"],
         alias="AUTHZ_ALLOWED_LOG_PREFIXES",
         description="Pod name prefixes the miner may read logs from in chutes namespace",
     )
 
-    # Chutes namespace: path to cosign public key used to enforce signed images in chutes namespace
-    chutes_cosign_public_key_path: Optional[Path] = Field(
-        default=Path("/etc/admission-controller/cosign/cosign.pub"),
-        alias="CHUTES_COSIGN_PUBLIC_KEY_PATH",
-        description="Path to cosign public key for chutes namespace image signing enforcement",
+    # Cosign public keys for chutes namespace enforcement.
+    # Keys are fetched at boot by the fetch-signing-keys initramfs script,
+    # RSA-verified against the attested root key, and written to tmpfs.
+    chutes_public_key_path: Path = Field(
+        default=Path("/run/chutes/signing-keys/cosign/chutes.pub"),
+        alias="CHUTES_PUBLIC_KEY_PATH",
+        description="Path to cosign public key for registry.chutes.ai image signing enforcement",
+    )
+    dockerhub_public_key_path: Path = Field(
+        default=Path("/run/chutes/signing-keys/cosign/dockerhub.pub"),
+        alias="DOCKERHUB_PUBLIC_KEY_PATH",
+        description="Path to cosign public key for Docker Hub image signing enforcement",
     )
 
     @field_validator("namespace_policies", mode="before")
@@ -509,7 +508,10 @@ class CosignConfig(BaseSettings):
                     registry="*",
                     require_signature=True,
                     verification_method="key",
-                    public_key=Path("/etc/admission-controller/.cosign/cosign.pub"),
+                    # Match the boot-fetched key path (required_key_paths / the rendered
+                    # cosign-registries.json), not the retired /etc/admission-controller/.cosign
+                    # location — else a missing config file denies all chutes-namespace images.
+                    public_key=Path("/run/chutes/signing-keys/cosign/chutes.pub"),
                 )
             ]
 

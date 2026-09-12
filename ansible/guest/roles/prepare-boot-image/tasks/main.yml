@@ -1,0 +1,28 @@
+---
+# prepare-boot-image assembles the FINAL bootable root filesystem from the exported plaintext
+# image: it (optionally) encrypts the root, installs the boot + attestation initramfs scripts,
+# rewrites the mount config (fstab/crypttab), generates the RTMR3 canonical manifest over the
+# finalized root, and builds the final measured initramfs. It is more than LUKS — encryption and
+# the RTMR3 manifest cannot be separated, since the manifest must hash the post-encryption root and
+# be embedded in that same final initramfs (see generate-expected-hashes.yml).
+#
+# Runs for ALL guest images. The prod-vs-debug split is decided HERE, in one place, so it is
+# auditable at a glance: exactly one of the two task sets runs, and each is all-or-nothing. This
+# mirrors the k3s role convention — gate the include, never individual tasks inside a
+# security-critical set.
+#
+#   prod.yml  — encrypts the root filesystem and installs the fail-CLOSED prod
+#               initramfs (LUKS unlock + root rotation). Distinct measurement.
+#   debug.yml — installs the fail-OPEN debug initramfs (static k3s key, no LUKS) and
+#               performs NO encryption. Distinct measurement. The debug-only *_debug
+#               entries are installed ONLY by this set, so prod carries none of that code.
+
+- name: Encrypt root filesystem and install production initramfs
+  ansible.builtin.include_tasks: prod.yml
+  tags: luks-prod
+  when: not (debug_build | default(false))
+
+- name: Install debug initramfs (no encryption)
+  ansible.builtin.include_tasks: debug.yml
+  tags: luks-debug
+  when: debug_build | default(false)

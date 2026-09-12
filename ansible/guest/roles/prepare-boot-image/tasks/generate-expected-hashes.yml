@@ -1,0 +1,53 @@
+---
+# Generate /etc/tdx-rtmr3-expected-hashes: the RTMR3 canonical manifest, the boot-time integrity
+# gate for the measured root. Included by this role's finalize sub-tasks (luks_encrypt.yml for prod,
+# debug_install.yml for debug) over the mounted root (`newroot_mount`), and MUST run BEFORE that
+# sub-task's final `update-initramfs` — the rtmr3-measure hook copies this file into the initramfs,
+# so it is covered by RTMR1 and cannot be tampered with offline.
+#
+# This lives here, in prepare-boot-image, and not in rtmr3-measure, because the manifest is
+# inseparable from assembling the final boot image: several measured files reach their final on-disk
+# content only in this stage (/etc/fstab rewritten to /dev/mapper by encryption; /root/.ssh set
+# earlier by setup-ssh-access; cleanup adds systemd drop-ins; /etc/tdx-luks.conf written here).
+# Hashing the FINAL root means EVERY measured file gets a real canonical hash — nothing is excluded
+# — so offline tampering of a privileged file (a rogue key in /root/.ssh, a changed /etc/fstab, a
+# swapped verification tool) is caught at boot before RTMR3 is extended. rtmr3-measure still owns the
+# boot-time side (the conf, the hook, the init-bottom verifier).
+#
+# Runs on the build host against the mounted root (not a chroot): each conf path is resolved under
+# {{ newroot_mount }} and the mount prefix stripped from the emitted path, so the file carries the
+# same absolute paths the boot-time lookup (expected_hash_for) matches on.
+- name: Generate /etc/tdx-rtmr3-expected-hashes over the finalized root
+  ansible.builtin.shell: |
+    set -euo pipefail
+    root="{{ newroot_mount }}"
+    root="${root%/}"
+    conf="$root/etc/tdx-measure.conf"
+    out="$root/etc/tdx-rtmr3-expected-hashes"
+
+    # Both the file set and the hashes come from tdx-measure, the SAME script the
+    # initramfs measurer runs at boot, so this manifest cannot disagree with what
+    # RTMR3 is actually extended with. It owns the parse, the LC_ALL=C ordering, the
+    # symlinked-entry refusal and the content-only `sha384sum < file` hashing; this
+    # task only swaps the two fields into the <path> <hash> manifest layout.
+    # Hashing BEFORE touching $out so a bad conf fails the build with the previous
+    # manifest intact — build is where such a problem should surface, not boot.
+    hashes=$(mktemp)
+    trap 'rm -f "$hashes"' EXIT
+    "$root/usr/local/bin/tdx-measure" hash "$root" "$conf" > "$hashes"
+
+    chattr -i "$out" 2>/dev/null || true
+    {
+      printf '# Expected SHA-384 hashes for canonical files, verified at boot.\n'
+      printf '# Generated over the FINAL image root while assembling the boot image, so every\n'
+      printf '# measured file is hashed in its true on-disk state — nothing excluded. Baked into\n'
+      printf '# the initramfs (covered by RTMR1); a boot-time mismatch powers the VM off.\n'
+      printf '# Format: <absolute-path> <sha384hex>\n'
+      while IFS= read -r line; do
+        printf '%s %s\n' "${line#* }" "${line%% *}"
+      done < "$hashes"
+    } > "$out"
+    chattr +i "$out"
+  args:
+    executable: /bin/bash
+  changed_when: true

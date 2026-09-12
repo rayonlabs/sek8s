@@ -1,0 +1,69 @@
+---
+# DEBUG task set (gated by main.yml: debug_build is true).
+#
+# The debug image is UNENCRYPTED. This set does NOT touch LUKS at all — it only
+# installs the fail-OPEN debug initramfs into the plain root filesystem (offline,
+# host-side over nbd/chroot) and rebuilds the initramfs. That gives a debug VM the
+# same boot-attestation / RC-provisioning code path as prod (validator auth, VM root
+# CA registration, k3s encryption) so it can be joined to the network by an operator
+# for hardware debugging — while never being trusted with real traffic.
+#
+# Installed scripts (debug set — all-or-nothing):
+#   hooks/fetch_key                 shared  (stages binaries + shell libs)
+#   scripts/init-top/load-tdx       shared
+#   scripts/attest-common           shared  (boot-attestation lib)
+#   scripts/provision-common        shared  (/provision + k3s-encryption lib)
+#   scripts/hotkey-sign             shared  (sr25519 miner-hotkey signing lib)
+#   scripts/init-premount/fetch_key_and_unlock_debug   DEBUG entry (fail-open, no LUKS)
+#   scripts/init-bottom/setup_storage_debug            DEBUG entry (static k3s key)
+#   scripts/init-bottom/write-validator-auth_debug     DEBUG entry (fail-open)
+#
+# NOT installed: luks-helpers (LUKS-only), fetch_key_and_unlock / setup_storage (prod
+# entries). Prod-only code never lands in the debug image, and the *_debug entries never
+# land in prod — the two initramfs images carry different files and different measurements.
+
+- name: Check if nbd device is connected
+  ansible.builtin.command: qemu-nbd --check {{ nbd_device }}
+  register: nbd_check_result
+  failed_when: false
+  changed_when: false
+
+- name: Disconnect nbd device if connected
+  ansible.builtin.command: qemu-nbd --disconnect {{ nbd_device }}
+  when: nbd_check_result.rc == 0
+  register: nbd_disconnect_result
+  changed_when: nbd_disconnect_result.rc == 0
+  ignore_errors: true
+
+- name: Unmount all possible partitions if mounted
+  ansible.builtin.mount:
+    path: "{{ item }}"
+    state: unmounted
+  ignore_errors: true
+  loop:
+    - "{{ newroot_mount }}/sys/firmware/efi/efivars"
+    - "{{ newroot_mount }}/proc"
+    - "{{ newroot_mount }}/sys"
+    - "{{ newroot_mount }}/dev"
+    - "{{ newroot_mount }}/run"
+    - "{{ newroot_mount }}/boot/efi"
+    - "{{ newroot_mount }}/boot"
+    - "{{ newroot_mount }}"
+
+- name: Clean up temporary directories if leftover
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  ignore_errors: true
+  loop:
+    - "{{ newroot_mount }}"
+
+# Install the debug initramfs into the plain image. always runs cleanup even on
+# failure to avoid leaving nbd connected.
+- name: Debug initramfs install
+  block:
+    - name: Run debug initramfs install tasks
+      ansible.builtin.include_tasks: debug_install.yml
+  always:
+    - name: Cleanup on success or failure
+      ansible.builtin.include_tasks: luks_cleanup.yml

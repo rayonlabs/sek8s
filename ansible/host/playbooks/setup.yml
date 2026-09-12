@@ -12,10 +12,13 @@
   gather_facts: true
   become: true
   vars:
+  # Thin orchestration around the CLI: host_tools bootstraps `chutes-cvm` (installs it + its fetch
+  # deps), tdx_bootstrap runs `chutes-cvm host setup` (which now owns the complete per-host config —
+  # packages incl. chrony/aria2/xfsprogs, NTP, kernel/GRUB, driver blacklist, QGS/QCNL, kvm group,
+  # /var/lib/chutes dirs) then handles the reboot + TDX-init verify, and pccs_configure applies the
+  # vault-held PCCS secrets. The former ntp / host_prerequisites / chutes_dirs roles are folded into
+  # host setup.
   roles:
-    - role: ntp
-    - role: host_prerequisites
     - role: host_tools
     - role: tdx_bootstrap
-    - role: chutes_dirs
     - role: pccs_configure

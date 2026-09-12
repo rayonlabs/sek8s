@@ -1,0 +1,10 @@
+# vim: ft=apparmor
+# sek8s-cache-deny — deny access to HF model cache volume
+# Included by profiles that must NOT access /var/snap/cache/.
+# Services that need cache access use their own named profile
+# (applied via systemd AppArmorProfile=) which does not include
+# this abstraction.
+{% set deny_kw = 'audit deny' if debug_build | default(false) else 'deny' %}
+
+  {{ deny_kw }} /var/snap/cache/ rwlk,
+  {{ deny_kw }} /var/snap/cache/** rwlk,

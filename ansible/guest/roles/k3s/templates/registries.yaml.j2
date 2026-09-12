@@ -1,26 +1,15 @@
 # Registry mirrors configuration
 # Docker Hub authentication (docker.io / registry-1.docker.io) is merged at VM boot by
 # config-manager (process-config.py) from the config volume — no Hub secrets in the image.
-mirrors:
-  "{{ registry_hostname }}:{{ registry_port | default('30500') }}":
-    endpoint:
-      - "{{ registry_protocol | default('http') }}://{{ registry_hostname }}:{{ registry_port | default('30500') }}"
-
-# Configure registry authentication if needed
+#
+# registry.chutes.ai mTLS: the per-boot leaf client cert is generated in the
+# RTMR2-measured initramfs by generate_registry_client_cert() (setup_vm_tls,
+# vm-tls role) before userspace starts. The paths are static across all VMs
+# (only the cert content differs, not the path), so this config is safe to bake
+# in at image build time and measure into RTMR3. containerd reads the leaf cert
+# directly for mTLS pulls — no local proxy, no NodePort, no insecure registry.
 configs:
-  "{{ registry_hostname }}:{{ registry_port | default('30500') }}":
-{% if registry_protocol | default('http') == 'http' %}
+  "registry.chutes.ai":
     tls:
-      insecure_skip_verify: true
-{% else %}
-    tls:
-      cert_file: ""
-      key_file: ""
-      ca_file: ""
-      insecure_skip_verify: false
-{% endif %}
-{% if use_registry_auth | default(false) %}
-    auth:
-      username: "{{ registry_username }}"
-      password: "{{ registry_password }}"
-{% endif %}
+      cert_file: /run/chutes/registry-tls/client.crt
+      key_file: /run/chutes/registry-tls/client.key

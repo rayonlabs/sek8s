@@ -5,11 +5,49 @@
     state: directory
     mode: '0755'
 
-- name: Install Helm PGP keyring for chart provenance verification
+- name: Fetch and verify Helm key from signing-keys API (runs on build host)
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    # Expand ~ in root_signing_key_path (Ansible does not shell-expand tilde in strings)
+    ROOT_KEY=$(eval echo "{{ root_signing_key_path }}")
+    SIGNING_KEYS_URL="{{ validator_base_url }}/servers/signing-keys"
+
+    [ -f "$ROOT_KEY" ] || { echo "ERROR: root signing key not found: $ROOT_KEY" >&2; exit 1; }
+
+    BUNDLE=$(curl -sf --max-time 30 "$SIGNING_KEYS_URL") \
+      || { echo "ERROR: failed to fetch key bundle from $SIGNING_KEYS_URL" >&2; exit 1; }
+
+    KEY_B64=$(printf '%s' "$BUNDLE" | jq -r --arg k "helm-pubkey.gpg" '.keys[$k] // empty')
+    SIG_B64=$(printf '%s' "$BUNDLE" | jq -r --arg k "helm-pubkey.gpg" '.signatures[$k] // empty')
+
+    [ -n "$KEY_B64" ] || { echo "ERROR: helm-pubkey.gpg not in key bundle" >&2; exit 1; }
+    [ -n "$SIG_B64" ] || { echo "ERROR: helm-pubkey.gpg signature not in bundle" >&2; exit 1; }
+
+    TMPKEY=$(mktemp /tmp/helm-key.XXXXXXXX)
+    TMPSIG=$(mktemp /tmp/helm-sig.XXXXXXXX)
+    trap 'rm -f "$TMPKEY" "$TMPSIG"' EXIT
+
+    printf '%s' "$KEY_B64" | base64 -d > "$TMPKEY"
+    printf '%s' "$SIG_B64" | base64 -d > "$TMPSIG"
+
+    openssl dgst -sha256 -verify "$ROOT_KEY" -signature "$TMPSIG" "$TMPKEY" >&2 \
+      || { echo "ERROR: RSA signature verification FAILED for helm-pubkey.gpg" >&2; exit 1; }
+
+    # Output verified key bytes as base64 for the follow-up copy task
+    base64 -w0 < "$TMPKEY"
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  become: false
+  register: _helm_key_b64
+  changed_when: false
+
+- name: Write verified Helm PGP key to VM temp path for chart install
   ansible.builtin.copy:
-    src: "{{ helm_chart_public_key_path }}"
-    dest: /etc/chutes/helm-pubkey.gpg
-    mode: '0644'
+    content: "{{ _helm_key_b64.stdout | b64decode }}"
+    dest: /tmp/build-helm-pubkey.gpg
+    mode: '0600'
 
 - name: Create Helm config directories for build-time and boot-time use
   ansible.builtin.file:
@@ -47,7 +85,7 @@
       {% if chutes_chart_version is defined and chutes_chart_version %}
       --version {{ chutes_chart_version | quote }} \
       {% endif %}
-      --verify --keyring /etc/chutes/helm-pubkey.gpg \
+      --verify --keyring /tmp/build-helm-pubkey.gpg \
       --set-string minerCredentials.ss58Address="REPLACE_ME" \
       --set-string minerCredentials.secretSeed="REPLACE_ME" \
       {% if (chutes_gpu_values | default({}) | length) > 0 %}
@@ -61,6 +99,11 @@
   register: miner_deployment
   changed_when: miner_deployment.rc == 0
   no_log: true
+
+- name: Remove build-time Helm keyring (not persisted in image)
+  ansible.builtin.file:
+    path: /tmp/build-helm-pubkey.gpg
+    state: absent
 
 - name: Display deployment result
   ansible.builtin.debug:

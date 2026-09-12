@@ -1,25 +1,151 @@
 ---
 # One-time setup for a host used to build guest VM images.
-# Run this after setup.yml when provisioning a new build host.
+#
+# STANDALONE. A build host is not a miner TEE host: do NOT run setup.yml here. setup.yml
+# provisions a bare-metal host to *run* the guest VM (TDX bootstrap, PCCS, a sparse
+# host-tools-only checkout at /opt/sek8s); this playbook provisions a host to *build* the
+# image, and owns everything that needs, including the full sek8s checkout it builds from.
 #
 # Usage (from repo root or ansible/host):
 #   ansible-playbook -i inventory/hosts.yml playbooks/build-setup.yml
 #
 # What this does:
+#   - Clones the full sek8s repo the build runs from (see sek8s_build_root below)
 #   - Benchmarks Ubuntu apt mirrors and selects the fastest one
 #   - Installs host script dependencies (git, aria2, python3-yaml, python3-venv)
 #   - Installs Ansible for running the guest image build locally
+#   - Installs Docker (offline RTMR0 generation runs the tdx-measure fork's
+#     patched QEMU in a container; see `chutes-cvm measurements generate`)
+#   - Installs libguestfs-tools (RTMR3 mounts the image root read-only;
+#     see `chutes-cvm measurements generate` / the standalone `rtmr3`)
+#   - Installs rustup for build_user (the guest build compiles the sr25519 initramfs
+#     signer with the pinned toolchain + musl target from src/sr25519/rust-toolchain.toml)
 
 - name: Build host setup
   hosts: td_hosts
   gather_facts: true
   become: true
+  vars:
+    # Full checkout the guest image build runs from (`cd {{ sek8s_build_root }}/ansible/guest &&
+    # ansible-playbook playbooks/chutes-miner-vm.yml`). Distinct in purpose from the miner host's
+    # sek8s_remote_root, which install.sh sparse-fetches to host-tools/ + firmware/ + src/chutes-cvm/;
+    # a build needs ansible/guest/, guest-tools/, charts/ and src/ too, so this is a plain full clone.
+    # sek8s_repo_url / sek8s_repo_branch come from playbooks/group_vars/all.yml.
+    sek8s_build_root: /opt/sek8s
+    # Account that drives the guest image build; everything per-user (rustup, checkout ownership)
+    # is provisioned for it. Root by default — nbd/cryptsetup/virsh need it anyway. Home is read
+    # from passwd, never set separately, so the two cannot disagree.
+    build_user: root
   roles:
     - role: host_mirror
     - role: host_prerequisites
   tasks:
+    # check_mode: false — every task below needs build_user_home.
+    - name: Read the passwd database (build user home)
+      ansible.builtin.getent:
+        database: passwd
+      check_mode: false
+
+    - name: Assert the build user has a passwd entry
+      ansible.builtin.assert:
+        that: build_user in ansible_facts.getent_passwd
+        fail_msg: >-
+          build_user '{{ build_user }}' has no passwd entry on this host, so its home directory
+          cannot be resolved. Set build_user to an account that exists here.
+
+    - name: Resolve the build user's home
+      ansible.builtin.set_fact:
+        build_user_home: "{{ ansible_facts.getent_passwd[build_user][4] }}"
+
+    # ── Source checkout ────────────────────────────────────────────────────────
+    - name: Create the sek8s checkout directory owned by the build user
+      ansible.builtin.file:
+        path: "{{ sek8s_build_root }}"
+        state: directory
+        owner: "{{ build_user }}"
+        group: "{{ build_user }}"
+        mode: "0755"
+
+    # update: false — bootstrap only; a re-run must not move the operator's branch.
+    - name: Clone the sek8s repo the build runs from
+      ansible.builtin.git:
+        repo: "{{ sek8s_repo_url }}"
+        dest: "{{ sek8s_build_root }}"
+        version: "{{ sek8s_repo_branch | default('main') }}"
+        update: false
+      environment:
+        GIT_TERMINAL_PROMPT: "0"   # fail fast on missing credentials instead of hanging on a prompt
+      become_user: "{{ build_user }}"
+
+    - name: Report the build checkout
+      ansible.builtin.debug:
+        msg: >-
+          Build from: cd {{ sek8s_build_root }}/ansible/guest &&
+          ansible-playbook playbooks/chutes-miner-vm.yml
+
+    # ── Build toolchain ────────────────────────────────────────────────────────
     - name: Install Ansible
       ansible.builtin.apt:
         name: ansible
         state: present
         update_cache: true
+
+    - name: Install Docker (with buildx)
+      # measurements generate's offline ACPI gen runs the tdx-measure fork's `docker build
+      # --progress plain`, which needs BuildKit (the buildx plugin), not docker.io's legacy builder.
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-buildx
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker is running and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Install libguestfs-tools (guestfish, for stage-boot-artifacts)
+      ansible.builtin.apt:
+        name: libguestfs-tools
+        state: present
+        update_cache: true
+
+    # Only rustup honors the pinned toolchain + musl target in src/sr25519/rust-toolchain.toml.
+    # --default-toolchain none: the sr25519 role installs the pinned one on first build.
+    # --no-modify-path: that role puts ~/.cargo/bin on PATH itself.
+    - name: Install rustup for the build user (sr25519 guest-image signer)
+      ansible.builtin.shell: |
+        set -o pipefail
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --no-modify-path --default-toolchain none
+      args:
+        creates: "{{ build_user_home }}/.rustup"
+        executable: /bin/bash
+      become_user: "{{ build_user }}"
+      environment:
+        HOME: "{{ build_user_home }}"
+        RUSTUP_HOME: "{{ build_user_home }}/.rustup"
+        CARGO_HOME: "{{ build_user_home }}/.cargo"
+
+    # Otherwise a wrong-user rustup only surfaces ~30 min into a build, as an sr25519 failure.
+    - name: Verify rustup is usable by the build user
+      ansible.builtin.command: "{{ build_user_home }}/.cargo/bin/rustup --version"
+      become_user: "{{ build_user }}"
+      environment:
+        RUSTUP_HOME: "{{ build_user_home }}/.rustup"
+        CARGO_HOME: "{{ build_user_home }}/.cargo"
+      changed_when: false
+
+    - name: Report the rustup install
+      ansible.builtin.debug:
+        msg: >-
+          rustup ready for {{ build_user }} at {{ build_user_home }}/.cargo/bin —
+          run the guest image build as {{ build_user }}.
+
+    # NOTE: chutes-cvm is NOT installed here. The guest build (chutes-miner-vm.yml)
+    # self-installs it from its own checkout (`pip install -e {{ repo_root }}/src/chutes-cvm`)
+    # so the build always runs the code under test — installing here from /opt/sek8s could
+    # be a different checkout. build-setup only ensures the prereq (python3-venv, via
+    # host_prerequisites); the build owns the install.

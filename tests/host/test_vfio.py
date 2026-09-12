@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 import pytest
-from chutes.guest.vfio import (
+from chutes_cvm.vfio import (
     _get_bound_driver,
     bind_explicit_devices_to_vfio,
     has_stale_vfio_devices,
@@ -34,13 +34,13 @@ def test_get_bound_driver_returns_none_when_unbound(mock_islink):
 # ---------------------------------------------------------------------------
 
 
-@patch("chutes.guest.vfio._get_bound_driver")
+@patch("chutes_cvm.vfio._get_bound_driver")
 def test_has_stale_vfio_devices_true(mock_driver):
     mock_driver.side_effect = [None, "vfio-pci", None]
     assert has_stale_vfio_devices(["0000:a:00.0", "0000:b:00.0", "0000:c:00.0"])
 
 
-@patch("chutes.guest.vfio._get_bound_driver", return_value=None)
+@patch("chutes_cvm.vfio._get_bound_driver", return_value=None)
 def test_has_stale_vfio_devices_false(mock_driver):
     assert not has_stale_vfio_devices(["0000:a:00.0", "0000:b:00.0"])
 
@@ -50,16 +50,16 @@ def test_has_stale_vfio_devices_false(mock_driver):
 # ---------------------------------------------------------------------------
 
 
-@patch("chutes.guest.vfio._sysfs_write")
-@patch("chutes.guest.vfio._get_bound_driver", return_value="nvidia")
+@patch("chutes_cvm.vfio._sysfs_write")
+@patch("chutes_cvm.vfio._get_bound_driver", return_value="nvidia")
 def test_unbind_noop_when_not_vfio(mock_driver, mock_write):
     """Devices not on vfio-pci should not be unbound."""
     unbind_stale_vfio_devices(["0000:b8:00.0"])
     mock_write.assert_not_called()
 
 
-@patch("chutes.guest.vfio._sysfs_write", return_value=True)
-@patch("chutes.guest.vfio._get_bound_driver", return_value="vfio-pci")
+@patch("chutes_cvm.vfio._sysfs_write", return_value=True)
+@patch("chutes_cvm.vfio._get_bound_driver", return_value="vfio-pci")
 def test_unbind_writes_unbind_and_clears_override(mock_driver, mock_write):
     """Devices on vfio-pci should be unbound and have driver_override cleared."""
     unbind_stale_vfio_devices(["0000:b8:00.0"])
@@ -69,8 +69,8 @@ def test_unbind_writes_unbind_and_clears_override(mock_driver, mock_write):
     assert ("/sys/bus/pci/devices/0000:b8:00.0/driver_override", "") in calls
 
 
-@patch("chutes.guest.vfio._sysfs_write", return_value=True)
-@patch("chutes.guest.vfio._get_bound_driver")
+@patch("chutes_cvm.vfio._sysfs_write", return_value=True)
+@patch("chutes_cvm.vfio._get_bound_driver")
 def test_unbind_handles_multiple_devices(mock_driver, mock_write):
     """Multiple vfio-pci devices should all be unbound; non-vfio skipped."""
     mock_driver.side_effect = ["vfio-pci", "vfio-pci", None]
@@ -86,8 +86,8 @@ def test_unbind_handles_multiple_devices(mock_driver, mock_write):
     assert all("0000:ba:00.0" not in str(c) for c in written)
 
 
-@patch("chutes.guest.vfio._sysfs_write", return_value=False)
-@patch("chutes.guest.vfio._get_bound_driver", return_value="vfio-pci")
+@patch("chutes_cvm.vfio._sysfs_write", return_value=False)
+@patch("chutes_cvm.vfio._get_bound_driver", return_value="vfio-pci")
 def test_unbind_warns_on_timeout(mock_driver, mock_write, capsys):
     """Timed-out unbind should warn, not raise, and not clear override."""
     failed = unbind_stale_vfio_devices(["0000:b8:00.0"])
@@ -103,9 +103,9 @@ def test_unbind_warns_on_timeout(mock_driver, mock_write, capsys):
 # ---------------------------------------------------------------------------
 
 
-@patch("chutes.guest.vfio.load_vfio_modules")
-@patch("chutes.guest.vfio.bind_device_to_vfio")
-@patch("chutes.guest.vfio._is_vfio_bound", return_value=True)
+@patch("chutes_cvm.vfio.load_vfio_modules")
+@patch("chutes_cvm.vfio.bind_device_to_vfio")
+@patch("chutes_cvm.vfio._is_vfio_bound", return_value=True)
 def test_bind_prints_success_when_all_bound(mock_bound, mock_bind, mock_load, capsys):
     bind_explicit_devices_to_vfio(["0000:dc:00.0", "0000:dd:00.0"])
     out = capsys.readouterr().out
@@ -113,29 +113,33 @@ def test_bind_prints_success_when_all_bound(mock_bound, mock_bind, mock_load, ca
     assert "0000:dd:00.0 → vfio-pci" in out
 
 
-@patch("chutes.guest.vfio.load_vfio_modules")
-@patch("chutes.guest.vfio.bind_device_to_vfio")
-@patch("chutes.guest.vfio.time.sleep")
-@patch("chutes.guest.vfio._is_vfio_bound")
-def test_bind_succeeds_after_retry(mock_bound, mock_sleep, mock_bind, mock_load, capsys):
+@patch("chutes_cvm.vfio.load_vfio_modules")
+@patch("chutes_cvm.vfio.bind_device_to_vfio")
+@patch("chutes_cvm.vfio.time.sleep")
+@patch("chutes_cvm.vfio._is_vfio_bound")
+def test_bind_succeeds_after_retry(
+    mock_bound, mock_sleep, mock_bind, mock_load, capsys
+):
     # Not bound on the first check (still settling after reset), bound on retry.
     mock_bound.side_effect = [False, True, True]
     bind_explicit_devices_to_vfio(["0000:dc:00.0"])
     assert "0000:dc:00.0 → vfio-pci" in capsys.readouterr().out
 
 
-@patch("chutes.guest.vfio.load_vfio_modules")
-@patch("chutes.guest.vfio.bind_device_to_vfio")
-@patch("chutes.guest.vfio._is_vfio_bound", return_value=False)
-@patch("chutes.guest.vfio._get_bound_driver", return_value="nvidia")
-@patch("chutes.guest.vfio.time.sleep")
-@patch("chutes.guest.vfio.time.time", side_effect=[0, 0, 100])
+@patch("chutes_cvm.vfio.load_vfio_modules")
+@patch("chutes_cvm.vfio.bind_device_to_vfio")
+@patch("chutes_cvm.vfio._is_vfio_bound", return_value=False)
+@patch("chutes_cvm.vfio._get_bound_driver", return_value="nvidia")
+@patch("chutes_cvm.vfio.time.sleep")
+@patch("chutes_cvm.vfio.time.time", side_effect=[0, 0, 100])
 def test_bind_raises_when_device_never_binds(
     mock_time, mock_sleep, mock_driver, mock_bound, mock_bind, mock_load
 ):
     # A device that never lands on vfio-pci must abort loudly (with its driver),
     # not sail into a cryptic QEMU "couldn't open .../vfio-dev" failure.
-    with pytest.raises(RuntimeError, match=r"Failed to bind.*0000:dc:00.0.*driver=nvidia"):
+    with pytest.raises(
+        RuntimeError, match=r"Failed to bind.*0000:dc:00.0.*driver=nvidia"
+    ):
         bind_explicit_devices_to_vfio(["0000:dc:00.0"])
 
 
@@ -186,14 +190,14 @@ def test_pci_operations_wedged_false_when_no_d_state_pci_tasks(mock_run):
     assert not pci_operations_wedged()
 
 
-@patch("chutes.guest.vfio.pci_operations_wedged", side_effect=[True, True, False])
-@patch("chutes.guest.vfio.time.sleep")
+@patch("chutes_cvm.vfio.pci_operations_wedged", side_effect=[True, True, False])
+@patch("chutes_cvm.vfio.time.sleep")
 def test_wait_pci_operations_idle_returns_when_tasks_clear(mock_sleep, mock_wedged):
     assert wait_pci_operations_idle(timeout_secs=10)
 
 
-@patch("chutes.guest.vfio.pci_operations_wedged", return_value=True)
-@patch("chutes.guest.vfio.time.sleep")
-@patch("chutes.guest.vfio.time.time", side_effect=[0, 0, 100])
+@patch("chutes_cvm.vfio.pci_operations_wedged", return_value=True)
+@patch("chutes_cvm.vfio.time.sleep")
+@patch("chutes_cvm.vfio.time.time", side_effect=[0, 0, 100])
 def test_wait_pci_operations_idle_times_out(mock_time, mock_sleep, mock_wedged):
     assert not wait_pci_operations_idle(timeout_secs=10)

@@ -6,5 +6,6 @@
       - aria2
       - python3-yaml
       - python3-venv
+      - xfsprogs
     state: present
     update_cache: true

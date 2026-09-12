@@ -1,0 +1,50 @@
+#!/bin/sh
+# init-premount/dump-ccel — CAPTURE-ONLY, injected into a throwaway image copy by the
+# capture-ccel role. Dumps the CC event log (the RTMR0 baseline) to the serial console and
+# powers off, before any userspace — so the capture VM does firmware -> kernel -> dump ->
+# off. RTMR0 is firmware-populated before the kernel, so a minimal boot yields the same
+# CCEL a full boot would, without the userspace that can hang. The host decodes the base64
+# from the serial log. ccel_data is required; the fw_cfg/SMBIOS blobs are best-effort (need
+# qemu_fw_cfg, and only the future smbios_match.py uses them).
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+
+modprobe qemu_fw_cfg 2>/dev/null || true
+# The /sys/firmware/qemu_fw_cfg/by_name tree appears only once the driver probes;
+# give it a moment so the fw_cfg/SMBIOS blobs below are not silently missed.
+i=0
+while [ ! -d /sys/firmware/qemu_fw_cfg/by_name ] && [ "$i" -lt 50 ]; do
+  i=$((i + 1)); sleep 0.1
+done
+
+# Silence the kernel console so our base64 is not interleaved with printk on the serial.
+echo 0 > /proc/sys/kernel/printk 2>/dev/null || true
+
+S=/dev/ttyS0
+dump() {  # $1 = label  $2 = path
+  if [ -r "$2" ]; then
+    echo "MEAS-DUMP-BEGIN $1 $(wc -c < "$2" 2>/dev/null || echo 0)" > "$S"
+    base64 "$2" > "$S" 2>/dev/null || echo "(base64 failed)" > "$S"
+    echo "MEAS-DUMP-END $1" > "$S"
+  else
+    echo "MEAS-DUMP-MISSING $1 $2" > "$S"
+  fi
+}
+
+dump ccel_data     /sys/firmware/acpi/tables/data/CCEL
+dump ccel          /sys/firmware/acpi/tables/CCEL
+dump acpi_tables   /sys/firmware/qemu_fw_cfg/by_name/etc/acpi/tables/raw
+dump table_loader  /sys/firmware/qemu_fw_cfg/by_name/etc/table-loader/raw
+dump rsdp          /sys/firmware/qemu_fw_cfg/by_name/etc/acpi/rsdp/raw
+dump smbios_tables /sys/firmware/qemu_fw_cfg/by_name/etc/smbios/smbios-tables/raw
+dump smbios_anchor /sys/firmware/qemu_fw_cfg/by_name/etc/smbios/smbios-anchor/raw
+dump extra_pci_roots /sys/firmware/qemu_fw_cfg/by_name/etc/extra-pci-roots/raw
+dump bootorder     /sys/firmware/qemu_fw_cfg/by_name/bootorder/raw
+
+echo "MEAS-DUMP-COMPLETE" > "$S"
+sleep 1
+poweroff -f

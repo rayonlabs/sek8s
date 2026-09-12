@@ -7,7 +7,6 @@ After=cache-storage.mount
 After=verify-storage.service
 Before=containerd.service
 Before=k3s.service
-Before=k3s-agent.service
 
 [Service]
 Type=oneshot

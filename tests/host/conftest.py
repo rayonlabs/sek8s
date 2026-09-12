@@ -1,10 +1,10 @@
 import os
 import sys
 
-# chutes.guest is not an installed package; add host-tools/scripts/ to sys.path
-# so that `from chutes.guest.gpu.profiles import ...` works in tests.
-_HOST_SCRIPTS = os.path.join(
-    os.path.dirname(__file__), os.pardir, os.pardir, "host-tools", "scripts"
+# chutes_cvm is a src/ package; add src/chutes-cvm/ to sys.path so that
+# `from chutes_cvm.guest.gpu.profiles import ...` works in tests without an install.
+_PKG = os.path.join(
+    os.path.dirname(__file__), os.pardir, os.pardir, "src", "chutes-cvm"
 )
-if os.path.abspath(_HOST_SCRIPTS) not in sys.path:
-    sys.path.insert(0, os.path.abspath(_HOST_SCRIPTS))
+if os.path.abspath(_PKG) not in sys.path:
+    sys.path.insert(0, os.path.abspath(_PKG))

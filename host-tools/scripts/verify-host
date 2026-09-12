@@ -1,5 +1,0 @@
-#!/usr/bin/env python3
-import sys
-from chutes.guest.verify import main
-
-sys.exit(main())

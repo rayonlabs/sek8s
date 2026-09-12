@@ -32,12 +32,11 @@ VERSION_CHANGELOG_MAP: dict[str, str] = {
     "ansible/guest/VERSION": "changelogs/vm",
     "src/sek8s/VERSION": "changelogs/sek8s",
     "src/attestation-proxy/VERSION": "changelogs/attestation-proxy",
+    "src/chutes-cvm/VERSION": "changelogs/chutes-cvm",
     "changelogs/ops/VERSION": "changelogs/ops",
 }
 
 CATEGORY_ORDER = ["Added", "Changed", "Fixed", "Removed"]
-
-BRANCH_PREFIXES = ("feature/", "bugfix/", "fix/", "chore/", "hotfix/")
 
 # Maps file path prefixes to the changelog component they affect.
 # Order matters: first match wins, so more specific prefixes go first.
@@ -45,6 +44,7 @@ PATH_CHANGELOG_MAP: list[tuple[str, str]] = [
     ("src/sek8s/", "changelogs/sek8s"),
     ("src/sek8s-common/", "changelogs/sek8s"),
     ("src/attestation-proxy/", "changelogs/attestation-proxy"),
+    ("src/chutes-cvm/", "changelogs/chutes-cvm"),
     ("ansible/guest/", "changelogs/vm"),
     ("nvevidence/", "changelogs/vm"),
     # Ops changelog — versioned via changelogs/ops/VERSION (CalVer YYYY.MM.PATCH).
@@ -298,13 +298,15 @@ def _check_normal() -> int:
 
 
 def branch_to_fragment_name(branch: str) -> str:
-    """Strip common branch prefixes to get the expected fragment filename."""
-    name = branch
-    for prefix in BRANCH_PREFIXES:
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-            break
-    return f"{name}.md"
+    """Derive the expected fragment filename from a branch name.
+
+    The leading ``type/`` segment (``feat/``, ``fix/``, ``chore/``,
+    ``refactor/``, ...) is a branch-naming convention only and is deliberately
+    NOT part of the fragment name. Drop the first path segment when present and
+    flatten any remaining slashes so the result is always a flat filename.
+    """
+    name = branch.split("/", 1)[1] if "/" in branch else branch
+    return f"{name.replace('/', '-')}.md"
 
 
 def affected_components(changed_files: list[str]) -> set[str]:

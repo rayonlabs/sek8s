@@ -1,0 +1,54 @@
+# vim: ft=apparmor
+# sek8s.setup-cache — AppArmor profile for setup-cache.sh.
+# Applied via systemd AppArmorProfile= directive (not auto-attached).
+# Grants: cache rw, coreutils. No network, no credentials.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile sek8s.setup-cache flags=(enforce) {
+  include <abstractions/base>
+
+  # chown -R / chmod 2775 on the cache tree (owned 1000:1000, not root)
+  capability chown,
+  capability fowner,
+  capability fsetid,
+
+  # The script and its interpreter
+  /usr/local/bin/setup-cache.sh r,
+  /usr/bin/bash mrix,
+  /bin/sh mrix,
+
+  # Cache volume — create dirs and set ownership
+  /var/snap/ r,
+  /var/snap/cache/ rw,
+  /var/snap/cache/** rwlk,
+
+  # Coreutils used by the script
+  /usr/bin/mkdir mrix,
+  /usr/bin/chown mrix,
+  /usr/bin/chmod mrix,
+  /usr/bin/mountpoint mrix,
+  /usr/bin/logger mrix,
+  /usr/bin/sync mrix,
+  /usr/bin/echo mrix,
+  /sbin/shutdown mrix,
+
+  # System libraries
+  /usr/lib/** rm,
+  /etc/ld.so.cache r,
+  /etc/ld.so.conf r,
+  /etc/ld.so.conf.d/** r,
+
+  # Proc (mountpoint check)
+  @{PROC}/** r,
+
+  # Logging (logger uses journal socket)
+  /dev/log w,
+  /run/systemd/journal/socket w,
+  /run/systemd/journal/dev-log w,
+  /dev/null rw,
+
+  network unix dgram,
+}

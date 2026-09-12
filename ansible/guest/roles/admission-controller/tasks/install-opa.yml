@@ -49,8 +49,8 @@
         - { path: /var/log/opa, owner: opa, group: opa }
 
     - name: Create OPA configuration
-      ansible.builtin.copy:
-        src: opa-config.yaml
+      ansible.builtin.template:
+        src: opa-config.yaml.j2
         dest: /etc/opa/opa.yaml
         owner: root
         group: root

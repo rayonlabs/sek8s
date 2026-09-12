@@ -11,7 +11,7 @@ sek8s_remote_root: /opt/sek8s
 sek8s_remote_host_tools: "{{ sek8s_remote_root }}/host-tools"
 
 sek8s_repo_url: https://github.com/chutesai/sek8s
-sek8s_repo_branch: main
+sek8s_repo_branch: release/next
 
 # PCCS (setup only) — set BOTH or omit BOTH via inventory / Vault / -e.
 # pccs_api_key: ""
@@ -22,9 +22,13 @@ pccs_ssl_dir: /opt/intel/sgx-dcap-pccs/ssl_key
 
 chutes_validator_api: "https://api.chutes.ai"
 
-upgrade_base_image_url: "https://vm.chutes.ai/tdx-guest.qcow2"
-upgrade_staged_basename: tdx-guest-staged.qcow2
-upgrade_default_base_image: /var/lib/chutes/base-images/tdx-guest.qcow2
+# The base image is a published image SET (qcow2 + direct-boot .vmlinuz/.initrd/.cmdline
+# + manifest.json), verified as a coherent unit via chutes_cvm.guest.image_set. R2 serves the
+# set under the canonical variant name; the local set lives in a per-variant directory.
+upgrade_r2_base_url: "https://vm.chutes.ai"
+upgrade_image_variant: tdx-guest
+upgrade_default_base_image: /var/lib/chutes/base-images/tdx-guest       # image-set directory
+upgrade_staged_dir: /var/lib/chutes/base-images/tdx-guest.staged
 upgrade_chute_label: "chutes/chute=true"
 upgrade_drain_timeout: 600s
 upgrade_drain_timeout_seconds: 600
@@ -42,6 +46,6 @@ upgrade_reboot_timeout_seconds: 1800
 # To add a new hop, append an entry here.
 os_upgrade_path:
   "25.10": "26.04"
-  # 25.04 is EOL. setup.yml no longer supports it, but upgrade-host.yml can
-  # still advance it to 25.10 so the miner can then run setup.yml.
+  # 25.04 and 25.10 are EOL/unsupported waypoints — setup.yml has no profile for
+  # either, so always run with -e target_version=26.04 from them.
   "25.04": "25.10"

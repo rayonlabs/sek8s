@@ -1,0 +1,408 @@
+---
+- name: Load nbd kernel module
+  ansible.builtin.command: modprobe nbd max_part=8
+  args:
+    creates: /dev/nbd0
+  register: modprobe_result
+  changed_when: modprobe_result.rc == 0
+
+- name: Connect qcow2 image to nbd device
+  ansible.builtin.command: qemu-nbd --connect={{ nbd_device }} {{ final_img_path }}
+  args:
+    creates: "{{ nbd_device }}p1"
+  register: qemu_nbd_result
+  changed_when: qemu_nbd_result.rc == 0
+
+- name: Run partprobe to detect partitions
+  ansible.builtin.command: partprobe {{ nbd_device }}
+  changed_when: false
+
+- name: Check if backup already exists
+  ansible.builtin.stat:
+    path: "{{ backup_dir }}/etc"
+  register: backup_stat
+
+- name: Create mount points
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ root_mount }}"
+    - "{{ backup_dir }}"
+    - "{{ newroot_mount }}"
+
+- name: Detect partition layout dynamically
+  ansible.builtin.shell: |
+    set -e
+    efi=""
+    boot=""
+    root=""
+    for part in {{ nbd_device }}p*; do
+      fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || echo "")
+      size=$(blockdev --getsize64 "$part" 2>/dev/null || echo "0")
+      size_mb=$((size / 1024 / 1024))
+      case "$fstype" in
+        vfat) efi="$part" ;;
+        ext4)
+          if [ $size_mb -lt 2048 ]; then boot="$part"; else root="$part"; fi
+          ;;
+      esac
+    done
+    if [ -z "$efi" ] || [ -z "$root" ] || [ -z "$boot" ]; then
+      echo "ERROR: Could not detect partitions" >&2
+      exit 1
+    fi
+    echo "efi=$efi"
+    echo "boot=$boot"
+    echo "root=$root"
+  args:
+    executable: /bin/bash
+  register: partition_detection
+  changed_when: false
+  failed_when: partition_detection.rc != 0
+
+- name: Parse detected partitions
+  ansible.builtin.set_fact:
+    efi_partition: "{{ partition_detection.stdout | regex_search('efi=([^\\s]+)', '\\1') | first }}"
+    boot_partition: "{{ partition_detection.stdout | regex_search('boot=([^\\s]+)', '\\1') | first }}"
+    root_partition: "{{ partition_detection.stdout | regex_search('root=([^\\s]+)', '\\1') | first }}"
+
+- name: Display detected partition layout
+  ansible.builtin.debug:
+    msg:
+      - "Detected partition layout:"
+      - "  EFI:  {{ efi_partition }}"
+      - "  Boot: {{ boot_partition }}"
+      - "  Root: {{ root_partition }}"
+
+- name: Mount root partition
+  ansible.builtin.mount:
+    path: "{{ root_mount }}"
+    src: "{{ root_partition }}"
+    fstype: ext4
+    state: ephemeral
+  when: not backup_stat.stat.exists
+
+- name: Mount boot partition
+  ansible.builtin.mount:
+    path: "{{ root_mount }}/boot"
+    src: "{{ boot_partition }}"
+    fstype: ext4
+    state: ephemeral
+  when: not backup_stat.stat.exists
+
+- name: Mount EFI partition
+  ansible.builtin.mount:
+    path: "{{ root_mount }}/boot/efi"
+    src: "{{ efi_partition }}"
+    fstype: vfat
+    state: ephemeral
+  when: not backup_stat.stat.exists
+
+- name: Backup root filesystem
+  ansible.builtin.command: rsync -aAXv {{ root_mount }}/ {{ backup_dir }}/
+  args:
+    creates: "{{ backup_dir }}/etc"
+  register: rsync_backup_result
+  changed_when: rsync_backup_result.rc == 0
+  when: not backup_stat.stat.exists
+
+- name: Unmount partitions
+  ansible.builtin.mount:
+    path: "{{ item }}"
+    state: unmounted
+  ignore_errors: true
+  loop:
+    - "{{ root_mount }}/boot/efi"
+    - "{{ root_mount }}/boot"
+    - "{{ root_mount }}"
+  when: not backup_stat.stat.exists
+
+- name: Wipe existing superblock
+  ansible.builtin.command: wipefs -a {{ root_partition }}
+  register: wipefs_result
+  changed_when: wipefs_result.rc == 0
+  failed_when: wipefs_result.rc != 0
+
+- name: Create LUKS container
+  community.crypto.luks_device:
+    device: "{{ root_partition }}"
+    state: present
+    type: luks2
+    passphrase: "{{ luks_passphrase }}"
+  no_log: true
+
+# luksFormat assigns a RANDOM container UUID, which lands in cryptroot/crypttab inside the
+# initramfs and so moved RTMR2 on every rebuild. Set it explicitly here.
+#
+# NOT via the module's uuid: parameter — that is a SELECTOR ("identify the LUKS container by
+# UUID", used only when device: and label: are unset), so with device: set it is silently
+# ignored. The module cannot set a UUID at format time at all.
+#
+# Must run before the blkid lookup below, which is what crypttab is built from.
+# --batch-mode is required: luksUUID prompts "Type 'yes' in capital letters" on a tty, and with
+# no stdin under Ansible it aborts or hangs rather than failing cleanly.
+- name: Pin the LUKS container UUID (random per luksFormat; reaches RTMR2 via crypttab)
+  ansible.builtin.command: >-
+    cryptsetup --batch-mode luksUUID --uuid {{ luks_container_uuid }} {{ root_partition }}
+  changed_when: true
+
+# A custom (non-keyring) LUKS2 token is added via `token import` reading JSON from stdin —
+# `token add` is only for built-in keyring tokens (--key-description) and has no --json option.
+# The initramfs (fetch_key_and_unlock) only checks that token 15 EXISTS to detect first boot.
+# No secret here (type/version only), so no no_log — a failure must be visible.
+- name: Add first-boot LUKS2 token
+  ansible.builtin.shell: >-
+    echo '{"type":"chutes-first-boot","keyslots":[],"version":"{{ vm_version }}"}'
+    | cryptsetup token import --token-id 15 {{ root_partition }}
+
+- name: Open LUKS container
+  community.crypto.luks_device:
+    device: "{{ root_partition }}"
+    state: opened
+    name: "{{ encrypted_root_name }}"
+    passphrase: "{{ luks_passphrase }}"
+  no_log: true
+
+- name: Create ext4 filesystem on LUKS partition
+  ansible.builtin.filesystem:
+    dev: /dev/mapper/{{ encrypted_root_name }}
+    fstype: ext4
+    # -U pins the filesystem UUID, which stage-boot-artifacts writes into the kernel cmdline as
+    # root=UUID=. A random one moved RTMR2 on every rebuild.
+    opts: "-U {{ root_fs_uuid }}"
+
+- name: Mount encrypted root
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}"
+    src: "/dev/mapper/{{ encrypted_root_name }}"
+    fstype: ext4
+    state: ephemeral
+
+- name: Restore data to encrypted root
+  ansible.builtin.command: rsync -aAXv {{ backup_dir }}/ {{ newroot_mount }}/
+  args:
+    creates: "{{ newroot_mount }}/etc"
+  register: rsync_restore_result
+  changed_when: rsync_restore_result.rc == 0
+
+- name: Mount boot partition to new root
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}/boot"
+    src: "{{ boot_partition }}"
+    fstype: ext4
+    state: ephemeral
+
+- name: Mount EFI partition to new root
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}/boot/efi"
+    src: "{{ efi_partition }}"
+    fstype: vfat
+    state: ephemeral
+
+- name: Bind mount system directories
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}/{{ item }}"
+    src: "/{{ item }}"
+    fstype: none
+    opts: bind
+    state: ephemeral
+  loop:
+    - proc
+    - sys
+    - dev
+    - run
+
+- name: Get UUID of LUKS partition
+  ansible.builtin.command: blkid -o value -s UUID {{ root_partition }}
+  register: blkid_result
+
+# Guard against a silent regression: the previous attempt used a module parameter that was
+# ignored without error, and the drift only surfaced by diffing two builds' measurements.
+- name: Verify the LUKS UUID pin took effect
+  ansible.builtin.assert:
+    that:
+      - blkid_result.stdout | trim == luks_container_uuid
+    fail_msg: >-
+      LUKS container UUID is {{ blkid_result.stdout | trim }}, expected {{ luks_container_uuid }}.
+      crypttab would carry a random UUID into the initramfs and RTMR2 would drift between builds.
+  changed_when: false
+
+- name: Update /etc/crypttab
+  ansible.builtin.lineinfile:
+    path: "{{ newroot_mount }}/etc/crypttab"
+    line: "{{ encrypted_root_name }} UUID={{ blkid_result.stdout }} none luks,discard"
+    create: yes
+    mode: '0644'
+
+- name: Update /etc/fstab
+  ansible.builtin.replace:
+    path: "{{ newroot_mount }}/etc/fstab"
+    regexp: '^LABEL=cloudimg-rootfs\s+/\s+ext4\s+discard,commit=30,errors=remount-ro\s+0\s+1$'
+    replace: '/dev/mapper/{{ encrypted_root_name }}\t/\text4\tdiscard,errors=remount-ro\t0 1'
+    backup: yes
+
+- name: Copy shared LUKS helpers (init script sourced by both premount and init-bottom)
+  ansible.builtin.copy:
+    src: files/initramfs/luks-helpers
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/luks-helpers"
+    mode: '0755'
+    owner: root
+    group: root
+
+# Shared boot-attestation / provision libraries sourced by the prod entry scripts
+# (fetch_key_and_unlock -> attest-common; setup_storage -> provision-common). Staged
+# into the initramfs by the fetch_key hook.
+- name: Copy shared boot-attestation library (attest-common)
+  ansible.builtin.copy:
+    src: files/initramfs/attest-common
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/attest-common"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy shared provision library (provision-common)
+  ansible.builtin.copy:
+    src: files/initramfs/provision-common
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/provision-common"
+    mode: '0755'
+    owner: root
+    group: root
+
+# The sr25519 hotkey signer is installed for BOTH prod and debug (see debug_install.yml) — it
+# proves hotkey possession on every boot. The fetch_key hook stages it via its /scripts/* file glob.
+- name: Copy sr25519 hotkey signing library (hotkey-sign)
+  ansible.builtin.copy:
+    src: files/initramfs/hotkey-sign
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/hotkey-sign"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy TDX initramfs hooks
+  ansible.builtin.copy:
+    src: files/initramfs/fetch_key
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/hooks/fetch_key"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy TDX module loader script (init-top)
+  ansible.builtin.copy:
+    src: files/initramfs/load-tdx
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-top/load-tdx"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy TDX unlock script (init-premount)
+  ansible.builtin.copy:
+    src: files/initramfs/fetch_key_and_unlock
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-premount/fetch_key_and_unlock"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy storage setup script (init-bottom)
+  ansible.builtin.copy:
+    src: files/initramfs/setup_storage
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-bottom/setup_storage"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy write-validator-auth script (init-bottom)
+  ansible.builtin.copy:
+    src: files/initramfs/write-validator-auth
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-bottom/write-validator-auth"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Create TDX environment configuration
+  ansible.builtin.copy:
+    content: |
+      # TDX LUKS Configuration
+      # tdx_base_url: mTLS proxy — all boot-sensitive initramfs API calls (nonce,
+      #   boot attestation, LUKS attest, root confirm, storage confirm)
+      # validator_base_url: fetch-signing-keys (public endpoint) and post-boot services
+      # Specific paths are hardcoded in fetch_key_and_unlock and setup_storage.
+      TDX_BASE_URL="{{ tdx_base_url }}"
+      VALIDATOR_BASE_URL="{{ validator_base_url }}"
+      TDX_TIMEOUT="{{ tdx_timeout }}"
+      TDX_RETRY_COUNT="{{ tdx_retry_count }}"
+    dest: "{{ newroot_mount }}/etc/tdx-luks.conf"
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Source TDX config in initramfs script
+  ansible.builtin.replace:
+    path: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-premount/fetch_key_and_unlock"
+    regexp: '# Configuration'
+    replace: |
+      # Configuration
+      [ -f /etc/tdx-luks.conf ] && . /etc/tdx-luks.conf
+
+# Generate the RTMR3 canonical manifest over the FINAL root — after /etc/fstab was rewritten to
+# /dev/mapper and /etc/tdx-luks.conf written above, so every measured file is hashed in its final
+# state (nothing excluded). MUST precede the initramfs rebuild below, which embeds the file
+# (covering it under RTMR1). See generate-expected-hashes.yml.
+- name: Normalize per-build variability in initramfs inputs
+  ansible.builtin.include_tasks: normalize-initramfs-inputs.yml
+
+- name: Generate RTMR3 expected-hashes over the finalized encrypted root
+  ansible.builtin.include_tasks: generate-expected-hashes.yml
+
+- name: Update initramfs and grub in chroot
+  ansible.builtin.shell: |
+    chroot {{ newroot_mount }} /bin/bash -c "
+      export SOURCE_DATE_EPOCH={{ initramfs_source_date_epoch }} &&
+      update-initramfs -u -k all &&
+      update-grub
+    "
+  register: chroot_update_result
+  changed_when: chroot_update_result.rc == 0
+
+# Boot-critical guard. The initramfs scripts abort the LUKS unlock and power the VM off if any of
+# these is missing, and the failure only shows at boot — a missing head cost one full build cycle.
+# Verify against the artifact that was actually produced rather than trusting the hook.
+#
+# grep reads from a herestring, NOT a pipe: with `set -o pipefail`, `... | grep -q` returns
+# failure whenever grep matches early and exits, because the upstream write dies on SIGPIPE
+# (rc 141). That reported every binary as missing and failed a build.
+- name: Verify required binaries are present in the initramfs
+  ansible.builtin.shell: |
+    set -uo pipefail
+    tmp=$(mktemp)
+    unlisted=""
+    for img in {{ newroot_mount }}/boot/initrd.img-*; do
+      [ -f "$img" ] || continue
+      lsinitramfs "$img" >> "$tmp" 2>/dev/null || unlisted="$unlisted $img"
+    done
+    [ -n "$unlisted" ] && echo "WARNING: could not list:$unlisted"
+    if [ ! -s "$tmp" ]; then
+      echo "WARNING: no initramfs could be listed - check SKIPPED, not failed"
+      rm -f "$tmp"
+      exit 0
+    fi
+    missing=""
+    for b in head tail tr cut sed awk wc grep basename dirname mktemp dd cat curl jq openssl base64 cryptsetup blkid ip sr25519; do
+      grep -qE "(^|/)${b}$" "$tmp" || missing="$missing $b"
+    done
+    entries=$(wc -l < "$tmp")
+    rm -f "$tmp"
+    if [ -n "$missing" ]; then
+      echo "MISSING FROM INITRAMFS:$missing"
+      exit 1
+    fi
+    echo "all required initramfs binaries present ($entries entries)"
+  args:
+    executable: /bin/bash
+  register: _initramfs_bin_check
+  changed_when: false
+
+- name: Show initramfs binary check result
+  ansible.builtin.debug:
+    var: _initramfs_bin_check.stdout_lines

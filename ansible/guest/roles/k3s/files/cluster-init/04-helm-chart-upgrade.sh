@@ -49,7 +49,14 @@ RECONCILE_RETRY_DELAY="${RECONCILE_RETRY_DELAY:-5}"
 LOG_FILE="${LOG_FILE:-/var/log/helm-chart-upgrade.log}"
 CHARTS_DIR="${CHARTS_DIR:-/etc/chutes/charts}"
 MARKERS_DIR="${MARKERS_DIR:-/var/lib/rancher/k3s/init-markers/charts}"
-KEYRING_FILE="/etc/chutes/helm-pubkey.gpg"
+# Helm provenance keyring is fetched dynamically at boot (fetch-signing-keys, initramfs)
+# into the ephemeral /run tmpfs and PGP-verified against the attested root key — not
+# baked into the image. See the signing-keys role.
+# Staged flat into $STAGED_DIR by the k3s-post-start wrapper, so the basename differs from the
+# /run/chutes path. helm opens this file itself and inherits this script's profile via `ix`, so it
+# must be a path this profile grants — /run/chutes is denied here as it is everywhere.
+KEYRING_FILE="${STAGED_DIR:+$STAGED_DIR/helm-pubkey.gpg}"
+KEYRING_FILE="${KEYRING_FILE:-/run/chutes/signing-keys/helm-pubkey.gpg}"
 KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
 export KUBECONFIG
 # HELM_*_HOME are set by k3s-post-start.service; no fallbacks for determinism

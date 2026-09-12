@@ -27,7 +27,6 @@ async def lifespan(app: FastAPI):
 
     image_mgr = ImageManager(
         allowed_registries=image_config.image_pull_allowed_registries,
-        cosign_key_path=image_config.cosign_public_key_path,
         pull_timeout=image_config.image_pull_timeout_seconds,
         default_org=image_config.image_pull_default_org,
     )

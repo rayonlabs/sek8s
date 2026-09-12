@@ -1,4 +1,4 @@
-"""Unit tests for standalone host CPU tuning (chutes.host.tune).
+"""Unit tests for standalone host CPU tuning (chutes_cvm.host.tune).
 
 Verifies alignment with NVIDIA's CC Deployment Guide guidance: governor ->
 performance, and only the C1E/C6 C-states disabled (POLL/C1 left enabled, and
@@ -7,7 +7,7 @@ no turbo/EPP writes).
 
 from unittest.mock import MagicMock, patch
 
-from chutes.host import tune
+from chutes_cvm.host import tune
 
 _GOV = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
 _STATES = {
@@ -47,10 +47,10 @@ def _read_side_effect(original_saved="powersave"):
 def test_apply_sets_governor_performance(tmp_path):
     write_root = MagicMock()
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", str(tmp_path / "restore.sh")),
-        patch("chutes.host.tune.glob.glob", side_effect=_glob_side_effect),
-        patch("chutes.host.tune._read", side_effect=_read_side_effect()),
-        patch("chutes.host.tune._write_root", write_root),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", str(tmp_path / "restore.sh")),
+        patch("chutes_cvm.host.tune.glob.glob", side_effect=_glob_side_effect),
+        patch("chutes_cvm.host.tune._read", side_effect=_read_side_effect()),
+        patch("chutes_cvm.host.tune._write_root", write_root),
     ):
         tune.apply_tuning()
 
@@ -60,10 +60,10 @@ def test_apply_sets_governor_performance(tmp_path):
 def test_apply_disables_only_c1e_and_c6(tmp_path):
     write_root = MagicMock()
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", str(tmp_path / "restore.sh")),
-        patch("chutes.host.tune.glob.glob", side_effect=_glob_side_effect),
-        patch("chutes.host.tune._read", side_effect=_read_side_effect()),
-        patch("chutes.host.tune._write_root", write_root),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", str(tmp_path / "restore.sh")),
+        patch("chutes_cvm.host.tune.glob.glob", side_effect=_glob_side_effect),
+        patch("chutes_cvm.host.tune._read", side_effect=_read_side_effect()),
+        patch("chutes_cvm.host.tune._write_root", write_root),
     ):
         tune.apply_tuning()
 
@@ -81,10 +81,10 @@ def test_apply_disables_only_c1e_and_c6(tmp_path):
 def test_apply_does_not_touch_turbo_or_epp(tmp_path):
     write_root = MagicMock()
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", str(tmp_path / "restore.sh")),
-        patch("chutes.host.tune.glob.glob", side_effect=_glob_side_effect),
-        patch("chutes.host.tune._read", side_effect=_read_side_effect()),
-        patch("chutes.host.tune._write_root", write_root),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", str(tmp_path / "restore.sh")),
+        patch("chutes_cvm.host.tune.glob.glob", side_effect=_glob_side_effect),
+        patch("chutes_cvm.host.tune._read", side_effect=_read_side_effect()),
+        patch("chutes_cvm.host.tune._write_root", write_root),
     ):
         tune.apply_tuning()
 
@@ -96,10 +96,10 @@ def test_apply_does_not_touch_turbo_or_epp(tmp_path):
 def test_apply_writes_restore_snapshot(tmp_path):
     restore_path = tmp_path / "restore.sh"
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", str(restore_path)),
-        patch("chutes.host.tune.glob.glob", side_effect=_glob_side_effect),
-        patch("chutes.host.tune._read", side_effect=_read_side_effect("powersave")),
-        patch("chutes.host.tune._write_root"),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", str(restore_path)),
+        patch("chutes_cvm.host.tune.glob.glob", side_effect=_glob_side_effect),
+        patch("chutes_cvm.host.tune._read", side_effect=_read_side_effect("powersave")),
+        patch("chutes_cvm.host.tune._write_root"),
     ):
         tune.apply_tuning()
 
@@ -121,11 +121,13 @@ def test_apply_second_call_preserves_original_snapshot(tmp_path):
     write_root = MagicMock()
 
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", str(restore_path)),
-        patch("chutes.host.tune.glob.glob", side_effect=_glob_side_effect),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", str(restore_path)),
+        patch("chutes_cvm.host.tune.glob.glob", side_effect=_glob_side_effect),
         # sysfs now reads "performance" (already tuned)
-        patch("chutes.host.tune._read", side_effect=_read_side_effect("performance")),
-        patch("chutes.host.tune._write_root", write_root),
+        patch(
+            "chutes_cvm.host.tune._read", side_effect=_read_side_effect("performance")
+        ),
+        patch("chutes_cvm.host.tune._write_root", write_root),
     ):
         tune.apply_tuning()
 
@@ -143,9 +145,9 @@ def test_restore_runs_script_when_present(tmp_path):
     restore_path = str(tmp_path / "restore.sh")
     run = MagicMock(return_value=MagicMock(returncode=0))
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", restore_path),
-        patch("chutes.host.tune.os.path.isfile", return_value=True),
-        patch("chutes.host.tune.subprocess.run", run),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", restore_path),
+        patch("chutes_cvm.host.tune.os.path.isfile", return_value=True),
+        patch("chutes_cvm.host.tune.proc.run", run),
     ):
         tune.restore_tuning()
 
@@ -155,9 +157,9 @@ def test_restore_runs_script_when_present(tmp_path):
 def test_restore_is_noop_when_script_missing(tmp_path):
     run = MagicMock()
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", str(tmp_path / "missing.sh")),
-        patch("chutes.host.tune.os.path.isfile", return_value=False),
-        patch("chutes.host.tune.subprocess.run", run),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", str(tmp_path / "missing.sh")),
+        patch("chutes_cvm.host.tune.os.path.isfile", return_value=False),
+        patch("chutes_cvm.host.tune.proc.run", run),
     ):
         tune.restore_tuning()
 
@@ -168,9 +170,9 @@ def test_restore_warns_on_nonzero_exit(tmp_path, capsys):
     restore_path = str(tmp_path / "restore.sh")
     run = MagicMock(return_value=MagicMock(returncode=3))
     with (
-        patch("chutes.host.tune.RESTORE_SCRIPT", restore_path),
-        patch("chutes.host.tune.os.path.isfile", return_value=True),
-        patch("chutes.host.tune.subprocess.run", run),
+        patch("chutes_cvm.host.tune.RESTORE_SCRIPT", restore_path),
+        patch("chutes_cvm.host.tune.os.path.isfile", return_value=True),
+        patch("chutes_cvm.host.tune.proc.run", run),
     ):
         tune.restore_tuning()
 
@@ -184,7 +186,7 @@ def test_restore_warns_on_nonzero_exit(tmp_path, capsys):
 
 def test_main_apply_dispatches(monkeypatch):
     apply_mock = MagicMock()
-    monkeypatch.setattr("chutes.host.tune.apply_tuning", apply_mock)
+    monkeypatch.setattr("chutes_cvm.host.tune.apply_tuning", apply_mock)
     monkeypatch.setattr("sys.argv", ["tune", "apply"])
     assert tune.main() == 0
     apply_mock.assert_called_once()
@@ -192,7 +194,7 @@ def test_main_apply_dispatches(monkeypatch):
 
 def test_main_restore_dispatches(monkeypatch):
     restore_mock = MagicMock()
-    monkeypatch.setattr("chutes.host.tune.restore_tuning", restore_mock)
+    monkeypatch.setattr("chutes_cvm.host.tune.restore_tuning", restore_mock)
     monkeypatch.setattr("sys.argv", ["tune", "restore"])
     assert tune.main() == 0
     restore_mock.assert_called_once()

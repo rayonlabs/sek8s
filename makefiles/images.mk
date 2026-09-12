@@ -8,6 +8,8 @@ tag:
         pkg_version=$$(head "src/$$pkg_name/VERSION"); \
     elif [ -f "$$image_dir/VERSION" ]; then \
         pkg_version=$$(head "$$image_dir/VERSION"); \
+    else \
+        pkg_version="dev"; \
     fi; \
     echo "--------------------------------------------------------"; \
     echo "Tagging $$pkg_name (version: $$pkg_version)"; \
@@ -69,6 +71,8 @@ push:
 		pkg_version=$$(head "src/$$pkg_name/VERSION"); \
 	elif [ -f "$$image_dir/VERSION" ]; then \
 		pkg_version=$$(head "$$image_dir/VERSION"); \
+	else \
+		pkg_version="dev"; \
 	fi; \
 	echo "--------------------------------------------------------"; \
 	echo "Pushing $$pkg_name (version: $$pkg_version)"; \
@@ -115,32 +119,26 @@ push:
 	echo ;
 
 .PHONY: images
-images: ##@images Build all docker images
+images: ##@images Build standalone docker images (all, or one: "make images busybox")
 images: args ?= --network=host --build-arg BUILDKIT_INLINE_CACHE=1
 images:
-	@all_dirs=$$(find docker -maxdepth 1 -type d ! -path docker | sort); \
-	filtered_images=""; \
-	for image_dir in $$all_dirs; do \
-		pkg_name=$$(basename $$image_dir); \
-		if [ ! -d "src/$$pkg_name" ]; then \
-			filtered_images="$$filtered_images $$image_dir"; \
-		fi; \
-	done; \
-	if [ -z "$$filtered_images" ]; then \
+	@selected="$(SELECTED_IMGS)"; \
+	if [ -z "$$selected" ]; then \
 		echo "No standalone (non-source-package) docker images to build."; \
 		exit 0; \
 	fi; \
-	image_names=$$(echo $$filtered_images | xargs -n1 basename | tr '\n' ' '); \
-	echo "Building standalone images: $$image_names"; \
-	for image_dir in $$filtered_images; do \
-		pkg_name=$$(basename $$image_dir); \
+	echo "Building standalone images: $$selected"; \
+	for pkg_name in $$selected; do \
+		image_dir="docker/$$pkg_name"; \
 		pkg_version=$$(if [ -f "src/$$pkg_name/VERSION" ]; then head "src/$$pkg_name/VERSION"; elif [ -f "$$image_dir/VERSION" ]; then head "$$image_dir/VERSION"; else echo "dev"; fi); \
+		if [ "${BRANCH_NAME}" != "main" ]; then latest_tag="${BRANCH_NAME}-latest"; else latest_tag="latest"; fi; \
 		if [ -f "$$image_dir/Dockerfile" ]; then \
 			echo "Building images for $$pkg_name (version: $$pkg_version)"; \
 			DOCKER_BUILDKIT=1 docker build --progress=plain --target production \
 				-f $$image_dir/Dockerfile \
 				-t $$pkg_name:${BRANCH_NAME}-${BUILD_NUMBER} \
 				-t $$pkg_name:$$pkg_version \
+				-t $$pkg_name:$$latest_tag \
 				--build-arg PROJECT_DIR=$$pkg_name \
 				--build-arg PROJECT=$$pkg_name \
 				${args} .; \
@@ -148,6 +146,7 @@ images:
 				-f $$image_dir/Dockerfile \
 				-t $$pkg_name\_development:${BRANCH_NAME}-${BUILD_NUMBER} \
 				-t $$pkg_name\_development:$$pkg_version \
+				-t $$pkg_name\_development:$$latest_tag \
 				--build-arg PROJECT_DIR=$$pkg_name \
 				--build-arg PROJECT=$$pkg_name \
 				--cache-from $$pkg_name:${BRANCH_NAME}-${BUILD_NUMBER} \
@@ -183,6 +182,8 @@ sign:
 		pkg_version=$$(head "src/$$pkg_name/VERSION"); \
 	elif [ -f "$$image_dir/VERSION" ]; then \
 		pkg_version=$$(head "$$image_dir/VERSION"); \
+	else \
+		pkg_version="dev"; \
 	fi; \
 	echo "--------------------------------------------------------"; \
 	echo "Signing $$pkg_name (version: $$pkg_version)"; \
@@ -246,3 +247,25 @@ sign:
 		echo "Skipping $$pkg_name: $$image_dir/Dockerfile not found"; \
 	fi; \
 	echo ;
+
+define _rclone_pass_prompt
+	if [ -z "$$RCLONE_CONFIG_PASS" ]; then \
+		echo "Enter rclone config password:"; \
+		read -s RCLONE_CONFIG_PASS; \
+		export RCLONE_CONFIG_PASS; \
+		echo ""; \
+	fi; \
+	export RCLONE_CONFIG_PASS
+endef
+
+.PHONY: publish-guest
+publish-guest: ##@images Publish built prod guest image + direct-boot artifacts to R2 (ENV=prod)
+publish-guest:
+	@$(_rclone_pass_prompt); \
+	guest-tools/scripts/publish-image.sh --env $(or $(ENV),prod)
+
+.PHONY: publish-guest-debug
+publish-guest-debug: ##@images Publish built debug guest image + direct-boot artifacts to R2 (ENV=prod)
+publish-guest-debug:
+	@$(_rclone_pass_prompt); \
+	guest-tools/scripts/publish-image.sh --debug --env $(or $(ENV),prod)

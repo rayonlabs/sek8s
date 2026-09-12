@@ -119,7 +119,6 @@
       - "{{ chutes_kubeconfig_path }}"
       - --miner-api
       - "{{ chutes_miner_api }}"
-    # sync-kubeconfig prompts "Continue? [y/N]" before overwriting; auto-confirm.
     stdin: "y\n"
   delegate_to: localhost
   become: false
@@ -199,6 +198,8 @@
     - _force_pods_remaining.stdout | default('') | trim != ''
 
 - name: Force-evict | retry maintenance mode after purge
+  # Best-effort when force_upgrade=true — pods are already gone so we proceed
+  # even if the validator still denies (e.g. no_active_window).
   ansible.builtin.command:
     argv:
       - chutes-miner
@@ -216,6 +217,7 @@
       - --raw-json
   delegate_to: localhost
   become: false
+  failed_when: false
   when:
     - not _already_in_maintenance | bool
     - _maintenance_denied | default(false) | bool

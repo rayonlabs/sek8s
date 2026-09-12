@@ -1,43 +1,38 @@
 ---
-- name: Ensure sek8s remote root exists
-  ansible.builtin.file:
-    path: "{{ sek8s_remote_root }}"
-    state: directory
+# The chutes-cvm package's own install.sh is the single source of truth for fetch + install.
+# We stage it from the control-node checkout and run it on the host: it sparse shallow-fetches
+# host-tools/ + firmware/ + src/chutes-cvm/ into {{ sek8s_remote_root }} and editable-installs the
+# CLI (+ the bundled nvidia-gpu-tools) into a venv on PATH — so a later `git pull` updates the code
+# with no reinstall, and every later role/playbook has `chutes-cvm` (with its deps) available.
+# Runs before tdx_bootstrap so `chutes-cvm host setup` works, and self-ensures its own install
+# prerequisites (venv/pip + git for the fetch) so it holds without a separate host_prerequisites
+# step — setup.yml no longer runs one (host setup installs the host operational deps itself).
+
+- name: Ensure the chutes-cvm install prerequisites are present (venv/pip + git for the fetch)
+  ansible.builtin.apt:
+    name:
+      - python3-venv
+      - python3-pip
+      - git
+    state: present
+    update_cache: false
+
+- name: Stage the chutes-cvm install script on the host
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../src/chutes-cvm/install.sh"
+    dest: /tmp/chutes-cvm-install.sh
     mode: "0755"
 
-- name: Initialize sparse shallow checkout of host-tools
-  ansible.builtin.shell: |
-    set -euo pipefail
-    git init
-    git remote add origin {{ sek8s_repo_url }} 2>/dev/null \
-      || git remote set-url origin {{ sek8s_repo_url }}
-    git config core.sparseCheckout true
-    mkdir -p .git/info
-    printf 'host-tools/\nfirmware/\n' > .git/info/sparse-checkout
-    git fetch --depth 1 origin {{ sek8s_repo_branch | default('main') }}
-    git checkout {{ sek8s_repo_branch | default('main') }} 2>/dev/null \
-      || git checkout -b {{ sek8s_repo_branch | default('main') }} FETCH_HEAD
-  args:
-    chdir: "{{ sek8s_remote_root }}"
-    executable: /bin/bash
-    creates: "{{ sek8s_remote_host_tools }}"
-
-- name: Ensure sparse-checkout includes host-tools and firmware
-  ansible.builtin.copy:
-    dest: "{{ sek8s_remote_root }}/.git/info/sparse-checkout"
-    content: |
-      host-tools/
-      firmware/
-    mode: "0644"
-
-- name: Fetch latest host-tools
+- name: Fetch + editable-install chutes-cvm via its install.sh (single source of truth)
   ansible.builtin.command:
-    cmd: git fetch --depth 1 origin {{ sek8s_repo_branch | default('main') }}
-    chdir: "{{ sek8s_remote_root }}"
-
-- name: Reset to latest remote
-  ansible.builtin.command:
-    cmd: git reset --hard origin/{{ sek8s_repo_branch | default('main') }}
-    chdir: "{{ sek8s_remote_root }}"
-  register: git_reset
-  changed_when: git_reset.rc == 0
+    argv:
+      - /tmp/chutes-cvm-install.sh
+      - --dest
+      - "{{ sek8s_remote_root }}"
+      - --editable
+      - --ref
+      - "{{ sek8s_repo_branch | default('main') }}"
+  environment:
+    SEK8S_REPO: "{{ sek8s_repo_url }}"
+  register: _chutes_cvm_install
+  changed_when: "'Installed chutes-cvm' in _chutes_cvm_install.stdout"

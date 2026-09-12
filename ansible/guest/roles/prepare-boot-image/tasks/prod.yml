@@ -1,0 +1,98 @@
+---
+# PRODUCTION task set (gated by main.yml: debug_build is false).
+#
+# Encrypts the root filesystem in place (offline, host-side over nbd/chroot) and
+# installs the fail-CLOSED prod initramfs: attest-common + provision-common shared
+# libs, the prod entry scripts (fetch_key_and_unlock, setup_storage), and tdx-luks.conf.
+# All-or-nothing — this is a security-critical set; never gate individual tasks inside it.
+# The debug counterpart (debug.yml) installs a distinct fail-open initramfs and performs
+# NO encryption, so the two images carry different scripts and different measurements.
+
+# Fail fast if passphrase is missing; avoid wiping the disk then failing at LUKS create.
+- name: Validate LUKS passphrase is set
+  ansible.builtin.assert:
+    that:
+      - luks_passphrase is defined
+      - luks_passphrase | length > 0
+    fail_msg: "LUKS_PASSPHRASE environment variable must be set and non-empty for disk encryption. Export it before running the playbook."
+  no_log: true
+
+# Stray whitespace is baked into the keyslot and produces an image that unlocks ONLY with the
+# contaminated value — the control plane then presents the clean passphrase and the guest fails to
+# unlock at boot, with nothing in the build log to hint at why. An embedded newline is worse still:
+# cryptsetup truncates a stdin passphrase at the first newline, so the key silently becomes a
+# PREFIX of what was exported. Both are easy to introduce (`export LUKS_PASSPHRASE=$(cat key)`,
+# a copy-paste with a trailing space) and cost a full rebuild to discover, so reject them here.
+- name: Validate LUKS passphrase has no surrounding whitespace or newlines
+  ansible.builtin.assert:
+    that:
+      - luks_passphrase == (luks_passphrase | trim)
+      - luks_passphrase.splitlines() | length <= 1
+    fail_msg: >-
+      LUKS_PASSPHRASE contains leading/trailing whitespace or an embedded newline. It would be
+      baked into the LUKS keyslot verbatim, so the image would unlock only with the contaminated
+      value and would fail first-boot unlock against the registered passphrase. Re-export it
+      without the stray characters (e.g. LUKS_PASSPHRASE="$(tr -d '\r\n' < keyfile)").
+  no_log: true
+
+- name: Check if LUKS container is open
+  ansible.builtin.stat:
+    path: "/dev/mapper/{{ encrypted_root_name }}"
+  register: luks_stat
+
+- name: Close LUKS container if open
+  community.crypto.luks_device:
+    name: "{{ encrypted_root_name }}"
+    state: closed
+  when: luks_stat.stat.exists
+  ignore_errors: true
+
+- name: Check if nbd device is connected
+  ansible.builtin.command: qemu-nbd --check {{ nbd_device }}
+  register: nbd_check_result
+  failed_when: false
+  changed_when: false
+
+- name: Disconnect nbd device if connected
+  ansible.builtin.command: qemu-nbd --disconnect {{ nbd_device }}
+  when: nbd_check_result.rc == 0
+  register: nbd_disconnect_result
+  changed_when: nbd_disconnect_result.rc == 0
+  ignore_errors: true
+
+- name: Unmount all possible partitions if mounted
+  ansible.builtin.mount:
+    path: "{{ item }}"
+    state: unmounted
+  ignore_errors: true
+  loop:
+    - "{{ newroot_mount }}/sys/firmware/efi/efivars"
+    - "{{ newroot_mount }}/proc"
+    - "{{ newroot_mount }}/sys"
+    - "{{ newroot_mount }}/dev"
+    - "{{ newroot_mount }}/run"
+    - "{{ newroot_mount }}/boot/efi"
+    - "{{ newroot_mount }}/boot"
+    - "{{ newroot_mount }}"
+    - "{{ root_mount }}/boot/efi"
+    - "{{ root_mount }}/boot"
+    - "{{ root_mount }}"
+
+- name: Clean up temporary directories if leftover
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  ignore_errors: true
+  loop:
+    - "{{ root_mount }}"
+    - "{{ newroot_mount }}"
+    - "{{ backup_dir }}"
+
+# Main encryption work. always runs cleanup even on failure to avoid leaving nbd connected.
+- name: LUKS encryption
+  block:
+    - name: Run encryption tasks
+      ansible.builtin.include_tasks: luks_encrypt.yml
+  always:
+    - name: Cleanup on success or failure
+      ansible.builtin.include_tasks: luks_cleanup.yml

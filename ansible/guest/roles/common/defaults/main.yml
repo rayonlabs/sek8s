@@ -1,5 +1,3 @@
 ---
-# Chutes config
-validator: 5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ
 # Empty = auto-detect fastest mirror at build time. Set in inventory to pin a specific mirror.
 apt_mirror: ""

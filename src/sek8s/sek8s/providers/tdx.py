@@ -5,10 +5,15 @@ import tempfile
 
 from loguru import logger
 
-from sek8s.exceptions import TdxQuoteException
+from sek8s.exceptions import NonceError, TdxQuoteException
+from sek8s.nonce import QUOTE_NONCE_HEX_LEN, validate_quote_nonce
 
 QUOTE_GENERATOR_BINARY = "/usr/bin/tdx-quote-generator"
-SERVER_CERT = "/etc/attestation-service/certs/server.crt"
+# The per-VM proxy cert setup_vm_tls generates in initramfs and the proxy serves; REPORTDATA must
+# hash this exact cert so the validator's expected_cert_hash matches.
+SERVER_CERT = "/run/chutes/proxy-tls/server.crt"
+# 64-byte TDX REPORTDATA as hex: the 64-char nonce followed by the 64-char cert hash.
+REPORT_DATA_HEX_LEN = QUOTE_NONCE_HEX_LEN * 2
 
 
 class TdxQuoteProvider:
@@ -67,17 +72,17 @@ class TdxQuoteProvider:
             # Get certificate hash
             cert_hash = self._get_cert_hash()
 
-            # Combine nonce and cert hash for report data
-            # TDX report data is 64 bytes (128 hex chars)
-            # We have: 64 chars (nonce) + 64 chars (cert_hash) = 128 chars
+            # REPORTDATA is 64 bytes = 128 hex chars, split 64/64 as nonce ‖ cert_hash. Both halves
+            # are fixed-width, so validate rather than truncate: an over-long nonce used to push
+            # cert_hash out of the field, yielding a signed quote that bound no certificate.
+            nonce = validate_quote_nonce(nonce)
             report_data = f"{nonce}{cert_hash}"
 
-            # Truncate to 128 hex chars (64 bytes) if needed
-            report_data = report_data[:128]
-
-            logger.debug(
-                f"Report data: nonce({len(nonce)}) + cert_hash({len(cert_hash)}) = {len(report_data)} chars"
-            )
+            if len(report_data) != REPORT_DATA_HEX_LEN:
+                raise TdxQuoteException(
+                    f"REPORTDATA must be exactly {REPORT_DATA_HEX_LEN} hex characters, "
+                    f"got {len(report_data)} (cert_hash was {len(cert_hash)})"
+                )
 
             with tempfile.NamedTemporaryFile(mode="rb", suffix=".bin") as fp:
                 result = await asyncio.create_subprocess_exec(
@@ -114,7 +119,7 @@ class TdxQuoteProvider:
                     result_output = await result.stderr.read()
                     logger.error(f"Failed to generate quote: {result_output.decode()}")
                     raise TdxQuoteException("Failed to generate quote.")
-        except TdxQuoteException:
+        except (NonceError, TdxQuoteException):
             raise
         except Exception as e:
             logger.error(f"Unexpected error generating TDX quote: {e}")

@@ -1,0 +1,258 @@
+---
+# Debug initramfs install worker (offline, host-side). Mounts the UNENCRYPTED debug
+# image over nbd, installs the fail-open debug initramfs, and rebuilds it in a chroot.
+# No backup / wipe / LUKS / crypttab / fstab changes — the debug root stays plain.
+
+- name: Load nbd kernel module
+  ansible.builtin.command: modprobe nbd max_part=8
+  args:
+    creates: /dev/nbd0
+  register: modprobe_result
+  changed_when: modprobe_result.rc == 0
+
+- name: Connect qcow2 image to nbd device
+  ansible.builtin.command: qemu-nbd --connect={{ nbd_device }} {{ final_img_path }}
+  args:
+    creates: "{{ nbd_device }}p1"
+  register: qemu_nbd_result
+  changed_when: qemu_nbd_result.rc == 0
+
+- name: Run partprobe to detect partitions
+  ansible.builtin.command: partprobe {{ nbd_device }}
+  changed_when: false
+
+- name: Create mount point
+  ansible.builtin.file:
+    path: "{{ newroot_mount }}"
+    state: directory
+    mode: '0755'
+
+- name: Detect partition layout dynamically
+  ansible.builtin.shell: |
+    set -e
+    efi=""
+    boot=""
+    root=""
+    for part in {{ nbd_device }}p*; do
+      fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || echo "")
+      size=$(blockdev --getsize64 "$part" 2>/dev/null || echo "0")
+      size_mb=$((size / 1024 / 1024))
+      case "$fstype" in
+        vfat) efi="$part" ;;
+        ext4)
+          if [ $size_mb -lt 2048 ]; then boot="$part"; else root="$part"; fi
+          ;;
+      esac
+    done
+    if [ -z "$efi" ] || [ -z "$root" ] || [ -z "$boot" ]; then
+      echo "ERROR: Could not detect partitions" >&2
+      exit 1
+    fi
+    echo "efi=$efi"
+    echo "boot=$boot"
+    echo "root=$root"
+  args:
+    executable: /bin/bash
+  register: partition_detection
+  changed_when: false
+  failed_when: partition_detection.rc != 0
+
+- name: Parse detected partitions
+  ansible.builtin.set_fact:
+    efi_partition: "{{ partition_detection.stdout | regex_search('efi=([^\\s]+)', '\\1') | first }}"
+    boot_partition: "{{ partition_detection.stdout | regex_search('boot=([^\\s]+)', '\\1') | first }}"
+    root_partition: "{{ partition_detection.stdout | regex_search('root=([^\\s]+)', '\\1') | first }}"
+
+- name: Display detected partition layout
+  ansible.builtin.debug:
+    msg:
+      - "Detected partition layout (debug, unencrypted):"
+      - "  EFI:  {{ efi_partition }}"
+      - "  Boot: {{ boot_partition }}"
+      - "  Root: {{ root_partition }}"
+
+- name: Mount plain root partition
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}"
+    src: "{{ root_partition }}"
+    fstype: ext4
+    state: ephemeral
+
+- name: Mount boot partition
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}/boot"
+    src: "{{ boot_partition }}"
+    fstype: ext4
+    state: ephemeral
+
+- name: Mount EFI partition
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}/boot/efi"
+    src: "{{ efi_partition }}"
+    fstype: vfat
+    state: ephemeral
+
+- name: Bind mount system directories
+  ansible.builtin.mount:
+    path: "{{ newroot_mount }}/{{ item }}"
+    src: "/{{ item }}"
+    fstype: none
+    opts: bind
+    state: ephemeral
+  loop:
+    - proc
+    - sys
+    - dev
+    - run
+
+# ── Install debug initramfs script set ────────────────────────────────────────
+# Shared pieces (identical files to prod) + the debug-only *_debug entries. luks-helpers and
+# the prod entry scripts are deliberately NOT installed.
+
+- name: Copy TDX initramfs hook (stages binaries + shell libs)
+  ansible.builtin.copy:
+    src: files/initramfs/fetch_key
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/hooks/fetch_key"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy TDX module loader script (init-top)
+  ansible.builtin.copy:
+    src: files/initramfs/load-tdx
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-top/load-tdx"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy shared boot-attestation library (attest-common)
+  ansible.builtin.copy:
+    src: files/initramfs/attest-common
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/attest-common"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy shared provision library (provision-common)
+  ansible.builtin.copy:
+    src: files/initramfs/provision-common
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/provision-common"
+    mode: '0755'
+    owner: root
+    group: root
+
+# The sr25519 hotkey PoP runs on every boot, prod and debug, so hotkey-sign is installed in
+# both (mirrors luks_encrypt.yml).
+- name: Copy sr25519 hotkey signing library (hotkey-sign)
+  ansible.builtin.copy:
+    src: files/initramfs/hotkey-sign
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/hotkey-sign"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy debug boot-attestation entry script (init-premount, fail-open, no LUKS)
+  ansible.builtin.copy:
+    src: files/initramfs/fetch_key_and_unlock_debug
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-premount/fetch_key_and_unlock_debug"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy debug storage setup script (init-bottom, static k3s key, no LUKS)
+  ansible.builtin.copy:
+    src: files/initramfs/setup_storage_debug
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-bottom/setup_storage_debug"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Copy debug write-validator-auth script (init-bottom, fail-open)
+  # Debug installs the fail-open variant: a debug VM that cannot attest (e.g. an
+  # unregistered image being measured) must still boot, writing an empty
+  # ALLOWED_VALIDATORS rather than powering off. The prod (fail-closed)
+  # write-validator-auth is deliberately NOT installed here.
+  ansible.builtin.copy:
+    src: files/initramfs/write-validator-auth_debug
+    dest: "{{ newroot_mount }}/etc/initramfs-tools/scripts/init-bottom/write-validator-auth_debug"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Create TDX environment configuration
+  ansible.builtin.copy:
+    content: |
+      # TDX LUKS Configuration (debug image — no LUKS key is ever fetched)
+      # tdx_base_url: mTLS proxy — boot-attestation / RC-provisioning API calls
+      # validator_base_url: fetch-signing-keys (public) and post-boot services
+      TDX_BASE_URL="{{ tdx_base_url }}"
+      VALIDATOR_BASE_URL="{{ validator_base_url }}"
+      TDX_TIMEOUT="{{ tdx_timeout }}"
+      TDX_RETRY_COUNT="{{ tdx_retry_count }}"
+    dest: "{{ newroot_mount }}/etc/tdx-luks.conf"
+    mode: '0644'
+    owner: root
+    group: root
+
+# Generate the RTMR3 canonical manifest over the FINAL debug root — after every measured file
+# (incl. /root/.ssh, cleanup drop-ins, /etc/tdx-luks.conf above) is in its final state, so nothing
+# is excluded. MUST precede the initramfs rebuild below, which embeds the file (RTMR1). The debug
+# root is plaintext, so no /etc/fstab rewrite here — but the same generation keeps prod and debug
+# identical. See generate-expected-hashes.yml.
+- name: Normalize per-build variability in initramfs inputs
+  ansible.builtin.include_tasks: normalize-initramfs-inputs.yml
+
+- name: Generate RTMR3 expected-hashes over the finalized debug root
+  ansible.builtin.include_tasks: generate-expected-hashes.yml
+
+- name: Update initramfs and grub in chroot
+  ansible.builtin.shell: |
+    chroot {{ newroot_mount }} /bin/bash -c "
+      export SOURCE_DATE_EPOCH={{ initramfs_source_date_epoch }} &&
+      update-initramfs -u -k all &&
+      update-grub
+    "
+  register: chroot_update_result
+  changed_when: chroot_update_result.rc == 0
+
+# Boot-critical guard. The initramfs scripts abort the LUKS unlock and power the VM off if any of
+# these is missing, and the failure only shows at boot — a missing head cost one full build cycle.
+# Verify against the artifact that was actually produced rather than trusting the hook.
+#
+# grep reads from a herestring, NOT a pipe: with `set -o pipefail`, `... | grep -q` returns
+# failure whenever grep matches early and exits, because the upstream write dies on SIGPIPE
+# (rc 141). That reported every binary as missing and failed a build.
+- name: Verify required binaries are present in the initramfs
+  ansible.builtin.shell: |
+    set -uo pipefail
+    tmp=$(mktemp)
+    unlisted=""
+    for img in {{ newroot_mount }}/boot/initrd.img-*; do
+      [ -f "$img" ] || continue
+      lsinitramfs "$img" >> "$tmp" 2>/dev/null || unlisted="$unlisted $img"
+    done
+    [ -n "$unlisted" ] && echo "WARNING: could not list:$unlisted"
+    if [ ! -s "$tmp" ]; then
+      echo "WARNING: no initramfs could be listed - check SKIPPED, not failed"
+      rm -f "$tmp"
+      exit 0
+    fi
+    missing=""
+    for b in head tail tr cut sed awk wc grep basename dirname mktemp dd cat curl jq openssl base64 cryptsetup blkid ip sr25519; do
+      grep -qE "(^|/)${b}$" "$tmp" || missing="$missing $b"
+    done
+    entries=$(wc -l < "$tmp")
+    rm -f "$tmp"
+    if [ -n "$missing" ]; then
+      echo "MISSING FROM INITRAMFS:$missing"
+      exit 1
+    fi
+    echo "all required initramfs binaries present ($entries entries)"
+  args:
+    executable: /bin/bash
+  register: _initramfs_bin_check
+  changed_when: false
+
+- name: Show initramfs binary check result
+  ansible.builtin.debug:
+    var: _initramfs_bin_check.stdout_lines

@@ -6,17 +6,16 @@ The TEE VM configuration system uses YAML files with JSON schema validation to e
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Install the CLI
 
-```bash
-pip3 install pyyaml jsonschema
-```
+The `chutes-cvm` CLI (with its config deps: pyyaml, pydantic-settings) is installed by
+`src/chutes-cvm/install.sh`. No separate config dependencies are needed.
 
 ### 2. Create Your Config
 
 ```bash
 # Start from template
-cp config/config.tmpl.yaml config.yaml
+chutes-cvm config init
 
 # Or use examples
 cp config/config.prod.example.yaml config.yaml    # For production
@@ -35,12 +34,12 @@ Edit `config.yaml` with your settings. The schema will validate:
 ### 4. Launch VM
 
 ```bash
-./quick-launch.sh config.yaml
+chutes-cvm guest launch config.yaml
 ```
 
 ## Schema Validation
 
-The parser automatically validates your config against `config-schema.json`. If validation fails, you'll see clear error messages:
+The parser automatically validates your config against the `LaunchConfig` schema. If validation fails, you'll see clear error messages:
 
 ```
 Config validation error: 'containerd' is a required property
@@ -55,36 +54,44 @@ Path: volumes
 - **Pattern matching**: hostname must be valid DNS label
 - **Type checking**: booleans, integers, strings
 
-### Optional Validation
+### Validation is built in
 
-If `jsonschema` isn't installed, the parser will show a warning but continue. For production use, always install jsonschema:
-
-```bash
-pip3 install jsonschema
-```
+Validation is performed by the `LaunchConfig` pydantic model, which ships with the `chutes-cvm`
+CLI (via `pydantic-settings`) — there is nothing extra to install. `chutes-cvm config verify <file>`
+checks a config without launching.
 
 ## Configuration Precedence
 
-Values are resolved in this order (highest to lowest):
+Values are resolved by the `LaunchConfig` model in this order (highest to lowest):
 
-1. **CLI arguments** (`--hostname`, `--base-image`, `--overlay-dir`, `--docker-hub-username` / `--docker-hub-token` when **both** are set, etc.)
-2. **YAML config file** (your config.yaml)
-3. **Hard-coded defaults** (in quick-launch.sh)
+1. **CLI arguments** (`--hostname`, `--base-image`, `--vm-image-dir`, `--docker-hub-username` / `--docker-hub-token` when **both** are set, etc.)
+2. **Environment variables** (`CHUTES_CVM_*`, e.g. `CHUTES_CVM_VM_IP`)
+3. **YAML config file** (your config.yaml)
+4. **Field defaults** (declared on the model)
 
 For Docker Hub: if you pass **both** `--docker-hub-username` and `--docker-hub-token`, they override the optional `docker_hub` block in YAML. Otherwise `docker_hub.username` / `docker_hub.token` from YAML are used when present.
 
 Example:
 ```bash
 # Base image precedence:
-./quick-launch.sh config.yaml --base-image /path/to/custom.qcow2
-# Uses: /path/to/custom.qcow2 (CLI wins)
+chutes-cvm guest launch config.yaml --base-image /path/to/custom-image-set/
+# Uses: /path/to/custom-image-set/ (CLI wins)
 
-./quick-launch.sh config.yaml  # config.yaml has vm.base_image: "/var/lib/chutes/base-images/tdx-guest.qcow2"
-# Uses: value from YAML
+chutes-cvm guest launch config.yaml  # config.yaml has vm.base_image: "/var/lib/chutes/base-images/tdx-guest/"
+# Uses: value from YAML (image-set directory)
 
-./quick-launch.sh config.yaml  # config.yaml has vm.base_image: ""
-# Uses: default /var/lib/chutes/base-images/tdx-guest.qcow2
+chutes-cvm guest launch config.yaml  # config.yaml has vm.base_image: ""
+# Uses: default /var/lib/chutes/base-images/tdx-guest/
 ```
+
+`base_image` points at a **published image-set directory** — the qcow2 plus its direct-boot
+artifacts (`.vmlinuz`/`.initrd`/`.cmdline`) and a `manifest.json` that ties them together —
+populated by `chutes-cvm image download`. There is one image format: the set. The launcher
+verifies the set against the manifest (so a stale/mismatched artifact fails loudly, not as
+an opaque boot error) and reads the qcow2's sha256 from the manifest instead of re-hashing
+it each launch. Launch does not auto-download: a missing set fails with a clear message,
+and you stage it explicitly with `chutes-cvm image download` (or, in a build, via ansible). Custom or
+benchmark images must likewise be assembled into a set (`chutes_cvm.guest.image_set manifest`).
 
 ## Docker Hub (optional)
 
@@ -98,8 +105,8 @@ docker_hub:
 
 - Schema: both `username` and `token` are required when `docker_hub` is present (`maxLength` 64 / 128).
 - The host writes `docker-hub-username` and `docker-hub-token` onto the config volume (cleartext); treat the volume like other secrets.
-- `quick-launch.sh` runs `volumes/create-config.sh` every launch: **new** qcow2 if the path is missing, otherwise **mount, remove everything at the volume root, then write** the current YAML-derived files. Stop the VM if QEMU still has that qcow2 open.
-- See `config.tmpl.yaml`, `config.prod.example.yaml`, and `config.debug.example.yaml` for commented examples.
+- `chutes-cvm guest launch` runs `volumes/create-config.sh` every launch: **new** qcow2 if the path is missing, otherwise **mount, remove everything at the volume root, then write** the current YAML-derived files. Stop the VM if QEMU still has that qcow2 open.
+- Run `chutes-cvm config init` to generate a starter config from the schema; see `config.prod.example.yaml` and `config.debug.example.yaml` for commented examples.
 
 ## Production vs Debug Configs
 
@@ -108,8 +115,8 @@ docker_hub:
 ```yaml
 vm:
   hostname: chutes-miner-prod-0
-  base_image: "/var/lib/chutes/base-images/tdx-guest.qcow2"  # Encrypted image
-  overlay_directory: ""  # Empty = /var/lib/chutes/vm-overlays/
+  base_image: "/var/lib/chutes/base-images/tdx-guest/"  # Encrypted image set (dir)
+  vm_image_directory: ""  # Empty = /var/lib/chutes/vm-images/
 
 volumes:
   cache:
@@ -129,8 +136,8 @@ volumes:
 ```yaml
 vm:
   hostname: chutes-miner-debug-0
-  base_image: "/var/lib/chutes/base-images/tdx-guest-debug.qcow2"  # Debug image
-  overlay_directory: ""  # Empty = /var/lib/chutes/vm-overlays/
+  base_image: "/var/lib/chutes/base-images/tdx-guest-debug/"  # Debug image set (dir)
+  vm_image_directory: ""  # Empty = /var/lib/chutes/vm-images/
 
 volumes:
   cache:
@@ -153,17 +160,17 @@ volumes:
 
 ```yaml
 vm:
-  base_image: "/var/lib/chutes/base-images/tdx-guest.qcow2"
-  overlay_directory: ""  # Empty = /var/lib/chutes/vm-overlays/
+  base_image: "/var/lib/chutes/base-images/tdx-guest/"
+  vm_image_directory: ""  # Empty = /var/lib/chutes/vm-images/
 ```
 
-Leave `base_image` empty to use default `/var/lib/chutes/base-images/tdx-guest.qcow2`.
+Leave `base_image` empty to use default `/var/lib/chutes/base-images/tdx-guest/`.
 
 ### Via CLI Override
 
 ```bash
-./quick-launch.sh config.yaml --base-image /path/to/tdx-guest.qcow2
-./quick-launch.sh config.yaml --overlay-dir /custom/overlay/path
+chutes-cvm guest launch config.yaml --base-image /path/to/image-set-dir/
+chutes-cvm guest launch config.yaml --vm-image-dir /custom/vm-images/
 ```
 
 ## Volume Auto-Generation
@@ -191,7 +198,7 @@ Config validation error: 'storage' is a required property
 Path: volumes
 ```
 
-**Fix:** Add the `storage` section to volumes (see `config.tmpl.yaml`).
+**Fix:** Add the `storage` section to volumes (see the example configs).
 
 ### Invalid Volume Size Format
 
@@ -234,7 +241,7 @@ network:
 
 ## Migrating Old Configs
 
-If you have configs from an older layout (e.g. missing `storage`), add the `volumes.storage` section to match `config-schema.json` and the current examples.
+If you have configs from an older layout (e.g. missing `storage`), add the `volumes.storage` section to match the `LaunchConfig` schema and the current examples.
 
 The schema validation will catch missing required sections, preventing runtime errors.
 
@@ -269,13 +276,13 @@ Check YAML syntax:
 Config validation error: Additional properties are not allowed ('old_field' was unexpected)
 ```
 
-Remove deprecated fields from your config. Check `config.tmpl.yaml` for current schema.
+Remove deprecated fields from your config. Run `chutes-cvm config init` for a current template.
 
 ## Schema Reference
 
-See `config-schema.json` for the complete schema definition. Key sections:
+See the `LaunchConfig` schema for the complete schema definition. Key sections:
 
-- **vm**: hostname (required), base_image (optional), overlay_directory (optional)
+- **vm**: hostname (required), base_image (optional), vm_image_directory (optional)
 - **miner**: ss58, seed (both required)
 - **network**: vm_ip, bridge_ip, dns, public_interface (all required), type, ssh_port (optional)
 - **volumes**: cache, storage (both required), config (optional)
@@ -290,8 +297,8 @@ See `config-schema.json` for the complete schema definition. Key sections:
 ```yaml
 vm:
   hostname: my-miner
-  base_image: ""  # Optional: default /var/lib/chutes/base-images/tdx-guest.qcow2
-  overlay_directory: ""  # Optional: default /var/lib/chutes/vm-overlays/
+  base_image: ""  # Optional: default /var/lib/chutes/base-images/tdx-guest/
+  vm_image_directory: ""  # Optional: default /var/lib/chutes/vm-images/
 
 miner:
   ss58: "5Grw..."
@@ -312,4 +319,4 @@ volumes:
 
 ### Full Config with All Options
 
-See `config.tmpl.yaml` for a complete example with all available options and documentation.
+Run `chutes-cvm config init`, or see `config.prod.example.yaml`, for a complete example with all available options and documentation.

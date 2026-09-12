@@ -11,3 +11,10 @@ auto_drain_vm: true
 # after all upgrade hops complete. Set to false to leave the host upgraded but
 # the VM stopped (e.g. for maintenance or manual inspection).
 relaunch_vm: true
+
+# PCCS install root and the location its artifacts (config/, ssl_key/) are
+# backed up to across a hop that must remove sgx-dcap-pccs (see pre_2510.yml
+# and the restore step in hop.yml). The backup lives under /var/backups so it
+# survives the do-release-upgrade reboot.
+pccs_install_dir: /opt/intel/sgx-dcap-pccs
+pccs_upgrade_backup_dir: /var/backups/sek8s/pccs

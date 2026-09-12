@@ -1,0 +1,229 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-premount/fetch_key_and_unlock
+#
+# PROD: TDX-attested boot -> release the root LUKS key -> unlock -> mandatory root
+# passphrase rotation. The shared boot-attestation flow (CA, config/network, nonce,
+# quote, POST /boot/attestation, /run/chutes state) lives in attest-common and is
+# identical to the debug entry; this script adds only the LUKS-specific unlock +
+# rotation and fail-CLOSED cleanup. None of the debug-only signing or
+# boot-through-on-failure logic appears here — it lives in the separate debug entry
+# script and its helper.
+PREREQ="load-tdx network"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+. /scripts/luks-helpers
+
+# Configuration
+[ -f /etc/tdx-luks.conf ] && . /etc/tdx-luks.conf
+
+# Validate required configuration
+if [ -z "$TDX_BASE_URL" ]; then
+    echo "ERROR: Missing required TDX configuration. Check /etc/tdx-luks.conf" >&2
+    exit 1
+fi
+
+# Shared boot-attestation flow (defines run_boot_attestation + its hooks).
+. /scripts/attest-common
+
+DEVICE_PATH="${LUKS_DEVICE:-/dev/vda1}"
+LUKS_NAME="${LUKS_NAME:-encrypted_root}"
+OLD_ROOT_SLOTS=""    # slot numbers present before luksAddKey; killed by number after confirm
+SUCCESS_FLAG=0
+
+# Function to securely clear the LUKS key and temporary files. On FAILURE removes the
+# VM root CA (the VM is about to power off); on SUCCESS the CA survives for setup_storage
+# / setup_vm_tls. Powers off (fail closed) if the script did not reach SUCCESS_FLAG=1.
+clear_luks_key() {
+    if [ -n "$LUKS_KEY" ]; then
+        # Overwrite with random data multiple times for defense in depth
+        LUKS_KEY="$(head -c 1000 /dev/zero | tr '\0' 'x')"
+        LUKS_KEY="$(head -c 1000 /dev/urandom 2>/dev/null | base64 | tr -d '\n' | head -c 1000)"
+        LUKS_KEY=""
+        unset LUKS_KEY
+    fi
+    if [ -n "$ROOT_NEXT" ]; then
+        ROOT_NEXT="$(head -c 1000 /dev/urandom 2>/dev/null | base64 | tr -d '\n' | head -c 1000)"
+        ROOT_NEXT=""
+        unset ROOT_NEXT
+    fi
+    ROOT_CONFIRM_NONCE=""
+    unset ROOT_CONFIRM_NONCE
+
+    if [ "$SUCCESS_FLAG" -ne 1 ]; then
+        rm -f "$CLIENT_CERT" "$CLIENT_KEY"
+    fi
+    rm -f /tmp/api_response /tmp/nonce_response
+
+    if [ "$SUCCESS_FLAG" -ne 1 ]; then
+        log_failure_msg "TDX unlock failed - VM will shut down in 5 seconds..."
+        echo "TDX-LUKS-UNLOCK-FAILED" > /dev/kmsg
+        sleep 5
+        poweroff -f
+    fi
+}
+
+# Set up trap to ensure cleanup happens on ANY exit
+trap clear_luks_key EXIT INT TERM
+
+# handle_failure: fail closed. Overrides the attest-common default so the shared flow
+# shreds key material before powering off.
+handle_failure() {
+    local reason="$1"
+    log_failure_msg "TDX unlock failed: $reason"
+    log_failure_msg "VM will shut down in 10 seconds..."
+    echo "TDX-LUKS-UNLOCK-FAILED: $reason" > /dev/kmsg
+    clear_luks_key
+    sleep 10
+    poweroff -f
+}
+
+# detect_first_boot hook: inspect the LUKS2 first-boot token (id 15) so the flag is
+# included in the boot attestation POST body.
+detect_first_boot() {
+    log_begin_msg "Checking for first-boot LUKS2 token (id 15)"
+    if cryptsetup token export "$DEVICE_PATH" --token-id 15 >/dev/null 2>&1; then
+        FIRST_BOOT="true"
+        log_end_msg 0
+        log_msg "  First-boot token present — VM booting from original published state"
+    else
+        FIRST_BOOT="false"
+        log_end_msg 0
+        log_msg "  No first-boot token (normal reboot)"
+    fi
+}
+
+# Function to unlock LUKS device
+unlock_device() {
+    log_begin_msg "Unlocking LUKS device $DEVICE_PATH"
+    if printf '%s' "$LUKS_KEY" | cryptsetup luksOpen "$DEVICE_PATH" "$LUKS_NAME" --key-file=-; then
+        log_end_msg 0
+        return 0
+    else
+        log_end_msg 1
+        return 1
+    fi
+}
+
+# Main execution
+main() {
+    echo ""
+    log_msg "Starting TDX-based disk unlock"
+    log_msg "TDX mTLS base: ${TDX_BASE_URL}"
+
+    # Shared: CA, config/network, nonce/quote, POST /boot/attestation, /run/chutes
+    # state. On any failure it has already called handle_failure (fail closed).
+    if ! run_boot_attestation; then
+        return 1
+    fi
+
+    # Check that we actually got a key
+    if [ -z "$LUKS_KEY" ]; then
+        handle_failure "LUKS key is empty after fetch"
+        return 1
+    fi
+
+    # Root passphrase rotation is mandatory on every boot.
+    if [ -z "$ROOT_NEXT" ] || [ -z "$ROOT_CONFIRM_NONCE" ]; then
+        handle_failure "Boot attestation did not return root_next/root_confirm_nonce — root rotation is required"
+        return 1
+    fi
+
+    # Unlock the device
+    if ! unlock_device; then
+        handle_failure "Device unlock failed with retrieved key"
+        return 1
+    fi
+
+    # Remove the first-boot token now that luksOpen succeeded.
+    # Best-effort: absence on subsequent boots is the expected normal-reboot state.
+    cryptsetup token remove "$DEVICE_PATH" --token-id 15 2>/dev/null || true
+
+    # Capture all currently-enabled slot numbers before adding the new one.
+    # After confirm these slots are killed by number, cleaning up any stale slots
+    # from previous failed removals in addition to the one being rotated.
+    OLD_ROOT_SLOTS=$(cryptsetup luksDump --dump-json-metadata "$DEVICE_PATH" 2>/dev/null \
+        | jq -r '.keyslots | keys[]' 2>/dev/null | tr '\n' ' ')
+    if [ -z "$OLD_ROOT_SLOTS" ]; then
+        handle_failure "could not enumerate root LUKS key slots"
+        return 1
+    fi
+
+    # Root passphrase rotation: add new key slot, confirm with API, then kill all old
+    # slots by number. At least one valid slot exists at all times.
+    log_begin_msg "Adding next root key slot (rotation)"
+    if luks_add_key "$DEVICE_PATH" "$LUKS_KEY" "$ROOT_NEXT"; then
+        log_end_msg 0
+
+        log_begin_msg "Confirming root passphrase rotation with API"
+        # The exact request body — built once so the hotkey signature hashes the same bytes sent.
+        local body='{"volumes":{"root":{"rotated":true}}}'
+        # Miner-hotkey proof-of-possession: sr25519 over {ss58}:{ROOT_CONFIRM_NONCE}:{sha256(body)}.
+        # X-Chutes-Nonce carries the same nonce as X-Confirm-Nonce (verify_hotkey_auth server_nonce).
+        local hk_hdr="" _hk_sig
+        _hk_sig=$(hotkey_sign "$ROOT_CONFIRM_NONCE" "$body")
+        [ -n "$_hk_sig" ] && hk_hdr="-H X-Chutes-Signature:$_hk_sig"
+        local confirm_code
+        confirm_code=$(curl -s -w "%{http_code}" \
+            -X POST \
+            -H "X-Confirm-Nonce: $ROOT_CONFIRM_NONCE" \
+            -H "X-Chutes-Nonce: $ROOT_CONFIRM_NONCE" \
+            -H "X-Chutes-Hotkey: $HOTKEY" \
+            ${hk_hdr} \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: TDX-LUKS-Client/1.0" \
+            --max-time "$TIMEOUT" \
+            --retry 0 \
+            --cacert "$API_CA_CERT" \
+            --cert "$CLIENT_CERT" \
+            --key "$CLIENT_KEY" \
+            -d "$body" \
+            -o /dev/null \
+            "${TDX_BASE_URL}/servers/${VM_NAME}/provision/confirm")
+
+        if [ "$confirm_code" = "200" ]; then
+            log_end_msg 0
+            # Kill every pre-existing slot by number, authorising with the new
+            # passphrase. This removes the rotated-away slot and any stale slots
+            # left over from previous incomplete rotations.
+            local f_auth
+            f_auth=$(write_key_file "$ROOT_NEXT")
+            for slot in $OLD_ROOT_SLOTS; do
+                if ! cryptsetup luksKillSlot --key-file="$f_auth" \
+                        "$DEVICE_PATH" "$slot" 2>/dev/null; then
+                    shred_key_file "$f_auth"
+                    handle_failure "root key slot cleanup failed"
+                    return 1
+                fi
+            done
+            shred_key_file "$f_auth"
+            log_success_msg "Root key rotation complete"
+        else
+            log_end_msg 1
+            # Confirm failed: remove the newly-added slot to restore single-slot state.
+            luks_remove_key "$DEVICE_PATH" "$ROOT_NEXT" \
+                || { handle_failure "root key slot rollback failed"; return 1; }
+        fi
+    else
+        log_end_msg 1
+        handle_failure "luksAddKey failed for root — cannot complete mandatory rotation"
+        return 1
+    fi
+
+    # Persist ephemeral /run/chutes state for later init-bottom scripts — after
+    # rotation, matching the original ordering (pure restructure, no behavior change).
+    write_boot_state
+
+    # Mark as successful before cleanup
+    SUCCESS_FLAG=1
+
+    # Clear key material from memory
+    clear_luks_key
+    log_success_msg "TDX-based unlock and root rotation completed successfully"
+    return 0
+}
+
+# Run main function
+main
+exit $?

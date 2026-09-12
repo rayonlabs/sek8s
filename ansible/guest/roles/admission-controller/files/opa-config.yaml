@@ -1,9 +1,0 @@
-# OPA Configuration
-decision_logs:
-  console: true
-  reporting:
-    min_delay_seconds: 5
-    max_delay_seconds: 10
-
-status:
-  console: true

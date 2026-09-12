@@ -1,0 +1,51 @@
+# vim: ft=apparmor
+# sek8s.k3s-init.* — one profile per k3s cluster-init script that needs a file from /run/chutes.
+#
+# Applied by k3s-post-start.sh via `aa-exec -p sek8s.k3s-init.<script>`. A script with no profile
+# here gets no exception: it stays on sek8s.deny-sensitive-default, the restrictive default.
+#
+# Each profile still denies the model cache AND /run/chutes. The wrapper stages the one needed
+# file into /run/k3s-init/<script>/ and removes it when the script exits; these profiles grant
+# read on that directory. /run/chutes is never narrowed — deny beats allow in AppArmor, and
+# carving exceptions into it would make a fail-closed blanket into a denylist.
+#
+# Adding a script means declaring it in THREE places: here, the staging map in k3s-post-start.sh,
+# and the PROFILES list in verify-apparmor-profiles.sh. Missing one is a loud boot failure.
+#
+# sys_boot is deliberately not denied here — these scripts power the VM off as their fail-closed
+# response, and the blanket profile's deny made that handler silently fail.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# Staged: k3s-encryption-config.yaml — confidential (holds the secretbox key).
+profile sek8s.k3s-init.00-reencrypt-secrets flags=(enforce) {
+  include <abstractions/sek8s-shell-base>
+  include <abstractions/sek8s-cache-deny>
+  include <abstractions/sek8s-secrets-deny>
+
+  # Redundant today (shell-base grants /** rwlkm); kept explicit in case that is narrowed.
+  /run/k3s-init/00-reencrypt-secrets.sh/ r,
+  /run/k3s-init/00-reencrypt-secrets.sh/** r,
+}
+
+# Staged: validator-ss58 — a public address; integrity-critical, not confidential.
+profile sek8s.k3s-init.03-k3s-validator-auth flags=(enforce) {
+  include <abstractions/sek8s-shell-base>
+  include <abstractions/sek8s-cache-deny>
+  include <abstractions/sek8s-secrets-deny>
+
+  /run/k3s-init/03-k3s-validator-auth.sh/ r,
+  /run/k3s-init/03-k3s-validator-auth.sh/** r,
+}
+
+# Staged: helm-pubkey.gpg — a public key; helm opens it itself and inherits this profile via ix.
+profile sek8s.k3s-init.04-helm-chart-upgrade flags=(enforce) {
+  include <abstractions/sek8s-shell-base>
+  include <abstractions/sek8s-cache-deny>
+  include <abstractions/sek8s-secrets-deny>
+
+  /run/k3s-init/04-helm-chart-upgrade.sh/ r,
+  /run/k3s-init/04-helm-chart-upgrade.sh/** r,
+}

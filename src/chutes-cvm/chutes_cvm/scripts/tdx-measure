@@ -1,0 +1,161 @@
+#!/bin/sh
+# tdx-measure — the single implementation of the RTMR3 measured-file walk.
+#
+# Owns the three decisions that must be identical everywhere RTMR3 is computed,
+# checked or predicted: WHICH files are measured, in WHAT ORDER, and HOW each one
+# is hashed. Every consumer reads this script's output rather than re-deriving it:
+#
+#   init-bottom/rtmr3-measure     boot: checks each hash against the canonical
+#                                 manifest, then extends hardware RTMR3
+#   generate-expected-hashes.yml  build: the `hash` output IS the manifest
+#   rtmr3-verify                  guest: folds the chain, compares to a TDX quote
+#   chutes_cvm.measurement        host: folds the chain to predict the published
+#                                 measurement, from a bundled copy of this script
+#
+# Four independent walkers of tdx-measure.conf used to exist and they disagreed
+# four ways: inline comments and trimming, symlinked conf entries, sort collation,
+# and `sha384sum FILE` vs stdin (which bricked any image holding a backslash-named
+# measured file). Keeping exactly one implementation is the fix — do not add a
+# second one, in any language.
+#
+# Usage: tdx-measure <command> <root> <conf>
+#   list   root-relative path of every regular file to measure, sorted
+#   hash   "<sha384hex> <root-relative path>" per file, in chain order
+#
+#   <root> prefixes the conf's absolute paths: "" for the live root, ${rootmnt} in
+#          the initramfs, the mounted newroot at image-build time.
+#
+#   stdout the requested output      stderr progress and warnings
+#   exit   0 ok; 1 conf unreadable, no paths configured, a symlinked entry, an
+#          unreadable file, or nothing to measure
+#
+# Canonical rules:
+#   - a line is truncated at the first '#', then whitespace-trimmed; empty lines skip
+#   - a conf entry that is itself a SYMLINK is an error. Following a symlinked
+#     directory while skipping a symlinked file is exactly the ambiguity that made
+#     the old walkers disagree, and either choice silently changes coverage, so
+#     entries must name a real file or a real directory.
+#   - directories are walked recursively; symlinks INSIDE them are neither followed
+#     nor measured (find -P and Path.rglob agree here)
+#   - a missing path contributes nothing
+#   - ordering is LC_ALL=C on the root-relative path, so no locale can reorder the
+#     extend chain
+#   - hashing is `sha384sum < file`: content only, never the path. The filename form
+#     prefixes its output with '\' when the name contains a backslash (systemd's
+#     \x2d escaping), which silently corrupts the hash field.
+
+set -eu
+
+usage() {
+    echo "usage: tdx-measure <list|hash> <root> <conf>" >&2
+    exit 1
+}
+
+[ $# -eq 3 ] || usage
+command="$1"
+root="$2"
+conf="$3"
+root="${root%/}"
+
+case "$command" in
+    list | hash) ;;
+    *) usage ;;
+esac
+
+if [ ! -f "$conf" ]; then
+    echo "tdx-measure: measure config not found: $conf" >&2
+    exit 1
+fi
+
+parsed=$(mktemp)
+filelist=$(mktemp)
+trap 'rm -f "$parsed" "$filelist"' EXIT
+
+# One sed does the whole parse: drop from the first '#', trim leading and trailing
+# whitespace (spaces, tabs and CR, so a CRLF conf behaves), delete what is left empty.
+sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' \
+    "$conf" > "$parsed"
+
+if [ ! -s "$parsed" ]; then
+    echo "tdx-measure: no paths configured in $conf" >&2
+    exit 1
+fi
+
+entry_idx=0
+symlinked=""
+
+# Read from a file, not a pipe, so the loop runs in this shell and its variables survive.
+while IFS= read -r entry; do
+    entry_idx=$((entry_idx + 1))
+    full="$root$entry"
+
+    if [ -L "$full" ]; then
+        echo "tdx-measure: [$entry_idx] conf entry is a symlink: $entry" >&2
+        symlinked="$symlinked $entry"
+        continue
+    fi
+
+    if [ -d "$full" ]; then
+        before=$(wc -l < "$filelist")
+        # Strip the root prefix here so the emitted paths sort consistently across
+        # machines. A single find, counted from the delta — the tree can be 1500+ files.
+        find "$full" -type f | while IFS= read -r f; do
+            printf '%s\n' "${f#"$root"}"
+        done >> "$filelist"
+        after=$(wc -l < "$filelist")
+        echo "tdx-measure: [$entry_idx] collected $((after - before)) files from $entry" >&2
+    elif [ -f "$full" ]; then
+        printf '%s\n' "$entry" >> "$filelist"
+    fi
+done < "$parsed"
+
+if [ -n "$symlinked" ]; then
+    echo "tdx-measure: conf entries are symlinks, which would change measurement" >&2
+    echo "  coverage silently:$symlinked" >&2
+    exit 1
+fi
+
+if [ ! -s "$filelist" ]; then
+    echo "tdx-measure: no files found to measure — check $conf paths" >&2
+    exit 1
+fi
+
+sorted=$(mktemp)
+trap 'rm -f "$parsed" "$filelist" "$sorted"' EXIT
+# -u because conf entries legitimately overlap: a directory is listed for coverage
+# and individual files under it are listed again so they can be asserted by name.
+# Without dedupe those files are hashed twice, which makes the measurement depend on
+# the config's redundancy -- tidying an entry that looks obviously superfluous would
+# change RTMR3 and power off every VM at the mismatch.
+LC_ALL=C sort -u "$filelist" > "$sorted"
+
+if [ "$command" = "list" ]; then
+    cat "$sorted"
+    exit 0
+fi
+
+# hash: content-only SHA-384 per file, in chain order.
+#
+# Batched through xargs, not one sha384sum per file: at 41k files the per-file fork was the
+# whole cost (~6ms each, ~4min of boot). -z disables GNU's filename escaping -- that escaping
+# is what forced the per-file stdin form, since a backslash in a name shifts the hash field.
+# xargs preserves input order, so digests pair positionally with $sorted by line number and
+# the names sha384sum echoes are ignored entirely.
+total=$(wc -l < "$sorted")
+digests=$(mktemp)
+trap 'rm -f "$parsed" "$filelist" "$sorted" "$digests"' EXIT
+echo "tdx-measure: hashing $total files..." >&2
+
+# Paths are root-relative with a leading '/'; strip it and chdir to $root so the hashed names
+# stay short and no prefix has to be stripped back off the output.
+sed 's|^/||' "$sorted" | tr '\n' '\0' \
+    | (cd "${root:-/}" && xargs -0 sha384sum -z 2>/dev/null) \
+    | tr '\0' '\n' | cut -c1-96 > "$digests"
+
+hashed=$(grep -c '' "$digests" 2>/dev/null || echo 0)
+if [ "$hashed" -ne "$total" ]; then
+    echo "tdx-measure: hashed $hashed of $total files -- unreadable file?" >&2
+    exit 1
+fi
+
+awk 'NR==FNR { d[FNR]=$0; next } { print d[FNR] " " $0 }' "$digests" "$sorted"

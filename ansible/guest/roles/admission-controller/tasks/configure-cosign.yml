@@ -25,58 +25,8 @@
         group: admission
         mode: '0750'
 
-    - name: Setup cosign key
-      ansible.builtin.copy:
-        src: "{{ cosign_public_key_path }}"
-        dest: /etc/admission-controller/cosign/cosign.pub
-        owner: root
-        group: admission
-        mode: '0640'
-      notify: restart admission-controller
-
-    - name: Add proxy hostname to /etc/hosts
-      lineinfile:
-        path: /etc/hosts
-        line: "127.0.0.1 {{ validator }}.localregistry.chutes.ai"
-        regexp: "^127\\.0\\.0\\.1\\s+{{ (validator + '.localregistry.chutes.ai') | regex_escape() }}$"
-        state: present
-        backup: yes
-
-    - name: Ensure /etc/docker directory exists
-      file:
-        path: /etc/docker
-        state: directory
-        mode: '0755'
-
-    - name: Read existing Docker daemon config
-      slurp:
-        path: /etc/docker/daemon.json
-      register: docker_daemon_config
-      ignore_errors: yes
-
-    - name: Parse existing Docker daemon config
-      set_fact:
-        docker_config: "{{ docker_daemon_config.content | b64decode | from_json }}"
-      when: docker_daemon_config is succeeded
-
-    - name: Set default Docker config if file doesn't exist
-      set_fact:
-        docker_config: {}
-      when: docker_daemon_config is failed
-
-    - name: Update insecure-registries in Docker config
-      set_fact:
-        docker_config: "{{ docker_config | combine({'insecure-registries': insecure_registries_list}) }}"
-      vars:
-        insecure_registries_list:
-          - "{{ validator }}.localregistry.chutes.ai:{{ registry_port | default('30500') }}"
-          - "localhost:{{ registry_port | default('30500')  }}"
-          - "127.0.0.1:{{ registry_port | default('30500')  }}"
-
-    - name: Write updated Docker daemon config
-      copy:
-        content: "{{ docker_config | to_nice_json }}"
-        dest: /etc/docker/daemon.json
-        mode: '0644'
-        backup: yes
-      notify: restart docker
+    # registry.chutes.ai is a real, publicly-resolvable host reached over
+    # genuine mTLS — no /etc/hosts loopback alias and no insecure-registries
+    # entry are needed. The former localregistry.chutes.ai:30500 local-proxy
+    # plumbing (127.0.0.1 hosts alias + insecure-registries in daemon.json) has
+    # been removed now that pulls use per-VM mTLS to the upstream registry.

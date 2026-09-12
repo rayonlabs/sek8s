@@ -1,0 +1,139 @@
+# vim: ft=apparmor
+# sek8s.chute-log-shipper — AppArmor profile for the chute-log-shipper service.
+# Applied via systemd AppArmorProfile= directive (not auto-attached).
+# Confines the service to exactly: chute pod logs, the registry-tls leaf, the cursor
+# dir, and outbound network. The CRI socket is NOT reachable from this profile -- it
+# lives only in the crictl child profile, entered by exec'ing crictl-pods-helper.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# attach_disconnected: the service runs in a systemd sandbox mount namespace, which leaves /dev
+# nodes (e.g. /dev/null) "disconnected" from this profile's root — without the flag AppArmor fails
+# the path lookup (error=-13) even in complain. (Confirmed against the live audit.)
+profile sek8s.chute-log-shipper flags=(enforce, attach_disconnected) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+  include <abstractions/python>
+
+  # Python interpreter and venv (the sek8s package, installed under /opt/sek8s). mr on the venv
+  # because C-extension .so files are mmap'd. /opt/sek8s/src is READ-ONLY: it is RTMR3-measured, and
+  # the service runs with PYTHONDONTWRITEBYTECODE=1 (see the unit file) so no .pyc are written into
+  # the measured tree at runtime — a runtime write would drift RTMR3 on the next boot.
+  /opt/sek8s/ r,
+  /opt/sek8s/venv/bin/python3{,.*} mrix,
+  /opt/sek8s/venv/** mr,
+  /opt/sek8s/src/** r,
+
+  # Environment file.
+  /etc/chute-log-shipper/** r,
+
+  # The unit drop-in grants CAP_DAC_READ_SEARCH (kubelet pod log dirs are root-owned 0750);
+  # AppArmor must permit its use separately or log capture fails with EACCES.
+  capability dac_read_search,
+
+  # Chute pod logs — read-only, scoped to the chutes namespace pod dirs only.
+  /var/log/pods/ r,
+  /var/log/pods/chutes_*/ r,
+  /var/log/pods/chutes_*/** r,
+
+  # Registry mTLS leaf — the egress client identity (read-only).
+  /run/chutes/registry-tls/ r,
+  /run/chutes/registry-tls/client.crt r,
+  /run/chutes/registry-tls/client.key r,
+
+  # Cursor persistence — read/write.
+  /var/lib/chute-log-shipper/ rw,
+  /var/lib/chute-log-shipper/** rwk,
+
+  # Pod discovery transitions to the crictl child profile (defined below) rather than
+  # inheriting this one. The CRI socket is full control of containerd — pull, run and exec
+  # any image, bypassing admission and cosign entirely — so it must not be reachable from
+  # the long-running Python process that parses attacker-controlled log lines. `rix` would
+  # inherit, which is what made the wrapper's allowlist decorative: a process that can exec
+  # /usr/local/bin/k3s directly never goes through crictl-pods-helper. Same reasoning and
+  # same shape as `du`/`df` -> disk_diag in sek8s.system-manager.
+  /usr/local/bin/crictl-pods-helper cx -> crictl,
+
+  # System libraries.
+  /usr/lib/** rm,
+  /usr/local/lib/** rm,
+  /etc/ld.so.cache r,
+  /etc/ld.so.conf r,
+  /etc/ld.so.conf.d/** r,
+
+  # Proc, sys, dev.
+  @{PROC}/** r,
+  @{sys}/** r,
+  /dev/null rw,
+  /dev/tty rw,
+  /dev/urandom r,
+  owner @{PROC}/@{pid}/fd/ r,
+
+  # Network egress to the validator (mTLS) + DNS.
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+  network unix stream,
+  network unix dgram,
+
+  # Signals to the crictl child (it is the only subprocess).
+  signal send peer=sek8s.chute-log-shipper,
+  signal receive peer=sek8s.chute-log-shipper,
+  signal send peer=sek8s.chute-log-shipper//crictl,
+
+  # ── crictl child profile ──────────────────────────────────────────────────────────────
+  # Everything needed to run `k3s crictl {pods,ps} -o json` and nothing else. Entered ONLY
+  # by exec'ing crictl-pods-helper, whose case statement (crictl-pods-helper:13-35) is now a
+  # real boundary: the socket and the k3s binary exist only in here, so the allowlist cannot
+  # be sidestepped by exec'ing k3s directly.
+  profile crictl flags=(enforce, attach_disconnected) {
+    include <abstractions/base>
+    include <abstractions/nameservice>
+
+    # The wrapper is a #! script: both it and its interpreter must be reachable here.
+    # dash, not bash — bash would source $BASH_ENV inside this profile before the
+    # wrapper's allowlist ran, handing the CRI socket to whoever set it.
+    /usr/local/bin/crictl-pods-helper r,
+    /usr/bin/dash mrix,
+    /bin/dash mrix,
+
+    # /usr/local/bin/k3s is a symlink into the versioned data dir and AppArmor mediates the
+    # RESOLVED path, so the real binary must be granted too or the exec is denied in enforce.
+    /usr/local/bin/k3s mrix,
+    /var/lib/rancher/k3s/data/*/bin/k3s mrix,
+
+    # The CRI socket, and the config that tells crictl where to find it.
+    /run/k3s/containerd/containerd.sock rw,
+    /etc/chute-log-shipper/crictl.yaml r,
+    /etc/rancher/k3s/config.yaml r,
+    /var/lib/rancher/k3s/agent/etc/ r,
+    /var/lib/rancher/k3s/agent/etc/crictl.yaml r,
+    /etc/machine-id r,
+
+    # The k3s multi-call binary shells out to its iptables backend even for `crictl`. It is
+    # not granted: the calls fail, the failures are non-fatal, and a log reader has no
+    # business touching the firewall. Denials from that path are expected noise.
+
+    /usr/lib/** rm,
+    /usr/local/lib/** rm,
+    /etc/ld.so.cache r,
+    /etc/ld.so.conf r,
+    /etc/ld.so.conf.d/** r,
+
+    @{PROC}/** r,
+    @{sys}/** r,
+    /dev/null rw,
+    /dev/tty rw,
+    /dev/urandom r,
+    owner @{PROC}/@{pid}/fd/ r,
+
+    # Connecting to the containerd socket.
+    network unix stream,
+    network unix dgram,
+
+    signal receive peer=sek8s.chute-log-shipper,
+  }
+}

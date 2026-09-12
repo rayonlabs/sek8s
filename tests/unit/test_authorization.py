@@ -57,7 +57,7 @@ async def test_allow_agent_pod_logs(authz_client):
 
 @pytest.mark.asyncio
 async def test_allow_registry_pod_logs(authz_client):
-    review = _subject_access_review(user="miner", name="registry-d2tdb")
+    review = _subject_access_review(user="miner", name="chutes-registry-d2tdb")
     resp = await authz_client.post("/authorize", json=review)
     assert resp.status_code == 200
     body = resp.json()
@@ -94,8 +94,8 @@ async def test_deny_chute_workload_logs(authz_client):
 
 @pytest.mark.asyncio
 async def test_deny_prefix_without_trailing_hyphen(authz_client):
-    """'registryevil-pod' must NOT match the 'registry-' prefix."""
-    review = _subject_access_review(user="miner", name="registryevil-pod")
+    """'chutes-registryevil-pod' must NOT match the 'chutes-registry-' prefix."""
+    review = _subject_access_review(user="miner", name="chutes-registryevil-pod")
     resp = await authz_client.post("/authorize", json=review)
     assert resp.status_code == 200
     body = resp.json()

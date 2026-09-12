@@ -4,7 +4,6 @@ Documentation=man:systemd.service(5)
 After=var-snap.mount
 Before=setup-cache.service
 Before=k3s.service
-Before=k3s-agent.service
 Requires=var-snap.mount
 OnFailure=poweroff.target
 

@@ -89,7 +89,8 @@ Advances the host OS by one or more versions following the `os_upgrade_path` def
 # Single hop (e.g. 25.10 -> 26.04):
 ansible-playbook -i ~/chutes/my-inventory.yml playbooks/upgrade-host.yml
 
-# Multi-hop to a target version (e.g. 25.04 -> 25.10 -> 26.04 in one run):
+# Multi-hop to a target version (e.g. 25.04 -> 25.10 -> 26.04 in one run; 25.10 has
+# no setup profile, so always target 26.04 from 25.04):
 ansible-playbook -i ~/chutes/my-inventory.yml playbooks/upgrade-host.yml \
   -e target_version=26.04
 
@@ -113,6 +114,11 @@ os_upgrade_path:
   "25.10": "26.04"
   "25.04": "25.10"  # 25.04 EOL; no setup.yml profile, but hop still works
 ```
+
+25.10 is a waypoint only — it has no `setup.yml` profile either, so from 25.04 always
+pass `-e target_version=26.04` rather than taking single hops. A run whose final hop is
+25.10 is refused by the `chutes-cvm host verify` pre-flight (that OS ships no baselined QEMU), which
+is what keeps a node from landing on an OS it cannot be provisioned on or launch from.
 
 To add future upgrade hops (e.g. `26.04 -> 26.10`), add an entry to `os_upgrade_path`.
 
@@ -178,7 +184,7 @@ all:
 
 The inventory hostname (`my-tee-host` above) is used as both `chutes-miner --name` and `vm.hostname` in `config.yaml`. These must match the TEE server name registered in chutes-miner — do not use an SSH alias as the inventory key.
 
-The generated `config.yaml` matches the shape of [`config.tmpl.yaml`](../../host-tools/scripts/config/config.tmpl.yaml).
+The `config.yaml` shape is defined by the `LaunchConfig` model in [`config.py`](../../src/chutes-cvm/chutes_cvm/guest/config.py); `chutes-cvm config init` generates a starter file from it.
 
 ---
 
@@ -186,9 +192,9 @@ The generated `config.yaml` matches the shape of [`config.tmpl.yaml`](../../host
 
 | Ubuntu | Status | TDX kernel | Attestation |
 |---|---|---|---|
-| **26.04** | current target | native `linux-image-generic` | Intel DCAP repo (`resolute` suite) |
-| 25.10 | supported — EOL July 2026; upgrade to 26.04 with `upgrade-host.yml` | native `linux-image-generic` | Intel DCAP repo (`noble` suite) |
-| 25.04 | **EOL Jan 2026 — no profile.** Use `upgrade-host.yml` to advance to 25.10. | — | — |
+| **26.04** | the only supported OS | pinned `linux-image-6.17.0-35-generic` | Intel DCAP repo (`resolute` suite) |
+| 25.10 | **no longer supported — upgrade-only waypoint.** No `setup.yml` profile and no baselined QEMU, so a host left on 25.10 cannot be provisioned or launch a VM. Advance it with `upgrade-host.yml -e target_version=26.04`. | — | — |
+| 25.04 | **EOL Jan 2026 — no profile.** Use `upgrade-host.yml -e target_version=26.04` (hops via 25.10). | — | — |
 
 ---
 
@@ -226,6 +232,6 @@ upgrade-host.yml                   upgrade-guest.yml
      "26.04": "26.10"   # new
    ```
 2. Optionally add `roles/os_upgrade/tasks/pre_2604.yml` with any migration tasks to run before `do-release-upgrade` on that version (e.g. removing stale repos). Omit the file if no pre-upgrade work is needed.
-3. Add a host profile in `host-tools/scripts/chutes/host/profiles.py` for the new target version so `setup-tdx-host` (called automatically by the hop) can configure it correctly.
+3. Add a host profile in `src/chutes-cvm/chutes_cvm/host/profiles.py` for the new target version so `chutes-cvm host setup` (called automatically by the hop) can configure it correctly.
 
 See [docs/specs/ansible-playbooks.md](../../docs/specs/ansible-playbooks.md) for the full contract.

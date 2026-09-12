@@ -1,12 +1,13 @@
 ---
 # lock-accounts — Remove non-system accounts and lock root.
 #
-# Removes all accounts with uid >= 1000 (except nobody and system-manager)
+# Removes all accounts with uid >= 1000 (except those in lock_accounts_preserve)
 # along with their home directories.  Locks root password and sets nologin
 # shell on any system account that still has an interactive shell.
 #
-# system-manager is excluded because it is a service account with uid 10150
-# (above the system range) that must survive into the running VM.
+# system-manager (10150) and chute-log-shipper (10151) are excluded because they are service
+# accounts with uids above the system range that must survive into the running VM. See
+# defaults/main.yml — every new service account with uid >= 1000 must be added there.
 #
 # Idempotent: safe to re-run. No flags or conditionals — the playbook
 # decides whether to include this role.
@@ -18,11 +19,18 @@
     shell: /usr/sbin/nologin
 
 - name: Remove all non-system accounts (uid >= 1000)
+  # DANGER: `userdel --remove` deletes the account's HOME DIRECTORY recursively. sek8s service
+  # accounts are given uids ABOVE the system range (system-manager 10150, chute-log-shipper 10151)
+  # and share `home: /opt/sek8s`, so deleting one here does not merely drop the account — it wipes
+  # the entire application tree (src/ + venv/). That is silent at build time and only surfaces at
+  # boot as 203/EXEC (venv python gone) on every sek8s service plus 217/USER for the deleted
+  # account. The preserve list is the ONLY thing standing between a new service account and that.
   ansible.builtin.shell: |
-    awk -F: '$3 >= 1000 && $1 != "nobody" && $1 != "system-manager" {print $1}' /etc/passwd | \
-      while read -r user; do
-        userdel --remove --force "$user" 2>/dev/null || true
-      done
+    preserve="{{ lock_accounts_preserve | join(' ') }}"
+    awk -F: '$3 >= 1000 {print $1}' /etc/passwd | while read -r user; do
+      case " $preserve " in *" $user "*) continue ;; esac
+      userdel --remove --force "$user" 2>/dev/null || true
+    done
   changed_when: true
 
 - name: Set nologin shell on system accounts with interactive shells

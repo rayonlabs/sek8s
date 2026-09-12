@@ -1,8 +1,8 @@
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Set
 
 from sek8s.clients.cosign import (
     CosignClient,
@@ -67,7 +67,7 @@ class _TagVerification:
 class ValidationContext:
     """Context passed to validation rules: config, request, and pre-extracted data.
 
-    required_key_path is set in _get_rules_for_context when the rule set needs it
+    required_key_paths is populated in _get_rules_for_context when the rule set needs it
     (e.g. chutes namespace). Rules are generic and only read context; they are
     not aware of namespace or rule-set identity.
     """
@@ -78,7 +78,7 @@ class ValidationContext:
     images: List[str]
     cosign_config: CosignConfig
     validator: "CosignValidator"
-    required_key_path: Optional[Path] = None
+    required_key_paths: Set[Path] = field(default_factory=set)
 
 
 # Rule type: async bound method (ctx) -> list of violation strings (empty if none)
@@ -142,7 +142,8 @@ class CosignValidator(ValidatorBase):
         """
         rules: set = set()
         if ctx.namespace == "chutes":
-            ctx.required_key_path = self.config.chutes_cosign_public_key_path
+            ctx.required_key_paths.add(self.config.chutes_public_key_path)
+            ctx.required_key_paths.add(self.config.dockerhub_public_key_path)
             rules.update(self._chutes_rules)
 
         rules.update(self._default_rules)
@@ -263,12 +264,12 @@ class CosignValidator(ValidatorBase):
         return violations
 
     async def _require_ctx_key(self, ctx: ValidationContext) -> List[str]:
-        """Report any image whose cosign key path does not match ctx.required_key_path.
-        Raises if required_key_path is not set."""
-        if not ctx.required_key_path:
+        """Report any image whose cosign key path is not in ctx.required_key_paths.
+        Raises if required_key_paths is empty."""
+        if not ctx.required_key_paths:
             raise RuntimeError(
-                f"You can not use the require context key rule without providing a key path.\n"
-                f"{ctx.namespace=} {ctx.required_key_path=} {ctx.images=}"
+                f"You can not use the require context key rule without providing key paths.\n"
+                f"{ctx.namespace=} {ctx.required_key_paths=} {ctx.images=}"
             )
         violations: List[str] = []
         seen: set = set()
@@ -281,7 +282,7 @@ class CosignValidator(ValidatorBase):
             if (
                 vc
                 and vc.public_key is not None
-                and str(vc.public_key) != str(ctx.required_key_path)
+                and vc.public_key not in ctx.required_key_paths
             ):
                 violations.append(f"Image {image} uses a different cosign key")
         return violations

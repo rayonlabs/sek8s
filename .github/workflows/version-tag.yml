@@ -86,6 +86,27 @@ jobs:
             echo "No proxy-domain changes detected."
           fi
 
+          # --- chutes-cvm domain ---
+          # src/chutes-cvm/*  →  src/chutes-cvm/VERSION
+          needs_cvm_bump=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              src/chutes-cvm/*) needs_cvm_bump=true; break ;;
+            esac
+          done <<< "$changed_files"
+
+          if [ "$needs_cvm_bump" = true ]; then
+            if ! echo "$changed_files" | grep -qx "src/chutes-cvm/VERSION"; then
+              echo "::error::Changes under src/chutes-cvm/ require an src/chutes-cvm/VERSION bump."
+              errors=$((errors + 1))
+            else
+              echo "chutes-cvm domain: src/chutes-cvm/VERSION bumped."
+            fi
+          else
+            echo "No chutes-cvm-domain changes detected."
+          fi
+
           if [ "$errors" -gt 0 ]; then
             exit 1
           fi
@@ -178,3 +199,4 @@ jobs:
           tag_if_ready "src/sek8s/VERSION"             "sek8s-v"             "changelogs/sek8s"
           tag_if_ready "src/sek8s-common/VERSION"      "sek8s-common-v"      ""
           tag_if_ready "src/attestation-proxy/VERSION"  "attestation-proxy-v" "changelogs/attestation-proxy"
+          tag_if_ready "src/chutes-cvm/VERSION"         "chutes-cvm-v"        "changelogs/chutes-cvm"

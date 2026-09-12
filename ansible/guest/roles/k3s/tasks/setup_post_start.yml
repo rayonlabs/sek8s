@@ -12,6 +12,31 @@
     - /var/lib/rancher/k3s/credentials
     - /var/log
 
+# Written on EVERY build, not just debug. /etc/systemd/system is measured as a whole directory,
+# so this drop-in is covered by RTMR3 either way — but shipping it on both means a flipped value
+# is a CONTENT change with a manifest entry, which rtmr3-verify catches at boot and powers off on.
+# Were it absent on production, adding it offline would only show up as a failed remote
+# attestation, after the VM had already booted with the fail-closed poweroff disabled.
+- name: Create k3s-post-start drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/k3s-post-start.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install k3s post-start debug drop-in (poweroff gate)
+  ansible.builtin.copy:
+    content: |
+      # Debug builds stay up on a failed init script so it can be diagnosed over SSH;
+      # production powers the VM off. Measured into RTMR3 — do not edit on the image.
+      [Service]
+      Environment=K3S_POST_START_DEBUG={{ 'true' if (debug_build | default(false) | bool) else 'false' }}
+    dest: /etc/systemd/system/k3s-post-start.service.d/10-debug.conf
+    owner: root
+    group: root
+    mode: '0644'
+
 - name: Install k3s post-start script
   copy:
     src: k3s-post-start.sh

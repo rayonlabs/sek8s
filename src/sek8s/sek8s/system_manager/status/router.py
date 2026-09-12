@@ -321,7 +321,17 @@ async def shutdown_system() -> ShutdownResponse:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await process.communicate()
+            stdout, stderr = await process.communicate()
+            # `shutdown` returning non-zero is NOT an exception — without this check a failed
+            # poweroff (e.g. sudo/AppArmor/inhibitor) is swallowed silently and the VM just
+            # keeps running. Surface it loudly so the cause is visible in the logs.
+            if process.returncode != 0:
+                logger.error(
+                    "Shutdown command failed (rc={}): stdout={!r} stderr={!r}",
+                    process.returncode,
+                    stdout.decode(errors="replace").strip(),
+                    stderr.decode(errors="replace").strip(),
+                )
         except Exception as e:
             logger.error("Failed to execute shutdown: {}", e)
 

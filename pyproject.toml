@@ -11,6 +11,7 @@ python = ">=3.12,<3.15"
 sek8s = {path = "src/sek8s", develop = true}
 sek8s-common = {path = "src/sek8s-common", develop = true}
 attestation-proxy = {path = "src/attestation-proxy", develop = true}
+chutes-cvm = {path = "src/chutes-cvm", develop = true}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.1.1"
@@ -55,5 +56,6 @@ module = [
     "substrateinterface",
     "aiocache",
     "bittensor_wallet",
+    "yaml",
 ]
 ignore_missing_imports = true

@@ -1,0 +1,66 @@
+---
+# Build the sr25519 signer (static musl) on the control host and install it into the guest, so the
+# initramfs can prove miner-hotkey possession at boot (openssl cannot do Schnorr/Ristretto). The
+# luks fetch_key hook stages /usr/bin/sr25519 via copy_exec, so it lands in the measured initramfs.
+#
+# Must run BEFORE prepare-boot-image rebuilds the initramfs (so the binary exists when copy_exec runs).
+# The pinned rust-toolchain.toml (1.94.0 + musl) makes the shipped binary reproducible — a toolchain
+# bump changes the bytes and therefore RTMR2, so it is a deliberate, versioned change.
+
+- name: Build the sr25519 static binary on the control host
+  delegate_to: localhost
+  run_once: true
+  become: false
+  # rustup's shims live in ~/.cargo/bin, which a non-login ansible shell need not have on PATH —
+  # prepend it so `rustup`/`cargo` resolve to the pinned rustup toolchain, not an apt cargo that
+  # ignores rust-toolchain.toml. Harmless when the dir is absent.
+  environment:
+    PATH: "{{ lookup('env', 'HOME') }}/.cargo/bin:{{ lookup('env', 'PATH') }}"
+  block:
+    - name: Detect rustup on the control host
+      ansible.builtin.command: which rustup
+      register: _sr_rustup
+      changed_when: false
+      failed_when: false
+
+    - name: Require rustup (the pinned toolchain + musl target need it)
+      ansible.builtin.fail:
+        msg: >-
+          rustup not found for {{ lookup('env', 'USER') | default('this account', true) }}
+          (searched {{ lookup('env', 'HOME') }}/.cargo/bin). rustup is per-user — build-setup.yml
+          installs it for build_user, so run the build as that account, or install it here:
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none.
+          Only rustup honors the pinned toolchain + {{ sr25519_musl_target }} target in
+          src/sr25519/rust-toolchain.toml (apt's cargo gives "can't find crate for core").
+      when: _sr_rustup.rc != 0
+
+    # In the crate dir so rustup resolves the pinned channel from rust-toolchain.toml and adds the
+    # target TO it. Idempotent — rustup no-ops when the target is already present. Self-heals a host
+    # whose 1.94.0 was installed before the musl target (the "can't find crate for core" failure).
+    - name: Ensure the pinned toolchain's musl target is installed
+      ansible.builtin.command:
+        cmd: rustup target add {{ sr25519_musl_target }}
+        chdir: "{{ sr25519_src_dir }}"
+      register: _sr_target
+      changed_when: "'installing' in _sr_target.stdout"
+
+    - name: Build sr25519 (release, static musl — honors the pinned rust-toolchain.toml)
+      ansible.builtin.command:
+        cmd: cargo build --release --target {{ sr25519_musl_target }}
+        chdir: "{{ sr25519_src_dir }}"
+      changed_when: true
+
+    - name: Assert the static binary was produced
+      ansible.builtin.stat:
+        path: "{{ sr25519_bin_src }}"
+      register: _sr_bin
+      failed_when: not _sr_bin.stat.exists
+
+# Reads the control-host binary and pushes it to the guest.
+- name: Install the sr25519 binary into the guest
+  ansible.builtin.copy:
+    src: "{{ sr25519_bin_src }}"
+    dest: "{{ sr25519_bin_dest }}"
+    owner: root
+    group: root
+    mode: "0755"

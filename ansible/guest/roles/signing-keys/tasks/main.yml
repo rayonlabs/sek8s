@@ -1,0 +1,93 @@
+---
+# signing-keys — Bake the root RSA public key (PEM) into /etc/chutes/ (measured
+# by RTMR3) and install the initramfs fetch/verify machinery.
+
+# ── Validate build-host prerequisites ───────────────────────────────────────
+
+- name: Stat root signing key on build host
+  ansible.builtin.stat:
+    path: "{{ root_signing_key_path }}"
+  delegate_to: localhost
+  become: false
+  register: _root_key_stat
+
+- name: Assert root signing key exists
+  ansible.builtin.assert:
+    that: _root_key_stat.stat.exists
+    fail_msg: >-
+      Root RSA public key (PEM) not found at {{ root_signing_key_path }}.
+
+# ── Install root RSA public key and URL config ───────────────────────────────
+
+- name: Ensure /etc/chutes directory exists
+  ansible.builtin.file:
+    path: /etc/chutes
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install root RSA signing key (PEM)
+  ansible.builtin.copy:
+    src: "{{ root_signing_key_path }}"
+    dest: /etc/chutes/root-signing-key.pem
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install signing-keys.conf
+  ansible.builtin.template:
+    src: signing-keys.conf.j2
+    dest: /etc/chutes/signing-keys.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+# openssl (the RSA verifier) is already staged into the initramfs by the LUKS
+# fetch_key hook, so no extra binary is installed here.
+
+# ── Install initramfs hook and init-bottom script ────────────────────────────
+
+- name: Install fetch-signing-keys initramfs hook
+  ansible.builtin.copy:
+    src: initramfs/fetch-signing-keys-hook
+    dest: /etc/initramfs-tools/hooks/fetch-signing-keys
+    owner: root
+    group: root
+    mode: '0755'
+  notify: update initramfs
+
+- name: Install fetch-signing-keys init-bottom script
+  ansible.builtin.copy:
+    src: initramfs/fetch-signing-keys
+    dest: /etc/initramfs-tools/scripts/init-bottom/fetch-signing-keys
+    owner: root
+    group: root
+    mode: '0755'
+  notify: update initramfs
+
+# ── Consumer wiring (self-contained) ────────────────────────────────────────
+# The keys are PUBLIC and the initramfs writes them 0644, so nothing gates them and no
+# group or perms unit is involved. Admission reaches them through a drop-in that binds
+# the subtree into the private tmpfs its unit mounts over 0700 /run/chutes. Wiring it
+# via a drop-in rather than editing the unit keeps admission ignorant of signing keys.
+
+- name: Ensure admission-controller systemd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/admission-controller.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Grant admission-controller signing-key access via drop-in
+  ansible.builtin.copy:
+    src: admission-controller-signing-keys.conf
+    dest: /etc/systemd/system/admission-controller.service.d/30-signing-keys.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd so the admission-controller drop-in takes effect
+  ansible.builtin.systemd:
+    daemon_reload: true

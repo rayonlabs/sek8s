@@ -1,0 +1,18 @@
+# OPA Configuration
+# Managed by Ansible (see ansible/guest/roles/admission-controller).
+{% if opa_decision_logs | default(false) %}
+# Decision logs are OFF by default: `console: true` writes the full AdmissionReview
+# input (complete pod specs — images, env, mounts) to the journal for every admitted
+# object, which both floods the journal window that boot/attestation triage needs and
+# puts tenant workload detail into a log the miner can read over the status API
+# (/status/services/opa/logs). Enable only for debug builds: -e opa_decision_logs=true.
+decision_logs:
+  console: true
+  reporting:
+    min_delay_seconds: 5
+    max_delay_seconds: 10
+
+{% endif %}
+# Plugin/policy-load status only — low volume, no request data.
+status:
+  console: true

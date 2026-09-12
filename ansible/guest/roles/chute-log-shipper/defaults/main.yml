@@ -1,0 +1,22 @@
+---
+# Dedicated non-root uid/gid for the chute-log-shipper service (not 1000; not
+# the system-manager uid 10150). Kept within UID_MIN–UID_MAX to avoid useradd
+# warnings.
+chute_log_shipper_uid: 10151
+chute_log_shipper_gid: 10151
+
+# Validator egress: the dedicated CVM mTLS proxy (cvm.chutes.ai), NOT api.chutes.ai.
+chute_log_shipper_validator_base_url: "https://cvm.chutes.ai"
+
+# Pod discovery / capture knobs (see src/sek8s/sek8s/log_shipper/config.py).
+chute_log_shipper_namespace: "chutes"
+chute_log_shipper_label_selector: "chutes/chute=true"
+chute_log_shipper_container_name: "chute"
+chute_log_shipper_poll_interval: 10
+chute_log_shipper_batch_max_lines: 500
+chute_log_shipper_batch_max_bytes: 1048576
+chute_log_shipper_max_line_bytes: 16384
+chute_log_shipper_max_concurrent_pods: 32
+chute_log_shipper_request_timeout: 30
+chute_log_shipper_retry_max_attempts: 5
+chute_log_shipper_debug: false

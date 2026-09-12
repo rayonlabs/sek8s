@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exit 0 if a live chutes-td QEMU process is running on this host, 1 otherwise.
-# Logic must stay aligned with host-tools/scripts/quick-launch.sh (_live_chutes_td_qemu_running).
+# Logic must stay aligned with src/chutes-cvm/chutes_cvm/guest/launch.py (_chutes_td_running).
 set -euo pipefail
 
 _PROCESS_NAME_CHUTES_TD="chutes-td"

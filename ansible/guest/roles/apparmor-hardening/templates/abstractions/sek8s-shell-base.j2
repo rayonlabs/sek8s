@@ -1,0 +1,62 @@
+# vim: ft=apparmor
+# sek8s-shell-base — the permissions every sek8s shell profile shares.
+#
+# Extracted so a profile is expressed as "this base, plus which denies apply" rather than as a
+# hand-written allowlist. That distinction matters: these scripts run under poweroff-on-failure
+# orchestration, so a profile assembled from an allowlist fails the VM for every rule the author
+# forgot, whereas a profile built from this base starts out working and only removes access.
+#
+# Contains NO denies for the protected assets — the caller composes those:
+#   include <abstractions/sek8s-cache-deny>    model weights  (/var/snap/cache)
+#   include <abstractions/sek8s-secrets-deny>  runtime secrets (/run/chutes)
+# A profile that includes neither has full reach; that is never correct here, so every profile
+# including this one must include at least sek8s-cache-deny.
+
+  include <abstractions/base>
+  include <abstractions/nameservice>
+
+  # Broad filesystem access. The deny abstractions carve out the protected paths, and AppArmor
+  # gives deny precedence over any allow — which is exactly why exceptions cannot be expressed by
+  # adding an allow rule alongside a deny, and are handled by profile composition instead.
+  / r,
+  /** rwlkm,
+
+  # Execute system binaries; children inherit the including profile (ix).
+  /{,usr/}{bin,sbin}/** mrix,
+  /usr/local/{bin,sbin}/** mrix,
+  # k3s ships k3s/kubectl/crictl under a versioned data dir, not the standard bin paths.
+  /var/lib/rancher/k3s/data/*/bin/** mrix,
+
+  network,
+
+  # System D-Bus plus the AF_UNIX socket beneath it. `abi <abi/4.0>` mediates AF_UNIX sockets and
+  # D-Bus methods separately from file access, so `network,` alone is not enough: without the
+  # `unix` rule the connect() is denied and `systemctl is-active` fails with
+  # "Failed to connect to bus: Permission denied". Both the unix and dbus rules are required.
+  #
+  # This was found the hard way, and the finding generalises: it broke the k3s cluster-init steps,
+  # which the wrapper invokes as `bash <script>` — exec'ing /usr/bin/bash BY NAME, which is what
+  # attaches an @{confined_bins} profile — while the wrapper itself was unaffected, because
+  # systemd execs it as /usr/local/bin/k3s-post-start.sh and AppArmor matches attachment against
+  # the execve target, not against the interpreter the kernel then loads for a #! script. That
+  # asymmetry is what the per-script staging design depends on.
+  unix (connect, send, receive) type=stream peer=(label=unconfined),
+  dbus (send, receive) bus=system peer=(name=org.freedesktop.systemd1),
+  dbus (send, receive) bus=system peer=(name=org.freedesktop.DBus),
+
+  # Confine by PATH, not privilege: normal root tooling (dmesg, chown, mount) keeps working, but
+  # the capabilities that would let a process drop below AppArmor entirely are denied. sys_module
+  # is the critical one while module signing is not enforced — an insmod would bypass every path
+  # deny above wholesale.
+  capability,
+  deny capability sys_module,
+  deny capability mac_admin,
+  deny capability mac_override,
+  deny capability sys_rawio,
+
+  signal,
+  ptrace read,
+
+  @{PROC}/** r,
+  @{sys}/** r,
+  owner @{PROC}/@{pid}/fd/** rw,

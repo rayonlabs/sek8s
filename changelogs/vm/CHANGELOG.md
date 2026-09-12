@@ -7,6 +7,633 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Version source of truth: `ansible/guest/VERSION`
 
+## [1.4.0] - 2026-09-12
+
+### Added
+- **Boot-time miner-hotkey proof-of-possession (guest side).** A small, static, pinned-toolchain (musl) sr25519 signer (`src/sr25519`; Schnorr/Ristretto, which openssl cannot do) is built and staged into the guest initramfs (measured into RTMR2). The boot flow now derives the hotkey from the config-volume seed (`/run/tdx-config/miner-seed`) rather than trusting the claimed `miner-ss58`, and signs each chained server nonce — `/boot/attestation`, `/provision`, and `/provision/confirm` — sending the sr25519 proof in `X-Chutes-Signature`. This closes a cross-miner LUKS-brick vector where a peer could assert a victim's `(hotkey, vm_name)` and rotate its passphrase. The seed is stashed to `/run` for the init-bottom calls and shredded before the initramfs `/run` is moved into userspace. Pairs with a matching server-side signature check (chutes-api). Also fixes a migration miss: root-rotation confirm now uses `/provision/confirm` (the legacy `/luks/confirm` is deprecated).
+- **Reproducible builds from public inputs.** The root RSA public key is fetched from R2 at build time (`root_signing_key_url`) instead of a required local file, and a new `ansible/guest/inventory-reproduce.yml` builds the prod image with only non-secret inputs (published LUKS passphrase, R2-fetched key) so an independent party can reproduce the image and verify the published measurements.
+- New initramfs script `write-validator-auth` (init-bottom) writes the per-VM ephemeral validator auth SS58 to `/run/chutes/validator-auth.env` — directly in the initramfs `/run` tmpfs, which `initramfs-tools` moves to the real root's `/run` before exec'ing init. The file is fully ephemeral (cleared on every reboot, never touches the root filesystem), and the write logic is measured into RTMR2. VM powers off on invalid or missing SS58.
+- New cluster-init script `03-k3s-validator-auth.sh`: creates or updates the `validator-auth` K8s Secret in the `attestation-system` namespace with the per-VM ephemeral SS58 on every boot (no run-once marker), then restarts the attestation-proxy DaemonSet to apply the new `ALLOWED_VALIDATORS` value. Added to `SECURITY_CRITICAL_SCRIPTS` so a failure causes VM poweroff.
+- `system-manager.service` now loads `/run/chutes/validator-auth.env` as a second `EnvironmentFile`. Since this file is ephemeral and can never be present if `write-validator-auth` did not run, the service correctly fails to start if the initramfs script was skipped — safe failure by design.
+- RTMR3 measurement hardening: added `/etc/system-manager/system-manager.env`, `/etc/admission-controller/admission-controller.env`, `/etc/admission-controller/cosign-registries.json`, `/etc/docker/daemon.json`, `/etc/rancher/k3s/registries.yaml`, `/etc/hosts`, and `/etc/tdx-luks.conf` to `tdx-measure-miner.conf`. These were previously unmeasured, allowing offline tamper of registry allowlists, cosign config, or attestation endpoints without detection.
+- New Ansible role `apparmor-hardening`: installs AppArmor profiles, abstractions, systemd drop-ins, and a boot-time profile verification service (`lock-mac-caps.service`).
+- AppArmor abstraction `sek8s-cache-deny`: denies shell/interpreter access to the HF model cache volume (`/var/snap/cache/`). Debug builds use `audit deny` for kernel audit logging; production builds use silent `deny`.
+- AppArmor abstraction `sek8s-secrets-deny`: denies shell/interpreter access to boot secrets (`/run/chutes/`), containerd socket, k3s token, and miner credentials.
+- AppArmor profile `sek8s.system-manager`: named profile applied via systemd `AppArmorProfile=` — grants cache rw, credential read, containerd socket, and network access.
+- AppArmor profile `sek8s.setup-cache`: named profile for the setup-cache service — grants cache rw and coreutils, no network or credentials.
+- AppArmor profile `sek8s.deny-sensitive-default`: auto-attaches to common shells, interpreters, and data-transfer tools (bash, dash, sh, cat, cp, tar, rsync, curl, wget, perl, etc.) — includes both deny abstractions to block access to protected paths.
+- `verify-apparmor-profiles.service`: oneshot that verifies all sek8s AppArmor profiles are loaded in enforce mode at boot. Powers off the VM on failure.
+- RTMR3 progress logging: per-directory collection progress and periodic hashing progress (every 200 files) logged to `/dev/kmsg` during the expanded measurement phase.
+- `ansible/guest/roles/luks/files/initramfs/luks-helpers`: shared initramfs shell library with `write_key_file`, `shred_key_file`, `luks_add_key`, `luks_remove_key` — sourced by both `fetch_key_and_unlock` (init-premount) and `setup_storage` (init-bottom).
+- Root LUKS passphrase rotation in `fetch_key_and_unlock` (init-premount): detects first-boot LUKS2 token (id 15, type `chutes-first-boot`), sends `first_boot` flag in boot attestation POST, enforces mandatory rotation on every boot — adds new key slot, confirms with API, then kills all pre-existing slots by number to ensure no stale keys remain on the device.
+- `ansible/guest/roles/rtmr3-measure/files/tdx-measure-miner.conf` and `tdx-measure-gpu.conf`: extended RTMR3 measurement coverage to additional filesystem paths not previously included:
+  - `/usr/lib/systemd/system`
+  - `/etc/fstab`
+  - `/var/spool/cron/crontabs`
+  - `/etc/init.d`
+  - `/etc/rc.local`
+  - `/root/.bashrc`, `/root/.bash_profile`, `/root/.profile`
+- `tdx-measure-gpu.conf` aligned to the same measurement tiers as `tdx-measure-miner.conf`: systemd unit dirs, ld.so config, modprobe, sysctl, profile, environment, fstab, crontabs, init scripts, root shell startup files, and the `/usr/local/bin`, `/usr/local/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/local/lib` binary tiers.
+- `ansible/guest/roles/signing-keys/` — new role for root-of-trust PGP key installation and initramfs key-fetch machinery.
+- `vm-tls` role with `setup_vm_tls`, an initramfs `init-bottom` script
+  (`PREREQ=setup_storage`) that owns the full VM mTLS cert lifecycle — per-boot
+  4096-bit VM root CA generation, validator registration
+  (`PUT /servers/{vm_name}/vm-root-ca`, TDX-attested, mTLS using the CA cert
+  itself as the client credential), attestation-proxy server cert, registry mTLS
+  client cert, and `ca.key` deletion — all within the RTMR2-measured initramfs
+  before `pivot_root`. `ca.key` never exists in userspace.
+- Attestation proxy server cert (`/run/chutes/proxy-tls/server.{key,crt}`) and
+  registry mTLS client cert (`/run/chutes/registry-tls/client.{key,crt}`)
+  generated on tmpfs each boot; containerd reads the client cert for direct mTLS
+  pulls from `registry.chutes.ai`, and cosign reads it via
+  `/etc/docker/certs.d/registry.chutes.ai/` symlinks.
+- `sek8s.attestation-proxy` AppArmor profile confining the proxy container to
+  its required paths; added to the apparmor-hardening install/verify wiring and
+  to the RTMR3 measurement chain (`tdx-measure-miner.conf`).
+- **Build-time RTMR computation** — `chutes-miner-vm.yml` now computes all expected
+  build-time RTMRs (1, 2, 3) from the finalized image before LUKS encryption, in one
+  `compute-rtmrs` role that composes `stage-boot-artifacts`, `compute-rtmr3`,
+  `tdx-measure` (fork provisioning), and `compute-rtmr1-2`. Emits `<image>.rtmr1`,
+  `.rtmr2`, `.rtmr3` (bare uppercase hex). RTMR1/2 are version-level
+  (topology-independent) and come from the prod image — the debug image's initrd
+  differs, so its RTMR2 would be wrong. The role ensures its own build-host
+  prerequisites (`libguestfs-tools`, `git`, and `cargo` only when the build user has
+  none); `tdx-measure` clones/builds the `chutesai/tdx-measure` fork (reusing an
+  existing checkout), overridable via `tdx_measure_bin`.
+- **`stage-boot-artifacts`** — extracts the direct-boot kernel/initrd/cmdline from the
+  finalized image once and persists them next to it as `<image>.vmlinuz`, `.initrd`,
+  `.cmdline`. Published to R2 with the qcow2 and read by both `compute-rtmr1-2` (build)
+  and the launcher (deploy), so the pinned RTMR1/2 match the running VM by construction.
+- **`capture-measurement-baseline.yml`** — a local build-server step that captures the
+  offline-measurement baseline (the RTMR0 inputs) from the freshly-built debug image:
+  copies it to `/tmp` so the publishable artifact is never mutated, TDX-boots the copy,
+  captures the CCEL + fw_cfg ACPI/SMBIOS preimages into the top-level
+  `measurements/<version>/`, verifies the CCEL actually landed, and tears down.
+- **`guest-tools/measurement/`** — offline RTMR0 measurement/verification tooling:
+  `ccel_replay.py` (CC event-log parse + SHA-384 RTMR replay, with a per-register
+  `diff`), `capture-measurement-artifacts.sh` (capture the CCEL + preimages),
+  `extract-measurements.sh` (report a running guest's live MRTD + RTMR0-3 from a fresh
+  quote), and `utils/` (SMBIOS-event preimage matcher, per-table ACPI byte-diff). Reuses
+  the launcher's QEMU-arg builders and the `virtee/tdx-measure` fork.
+- **`docs/specs/tdx-measurement-verification.md`** — how TDX guest measurements are
+  structured, why RTMR0 is the only per-topology register, and how they are
+  independently reproduced and verified.
+- **Chute log shipper service (guest image, Phase 1).** New `chute-log-shipper` systemd service +
+  Ansible role in the attested guest image, running the `sek8s.log_shipper` agent as a dedicated
+  non-root uid. Ships crash/warmup logs of chute pods to the validator before instance registration.
+  - New Ansible role `chute-log-shipper` (registered in `chutes-miner-vm.yml`): hardened systemd
+    unit, rendered env, a restricted `crictl-pods-helper` wrapper (read-only `pods`/`ps` JSON), the
+    dedicated uid, and boot wiring (group/ACL for the CRI socket + `/var/log/pods` + the registry-tls
+    leaf, cursor/checkpoint state dir). No new leaf is minted — a boot-time path unit re-groups the
+    existing per-boot CVM mTLS leaf for the service's uid.
+  - `sek8s.chute-log-shipper` AppArmor profile delivered via `apparmor-hardening`, confining the
+    service to the chute log paths, the CRI socket, the registry-tls leaf, the checkpoint dir, and
+    egress to the validator.
+  - **Measurement:** adds guest image content (package + systemd unit + crictl wrapper + AppArmor
+    profile) → shifts **RTMR3**. Regenerate expected-measurement baselines before rollout.
+- RC gate for debug/RC VMs: the debug image boots a fail-open initramfs that provisions
+  against the production network (validator auth, VM root CA registration, k3s encryption)
+  by proving possession of an authorized operator key — a detached RSA signature over the
+  boot nonce sent in `X-Operator-Signature`. Only an authorized operator can bring a debug
+  VM up against prod, and it can never join real traffic; the debug initramfs carries a
+  distinct measurement (registered `rc: true`).
+- Offline per-topology RTMR0 generation (`guest-tools/measurement/generate_measurements.py`,
+  wired via the new `compute-rtmr0` role): reconstructs RTMR0 for every supported GPU
+  topology by splicing per-topology events from the `tdx-measure` fork into a captured
+  baseline CCEL — no per-topology hardware boot. `measurement_profile` selects one profile
+  or, when empty, all profiles.
+- Debug images now compute full RTMR1/2/3 (registered `rc: true`) so they attest under the
+  RC gate.
+- **Fully offline RTMR0 generation.** The `tdx-measure` fork now self-generates the
+  complete 15-event RTMR0 for each topology — firmware (MRTD/CFV/secure-boot), the
+  QEMU-generated ACPI (loader/rsdp/tables), the `etc/extra-pci-roots`/BootMenu/bootorder
+  fw_cfg events, and the SMBIOS handoff — with **no captured CCEL and no TDX hardware**.
+  `measurements=offline` now yields COMPLETE measurements on any x86-64 host; the
+  `capture-ccel` step is retained only as a `measurements=full` cross-validation against a
+  real quote, not a build dependency.
+- **Cross-host measurement determinism via the topology fingerprint.** RTMR0 is the only
+  CPU-dependent measurement, and only two things move it: the guest vendor drives QEMU's
+  SRAT memory-map (AMD guests get a 1 TiB memory hole) and the CPUID leaf-1 becomes the
+  SMBIOS Type-4 Processor ID. Offline measurement generation pins the fingerprint's
+  `cpu_vendor` into the measurement `-cpu` and patches `cpu_processor_id` into the dumped
+  SMBIOS via the fork, so any host — including non-Intel — regenerates the exact production
+  RTMR0. (phys-bits was measured to not affect RTMR0 and is not carried.) Launch keeps
+  plain `-cpu host` (real silicon, features, transparency).
+- The launcher **refuses to boot a host whose fingerprint isn't in the profile's baselined
+  set** (exact match on CPU + mem + device layout) — one check that subsumes the former
+  separate CPU-identity guard; an unbaselined host's RTMR0 would diverge and never attest.
+  A profile whose fingerprint is a placeholder (`cpu_processor_id=None`, pending a
+  discover-profile.sh capture) never matches a live host, so it is refused until captured.
+
+### Changed
+- Split cosign signature verification into two keys: `chutes.pub` for the private localregistry (and wildcard fallback), `dockerhub.pub` for Docker Hub `parachutes/*` images
+- Renamed Ansible inventory vars: `cosign_public_key_path` -> `cosign_chutes_public_key_path` (`~/.cosign/chutes.pub`) and added `cosign_dockerhub_public_key_path` (`~/.cosign/dockerhub.pub`)
+- Renamed admission controller env vars: `CHUTES_COSIGN_PUBLIC_KEY_PATH` -> `CHUTES_PUBLIC_KEY_PATH`, added `DOCKERHUB_PUBLIC_KEY_PATH`
+- Generalised `_require_ctx_key` to validate against a set of trusted key paths (`required_key_paths`) rather than a single path
+- `chutes_chart_version` bumped from `0.2.7` to `0.3.0` (`chutes-miner-gpu` Helm chart). The new chart replaces the per-validator nginx `map` routing with a single static `set $upstream_host` directive and a single `chutes-registry` NodePort Service, required for the static `localregistry.chutes.ai` hostname. See [chutes-miner#134](https://github.com/chutesai/chutes-miner/pull/134).
+- Registry hostname decoupled from the validator hotkey: all `{{ validator | lower }}.localregistry.chutes.ai` references replaced with the static hostname `localregistry.chutes.ai` across k3s-prereqs.yml, registries.yaml.j2, configure-cosign.yml, opa-config-data.json.j2, cosign-registries.json.j2, admission-controller/defaults/main.yml, and system-manager.env.j2. Validator hotkey rotation no longer invalidates cosign signatures or requires a VM rebuild.
+- `fetch_key_and_unlock` (initramfs, init-premount): now parses `vm_auth_ss58` from the boot attestation API response and saves it to `/run/chutes/validator-ss58` (mode 600). Boot fails with poweroff if the field is absent from the response.
+- `proxy-manifests.yaml.j2`: removed the baked-in `validator-auth` Secret definition (it contained a hard-coded validator hotkey and is in the RTMR3-measured manifests directory). The Secret is now created at runtime by `03-k3s-validator-auth.sh` and consumed by the attestation-proxy via `secretKeyRef` (`ALLOWED_VALIDATORS`), which the kubelet injects over its own host-network API client — so no in-pod secret read (and thus no `secret-reader` RBAC or `wait-for-credentials` init container) is needed. Socket-readiness is gated separately by the `wait-for-attestation-socket` init container.
+- `system-manager.env.j2`: removed `ALLOWED_VALIDATORS` (now in unmeasured `validator-auth.env`). `IMAGE_PULL_ALLOWED_REGISTRIES` updated to use static `localregistry.chutes.ai` hostname. `system-manager.env` is now fully deterministic at build time and safe to include in RTMR3 measurement.
+- `tdx-measure-miner.conf`: added three-tier RTMR3 measurement expansion — Tier 1 (custom binaries in `/usr/local/{bin,sbin}`), Tier 2 (code injection config paths), Tier 3 (system binaries in `/usr/bin`, `/usr/sbin`, and custom shared libs in `/usr/local/lib`). Also added service configs, AppArmor profiles, and systemd units not previously measured.
+- `tdx-measure-miner.conf`: removed `/etc/rancher/k3s/registries.yaml` (runtime-modified by `process-config.py`, persists across reboots; security properties independently measured through other files).
+- `pods.rego`: added `MAC_ADMIN` and `MAC_OVERRIDE` to `dangerous_capabilities` to prevent containers from modifying AppArmor profiles.
+- `chutes-miner-vm.yml`: inserted `apparmor-hardening` role after `cache-volume` and before dynamic config services.
+- `ansible/guest/roles/luks/tasks/luks_encrypt.yml`: added `type: luks2` to the LUKS container creation task (previously relied on cryptsetup default); added first-boot LUKS2 token task (`chutes-first-boot`, id 15) after container creation; added task to copy shared `luks-helpers` script into the initramfs.
+- `ansible/guest/roles/luks/files/initramfs/fetch_key_and_unlock`: updated boot attestation POST body to include `first_boot` flag; added slot enumeration and `luksKillSlot`-based cleanup after successful rotation confirm; rotation confirm failure now rolls back cleanly and powers off; any key slot cleanup failure powers off rather than proceeding with stale slots.
+- `ansible/guest/roles/luks/files/initramfs/setup_storage`: extracted LUKS helpers to shared `luks-helpers` file; `finalize_rotation` now uses `luksKillSlot` by slot number (cleaning up stale slots from prior incomplete rotations); any slot cleanup or rollback failure powers off.
+- Cosign public keys (`chutes.pub`, `dockerhub.pub`) and the Helm PGP keyring (`helm-pubkey.gpg`) are no longer baked into the VM image. They are now fetched dynamically at boot from `VALIDATOR_BASE_URL/servers/signing-keys`, verified against an attested root PGP key, and written to `/run/chutes/signing-keys/` (ephemeral tmpfs). Key rotation no longer requires an image rebuild or RTMR3 change.
+- New `signing-keys` Ansible role installs the root PGP public key to `/etc/chutes/root-signing-key.gpg` (measured in RTMR3), deploys `signing-keys.conf` with the API URL, and installs the `fetch-signing-keys` initramfs init-bottom script and its hook.
+- `fetch-signing-keys` initramfs script verifies each key's detached PGP signature with `gpgv` against the attested root key before writing to tmpfs. Any signature failure powers off the VM (fail-closed).
+- `admission-controller.env` and `cosign-registries.json` updated to reference `/run/chutes/signing-keys/cosign/` paths.
+- Helm chart provenance verification (`04-helm-chart-upgrade.sh`) updated to read keyring from `/run/chutes/signing-keys/helm-pubkey.gpg`.
+- Build-time Helm keyring is now fetched from the signing-keys API and PGP-verified on the build host (same trust chain as boot-time fetch). The key is written to `/tmp/` for the `helm upgrade --install` call and deleted immediately after. No leaf key files (`helm-pubkey.gpg`, `chutes.pub`, `dockerhub.pub`) need to be distributed to build machines — only the root PGP public key is required.
+- `/etc/admission-controller/cosign` removed from RTMR3 measurement path list (`tdx-measure-miner.conf`). Trust in cosign keys is now delegated to the PGP chain rooted at the measured `/etc/chutes/root-signing-key.gpg`.
+- AppArmor profile `sek8s.system-manager` updated to allow reads from `/run/chutes/signing-keys/`.
+- `fetch_key_and_unlock` (initramfs init-premount): the boot nonce endpoint (`/servers/nonce`) is
+  now fetched via the mTLS proxy (`TDX_BASE_URL`) instead of the regular TLS API
+  (`VALIDATOR_BASE_URL`), matching the API-side change that validates the miner cert during nonce
+  issuance.
+- `fetch_key_and_unlock`: the nonce request now includes the miner hotkey as the `miner_hotkey`
+  query parameter (`?miner_hotkey=<hotkey>`), binding the nonce to the requesting miner. The API
+  enforces that the same hotkey appears in the subsequent boot attestation POST body; nonces issued
+  without a hotkey are rejected by the server as legacy.
+- All boot-sensitive initramfs API calls now go through the mTLS proxy (`TDX_BASE_URL`). The LUKS
+  root-rotation confirm (`fetch_key_and_unlock`) and storage/cache rotation confirm
+  (`setup_storage`) previously used the regular TLS API; both now use `TDX_BASE_URL` with the
+  ephemeral client certificate. In `setup_storage` the mTLS cert deletion is deferred from
+  `post_sync_keys` to `confirm_rotation` so the cert is available for the confirm call; it is also
+  cleaned up in `clear_sensitive_data` as a safety net for boots where confirm is skipped.
+  Exception: `fetch-signing-keys` continues to use `VALIDATOR_BASE_URL` — the signing-keys
+  endpoint is intentionally public and does not require mTLS.
+- `VALIDATOR_BASE_URL` is no longer required or validated by `fetch_key_and_unlock`. It remains in
+  `tdx-luks.conf` for `fetch-signing-keys` (signing keys bundle fetch) and post-boot services
+  (system-manager).
+- Attestation proxy init container migrated from `bitnami/kubectl:latest` (unsigned, unpinned) to `parachutes/kubectl` (cosign-signed with `dockerhub.pub`). Removed the `require_signature: false` exception for `bitnami/kubectl` from the cosign registry config and removed `bitnami` from the OPA registry allowlist.
+- Bump VM version to 1.3.1 for new RTMR0 measurements. The guest image is
+  unchanged; RTMR0 changes because QEMU now pins SMBIOS type 1/2/3 identity to
+  static values, removing per-server motherboard drift from RTMR0 within a
+  profile. Topology-driven variance (type 4/17) is still absorbed per-profile.
+- Private registry pull auth moves from miner-hotkey-scoped (nginx proxy
+  DaemonSet on NodePort 30500 at `localregistry.chutes.ai:30500`) to per-VM mTLS
+  against `registry.chutes.ai`. Only an attested VM presenting a CA-signed client
+  cert can pull. Backward compatibility is DUAL-AUTH and lives server-side (the
+  validator/registry): old VMs keep the legacy miner-proxy path, new VMs present
+  a client cert. The guest image carries no dual-path code.
+- `registries.yaml.j2`: replaced the `localregistry.chutes.ai:30500` local-proxy
+  mirror with a `configs: "registry.chutes.ai"` mTLS block pointing at the
+  initramfs-written tmpfs client cert/key (no insecure-registry, no NodePort).
+- `proxy-manifests.yaml.j2`: `host-certs` hostPath moved from
+  `/etc/attestation-service/certs` to `/run/chutes/proxy-tls`; added the
+  attestation-proxy AppArmor annotation.
+- `cosign-registries.json.j2`, `opa-config-data.json.j2`, admission
+  `allowed_registries`, and system-manager `IMAGE_PULL_ALLOWED_REGISTRIES`
+  updated from `localregistry.chutes.ai:30500` to `registry.chutes.ai`. Removed
+  the `allow_http` / `allow_insecure` cosign flags now that pulls use real TLS.
+- `configure-cosign.yml`: removed the `127.0.0.1 localregistry.chutes.ai`
+  `/etc/hosts` alias and the `insecure-registries` Docker daemon config that
+  supported the old local proxy.
+- Build-pipeline-only scripts moved from `guest-tools/scripts/` into their Ansible role
+  `files/` (invoked exclusively by the build): `compute-rtmr3.sh`, `compute-rtmr1-2.sh`,
+  `stage-boot-artifacts.sh`, and `extract-vm-measurements.sh`. `guest-tools/scripts/` now
+  holds only the standalone release tool `publish-image.sh`.
+- The per-boot VM root CA is now generated up front in `fetch_key_and_unlock` (init-premount) and used as the VM's single mTLS client identity for every boot API call (`GET /nonce`, `POST /boot/attestation`, root `POST /luks/confirm`, and the runtime storage attestation). This replaces the throwaway self-signed client cert (`CN=tdx-vm-<ts>`) that was previously minted for the boot/luks calls.
+- `setup_storage` now calls the new `POST /servers/{vm}/provision` and `POST /servers/{vm}/provision/confirm` endpoints (replacing `/luks/attest` and the storage `/luks/confirm`). The provision quote binds `SHA256(CA pubkey)` after RTMR3 is extended, so the validator records the VM root CA implicitly from that RTMR3-attested call — no separate registration round-trip.
+- VM root CA and both leaf certs (attestation-proxy server cert, registry mTLS client cert) now use a 365-day validity instead of 1 day, so long-running VMs (which reboot only on image updates) do not hit cert expiry mid-run. Per-boot rotation is unchanged — all certs are still regenerated fresh on every boot and live in tmpfs only.
+- Signing-keys bundle verification switched from detached OpenPGP (`gpgv`) to
+  raw RSA (PKCS#1 v1.5, SHA-256). The `fetch-signing-keys` initramfs script and
+  the build-time Helm-key verification in the `chutes-gpu` role now verify each
+  key's signature over its raw (base64-decoded) bytes with
+  `openssl dgst -sha256 -verify`. The trust chain (RTMR1 + RTMR3 attest the
+  baked-in root key → root key verifies the signature → signature authenticates
+  the leaf key), the JSON bundle shape, the `/run/chutes/signing-keys/` output
+  paths, and the fail-closed behavior are unchanged. `helm-pubkey.gpg` stays a
+  byte-identical OpenPGP key file for Helm; only the signature over it changed.
+- The root trust anchor is now the RSA public key
+  `/etc/chutes/root-signing-key.pem`, replacing `root-signing-key.gpg`. It is
+  baked into the same measured locations (initramfs → RTMR1, `/etc/chutes/` →
+  RTMR3), so tampering still changes the measurement.
+- **CVM mTLS client cert CN generalized.** The per-boot mTLS client leaf minted by the vm-tls
+  initramfs `setup_vm_tls` script now uses a generic subject (`CN=sek8s-cvm-mtls-client`) instead of
+  `sek8s-vm-registry-client`. That leaf is the shared identity for *all* CVM mTLS (registry pulls,
+  the log shipper, …), not registry-specific, so the old name was misleading. Identity is **not**
+  carried in the CN — the validator resolves `(miner_hotkey, vm_name)` by verifying the leaf against
+  the registered per-boot VM CA — so the CN is intentionally generic, not per-VM. Edits initramfs →
+  shifts **RTMR2**; regenerate measurement baselines before rollout.
+- The `luks` role now runs for **all** guest images and gates internally on the build type:
+  prod encrypts the root filesystem and installs the fail-closed initramfs; debug installs
+  the fail-open RC initramfs and performs no encryption. Prod and debug carry distinct
+  initramfs measurements.
+- Boot and storage-provisioning logic refactored into shared initramfs libraries
+  (`attest-common`, `provision-common`) sourced by both prod and debug entry scripts, so the
+  two stay in sync without leaking debug code into prod.
+- Measurement pipeline restructured into explicit phases with one peer role per register —
+  gather (`stage-boot-artifacts` + `capture-ccel`) then compute (`compute-rtmr1-2` +
+  `compute-rtmr0`); RTMR1/2 now computed post-luks (after the initrd is final). Measurement
+  controls collapsed to a single `measurements: none | offline | full` flag.
+- CVM mTLS operations now use the `cvm.chutes.ai` domain.
+- HWE kernel bumped to `7.0.0-28.28~24.04.1`.
+- The compute phase now aggregates every register into a single
+  `measurements/<version>/measurements.yaml` (teeMeasurements-shaped, ready to merge into
+  chutes-ops values) instead of scattered per-register files; the raw registers are carried
+  as in-play facts, and per-topology hardware entries are named from each topology
+  fingerprint (computed, not hand-curated). A single `compute-measurements` tag runs the
+  whole phase (gather → compute → aggregate); a `build` tag runs the image-production plays.
+- The attestation proxy's init container now runs a cosign-signed `parachutes/busybox`
+  image (verified with `dockerhub.pub`) so it passes the admission controller instead of
+  being rejected as an unsigned image.
+- **Host-instance facts moved from `GpuProfile` into the topology fingerprint**, which is
+  now `TopologyFingerprint(cpu: CpuTopology, mem_gb: int, gpu: GpuTopology)` — the three
+  host axes that move RTMR0. `CpuTopology` carries the guest `-smp` (vcpus + sockets) and
+  CPU identity (vendor + Processor ID); `mem_gb` is guest RAM; `NumaTopology`/`FlatTopology`
+  carry only the device layout. These are derived from the LIVE host at detection (`vcpus =
+  host_cpus − host_reserved_cpus`; mem via a per-profile `guest_mem_gb` rule; CPU via
+  `/proc/cpuinfo`), and the known values live in `gpu/known_topologies.py` so profiles just
+  import them. A `GpuProfile` now holds only
+  GPU-model policy plus `host_reserved_cpus` / `guest_mem_gb`. Consequently **`B200Profile`
+  and `B200Xeon6Profile` collapse into one `B200Profile`** — the 192-CPU Xeon and 288-CPU
+  Xeon 6 hosts are two fingerprints, not two profiles — and an off-nominal host (e.g. a
+  192-CPU H200) now derives its own fingerprint/measurement instead of being pinned to the
+  nominal one. Published measurement names gain the host shape, e.g.
+  `8xb200 [10.2.1, numa-176c-1944g]`.
+- `compute-rtmr0` no longer requires a baseline CCEL; it runs the fork to self-generate
+  RTMR0 directly. `generate_measurements.py generate` drops the CCEL splice and folds the
+  fork's own rtmr0; `--baseline` is now an accepted-but-ignored deprecated flag.
+- `discover-profile.sh` additionally reports the host CPU identity (`cpu_vendor`,
+  `cpu_processor_id`), computed host-side with no TDX and no guest capture — the Processor
+  ID is CPUID leaf-1 (EAX from family/model/stepping, EDX = the TDX Module's fixed leaf-1
+  baseline). These are declared once per host class in a profile's fingerprint; a
+  fingerprint with `cpu_processor_id=None` stays launch-gated but refuses offline generation
+  rather than silently emitting a measurement for the generating host's CPU.
+- **Boot attestation failures now surface the API's reason.** The initramfs LUKS client
+  (`attest-common`, `setup_storage`) previously logged only a generic string and the HTTP
+  status (e.g. `Authentication failed (HTTP 403)`) when the nonce fetch, attestation POST, or
+  rotation confirm failed. It now reads the response body for a `detail` / `message` / `error`
+  field (FastAPI's `detail` first) and appends it — single-lined and capped at 300 chars so a
+  body can't mangle the console — so a miner sees the actual cause. The 401/403 case on the
+  attestation POST is relabeled `Attestation rejected` (it is a measurement verdict, not an
+  auth failure). Falls back to the prior generic string when the body carries no message.
+- **The guest-image build's measurement step now sources known host classes from the API.**
+  `chutes-cvm measurements generate` reads the published host profiles (and their fingerprints)
+  from the control plane instead of an in-repo baseline registry, so the build host must reach the
+  API. The `chutes-miner-vm` build passes `--api-base` (var `measurements_api_base`, default
+  `https://api.chutes.ai`); override it for an isolated build environment. The GPU-VM build's
+  `measurements generate --register rtmr3` step is unaffected (RTMR3 is image-only, no API call).
+- **The guest-image build's measurement step now sources known host classes from the API.**
+  `chutes-cvm measurements generate` reads the published host profiles (and their fingerprints)
+  from the control plane instead of an in-repo baseline registry, so the build host must reach the
+  API. The `chutes-miner-vm` build passes `--api-base` (var `measurements_api_base`, default
+  `https://api.chutes.ai`); override it for an isolated build environment. It also passes
+  `--include-pending` so the build (the authoritative generator) processes host classes awaiting
+  generation — turning newly submitted profiles into published measurements — where a third-party
+  verification run would see measured classes only. The GPU-VM build's
+  `measurements generate --register rtmr3` step is unaffected (RTMR3 is image-only, no API call).
+- OPA per-decision logging is now off by default. `opa-config.yaml` hardcoded
+  `decision_logs.console: true`, which wrote the full AdmissionReview input (complete pod specs) to the
+  journal for every admitted object — high-volume noise that evicted boot/attestation history from the
+  journal window, and tenant workload detail in a log the miner can read over the status API. The config
+  and unit are now templated, so the existing `opa_decision_logs` and `opa_log_level` variables are live
+  rather than dead; debug builds can opt back in with `-e opa_decision_logs=true`.
+- **The `luks` guest-build role is now `prepare-boot-image`.** It always did more than LUKS —
+  encryption/debug-init, mount-config rewrite, boot + attestation initramfs scripts, the RTMR3
+  canonical manifest, and the final measured initramfs — and the RTMR3 manifest generation moved
+  into it (it can't be separated from building the post-encryption initramfs). Operators selecting
+  this stage by tag now use `--tags prepare-boot-image` instead of `--tags luks`.
+- `system-manager`'s uid/gid are pinned to the literal `10150` instead of
+  `{{ system_manager_uid | default(10150) }}`. Nothing ever defined those variables, and
+  `setup-cache.sh` now chowns the XDG cache dir numerically, so the value must not vary.
+- AppArmor shell policy is now composed rather than monolithic. A new `sek8s-shell-base`
+  abstraction holds the permissions every shell profile shares, so a profile is expressed as
+  "this base, plus which denies apply" instead of a hand-written allowlist — which matters under
+  poweroff-on-failure orchestration, where an allowlist fails the VM for every rule its author
+  forgot. `sek8s.deny-sensitive-default` is unchanged in posture: it still denies both the model
+  cache and `/run/chutes`, and additionally hides the staging area described below.
+- Cluster-init scripts that need a file from `/run/chutes` now run under a
+  `sek8s.k3s-init.<script>` profile applied via `aa-exec`. Each still denies the model cache and
+  still denies `/run/chutes` itself; the unconfined `k3s-post-start.sh` wrapper stages only that
+  script's declared files into `/run/k3s-init/<script>/`, read-only, and removes them when the
+  script exits. `/run/chutes` is never narrowed to make room, because AppArmor gives `deny`
+  precedence over any allow and carving out exceptions would turn a fail-closed blanket into a
+  denylist that silently fails open when a secret is added. Cross-script isolation comes from the
+  wrapper running scripts sequentially and removing each directory before the next starts, not
+  from the profiles themselves.
+- Per-script access is declared in three places by design — the profile in
+  `/etc/apparmor.d/sek8s.k3s-init`, the staging map in `k3s-post-start.sh`, and the check list in
+  `verify-apparmor-profiles.sh`. A script absent from all three stays on the restrictive default
+  profile; missing one of the three is a loud boot failure rather than a silent grant.
+- `k3s-post-start.sh` no longer powers the VM off on debug builds. A failed init script previously
+  powered off regardless of build type, which made the debug image unusable for diagnosing exactly
+  those failures. Gated on `K3S_POST_START_DEBUG`, set by a systemd drop-in written on both builds
+  and covered by the existing `/etc/systemd/system` measurement; unset means false.
+- Cluster-init scripts can once again honour their own fail-closed handler. The blanket profile
+  denies `capability sys_boot`, so every `FATAL: powering off VM` silently failed with
+  `Failed to poweroff: Operation not permitted` and the run continued. The per-script profiles do
+  not deny it.
+- The RTMR3 manifest generator pins `LC_ALL=C` when sorting directory contents. `sort` is
+  locale-sensitive, so collation differences between build hosts would reorder the manifest,
+  changing its bytes and the initramfs that embeds it — moving RTMR2 with no content change.
+- Admission control now restricts which container may mount the shared cache root. The
+  `/var/snap/cache` hostPath volume exists so the cache-cleaner init container can scan the tree
+  for eviction; because volumes are pod-scoped, any other container in the same pod could mount it
+  too. Only the cache-cleaner init container may now do so, matched on the same container name and
+  signed image that already gate its root privilege. Containers keep unrestricted access to their
+  own per-chute cache directory.
+- Container capability admission is now an allowlist instead of a denylist. Only `IPC_LOCK` and
+  `NET_BIND_SERVICE` may be added; every other capability is rejected, including the literal
+  `ALL` and any spelling variant (`CAP_` prefix, lowercase). Previously the rule matched against
+  a fixed list of eight names, so capabilities outside that list were admitted.
+- Chute pods may no longer set container lifecycle hooks (`postStart`/`preStop`). Hooks take
+  arbitrary arguments and run as a separate process, so they bypassed the rule that restricts
+  containers to their signed image's entrypoint. Applies to all containers, init containers and
+  ephemeral containers across Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job and
+  CronJob. No existing chute spec uses lifecycle hooks; exec probes are unaffected.
+- Chute pod probes that use `exec` must now be a plain localhost `curl`. The port and path stay
+  free so the health endpoint can change without a policy change, but the command is pinned to
+  `/bin/sh -c` with an anchored form, an explicit curl flag set, and a `127.0.0.1` target, so a
+  probe cannot carry additional shell commands or reach off the pod. `httpGet` and `tcpSocket`
+  probes are unaffected.
+- Admission control can now bind a chute pod's per-chute cache directory to the chute identified in
+  its launch token. The token's signature is verified in policy, and the mount must match the
+  `chute_id` it carries, so the directory a pod may open is no longer determined by a value the
+  operator writes. The check activates once the launch-config public key is provisioned into the
+  admission controller's config data; it is inactive until then.
+- The environment-variable allowlist now applies to init containers and ephemeral containers, not
+  only to a pod's main containers. Previously those were unchecked, so an init container could
+  carry any variable — including ones explicitly forbidden elsewhere. The cache-cleaner init
+  container's own variables were added to the allowlist as part of this.
+- Chute workloads may no longer declare `projected` volumes. A projected volume can carry a
+  `serviceAccountToken` source, which is honoured regardless of `automountServiceAccountToken:
+  false`, so chute code could obtain a Kubernetes API token. Other pods in the namespace are
+  unaffected — the cluster's own cleanup job legitimately uses one.
+- Chute workloads may no longer select a service account. Previously nothing restricted
+  `serviceAccountName`, so a chute could run as an account with broader namespace permissions.
+  Chutes now run as the unprivileged default account, matching what they were already deployed
+  with. Other pods in the namespace are unaffected.
+- The boot-time AppArmor enforcement check is now a hard dependency of `k3s.service` and
+  `system-manager.service`. It previously ran only because it was enabled for
+  `multi-user.target`, and systemd enablement lives in symlinks, which the RTMR3 measurement
+  does not cover — so deleting one symlink disabled the check without changing the measurement.
+  The new dependencies live in drop-ins under `/etc/systemd/system`, which is measured, matching
+  how `rtmr3-verify.service` is already anchored. Neither service can start unless every sek8s
+  profile is loaded in enforce mode.
+- Chute workloads must now declare a container named `chute` and a non-empty
+  `chutes/config-id` label. The in-guest log shipper finds a chute pod by that label and
+  reads only that container, so a pod spec missing either was captured by nothing —
+  and because the pod spec is authored outside the guest, that was a way to opt out of
+  log capture entirely. Nothing else consulted either value, so neither omission was
+  visible before. Real chute specs already set both.
+- `/etc/chute-log-shipper` is now covered by the RTMR3 measurement. It holds the validator
+  URL logs are sent to and the settings that decide which pods are captured, and it was the
+  only sek8s service configuration left out — so an edit to it was the one that would not
+  have shown up in the measurement.
+- `/usr/lib` is now covered by the RTMR3 measurement on both images. The measured set
+  previously included the system binaries but not the shared libraries those binaries load
+  — half the executable surface, and the one the confined services are granted read and
+  execute access to. It also brings the kernel modules on disk into the measurement, which
+  the boot-time measurement did not reach. Costs roughly ten seconds of boot.
+- Chute workloads may no longer set container `args`. Overriding a container's command was
+  already blocked, but Kubernetes offers two ways to shape what a container runs: with the
+  command omitted, `args` replaces the image's own default and is handed to its entrypoint.
+  Restricting one and not the other enforced half the guarantee. Real chute specs set no args
+  at all: the init container runs its image entrypoint configured by environment variables,
+  and the chute container uses the sanctioned command form, which already carries the
+  arguments it needs.
+  No image shipped today acts on such arguments, so nothing was exploitable; the rule closes
+  the asymmetry so a future image that does act on them cannot slip through unnoticed.
+  Applies to main, init and ephemeral containers; other pods in the namespace are unaffected.
+- Bumped the pinned guest HWE kernel from `7.0.0-28.28~24.04.1` to `7.0.0-31.31~24.04.1`.
+  The pin is deliberate — it keeps the guest kernel, and so the measurement baseline,
+  reproducible across rebuilds — but noble-updates and noble-security carry only the newest
+  HWE ABI, so the old version stopped resolving and the build failed outright at "Install HWE
+  kernel and headers (pinned)". The new version is the current archive kernel and ships from
+  noble-security. Guest RTMR measurements change accordingly.
+- The boot-time RTMR3 phase extends the register **once** instead of once per measured file,
+  matching the new `SHA384(0^48 || SHA384(hash-list))` definition. **Published RTMR3
+  measurements must be regenerated.**
+
+### Fixed
+- `nvidia-fabricmanager` is no longer reported as unhealthy when it is intentionally masked (valid on non-NVLink hosts). The services overview now returns `ok` in this configuration instead of incorrectly reporting `degraded`.
+- Debug guest images (`debug_build: true`) shipped key-only: the debug-credentials play
+  edited the main `sshd_config`, but Ubuntu's `sshd_config.d/50-cloud-init.conf` drop-in
+  (`PasswordAuthentication no`) is Included first and won first-match precedence, so
+  password/console access never took effect. The play now writes a `00-debug-access.conf`
+  drop-in that sorts ahead of the cloud-init one, restoring root password SSH login.
+- AppArmor service profiles now load and enforce — they were missing
+  `include <tunables/global>`, so the policy failed to parse and silently did not confine.
+  Each profile now carries a least-privilege capability set (e.g. `setup-cache` gets
+  `chown`/`fowner`/`fsetid`; the shared default allows the base set but denies
+  `sys_module`/`mac_admin`/`mac_override`/`sys_rawio`/`sys_boot`). Debug builds load the
+  profiles in complain mode so a policy gap logs a denial instead of poweroff-bricking the VM.
+- Production guests no longer power off during k3s cluster init. `03-k3s-validator-auth.sh` read
+  `/run/chutes/validator-ss58` directly, but cluster-init scripts are launched as `bash <script>` —
+  exec'ing `/usr/bin/bash` by name, which `@{confined_bins}` auto-attaches to
+  `sek8s.deny-sensitive-default`, whose `sek8s-secrets-deny` abstraction denies `/run/chutes/**`.
+  The read returned EACCES, the script exited non-zero, and the wrapper's fatal handler powered the
+  VM off. The `k3s-post-start.sh` wrapper runs unconfined, so it now reads the value and exports
+  `VALIDATOR_SS58` to the init scripts, crossing the profile boundary the filesystem cannot.
+- `system-manager` no longer fails to start in production. `/var/snap/cache/.xdg-cache` was created
+  by a `+`-prefixed `ExecStartPre` in the `cache-volume.conf` drop-in; the `+` prefix makes systemd
+  skip `AppArmorProfile=`, so `/bin/bash` auto-attached `sek8s.deny-sensitive-default` and was
+  denied `/var/snap/cache/**`. The directory is now created by `setup-cache.sh`, which owns the
+  cache-volume layout and already runs as root under `sek8s.setup-cache`.
+Both failures were invisible on debug images, which load the sek8s profiles in complain mode.
+- Guest image builds are reproducible across rebuilds of identical source again. Five values
+  changed on every build and all reached RTMR2, so no two builds produced the same measurements —
+  defeating the third-party verification `inventory-reproduce.yml` documents. Continues the same
+  effort as the earlier admission-controller TLS and pinned-kernel fixes.
+  - **LUKS container UUID** — random per `luksFormat`, and written into `cryptroot/crypttab`
+    inside the initramfs. Now derived from version + build type via `to_uuid` and applied with
+    `cryptsetup luksUUID`, with an assertion that the pin took. (`community.crypto.luks_device`'s
+    `uuid:` parameter cannot do this — it is a selector for *finding* a container, ignored
+    entirely when `device:` is given, so setting it fails silently.)
+  - **ext4 root filesystem UUID** — random per `mkfs.ext4`, and written into the kernel cmdline as
+    `root=UUID=` by `stage-boot-artifacts`. Pinned the same way.
+  - **`k3s-install.sh`** — fetched unpinned from `get.k3s.io` into `/usr/local/bin`, which is
+    measured wholesale, and never used again after install. Removed once k3s is installed, so
+    image measurements no longer depend on what upstream happened to serve at build time. The k3s
+    binary itself stays version-pinned via `INSTALL_K3S_VERSION`.
+  - **`overlayroot` and `mdadm` initramfs hooks** — both unused cloud-image features that wrote
+    per-build data into the initramfs: `overlayroot` a fresh `/.random-seed`, `mdadm` a generation
+    timestamp in `mdadm.conf`. Their hooks are now removed before the final `update-initramfs`.
+    RAID is a host concern here (`ansible/host/playbooks/storage-setup.yml` builds `md0`); the
+    guest is handed individual virtio-blk devices. Removing the hooks rather than the packages
+    avoids dependency risk and is durable, since no apt operation follows in the build.
+  Neither pinned UUID is secret: the LUKS key is rotated on first boot and the base image is copied
+  per VM. Deriving both from version and build type keeps them stable across rebuilds, distinct per
+  version, and never shared between a debug and a production image.
+- The initramfs is packed reproducibly, which was the last source of RTMR2 drift. Even with
+  byte-identical content, two builds produced different archive bytes: `mkinitramfs` stages files
+  with `cp -pP`, so every cpio member carries its source mtime, and those vary per build.
+  Confirmed by extracting two builds' initramfs images — no differing files, no size differences,
+  different hashes.
+  `SOURCE_DATE_EPOCH` is now exported for `update-initramfs`. `mkinitramfs` itself never mentions
+  the variable, which is misleading: it builds a sorted manifest (`LC_ALL=C sort | uniq`, so member
+  ordering was already deterministic) and hands it to `3cpio --create`, and `3cpio` is what reads
+  `SOURCE_DATE_EPOCH` to fix member mtimes. The `amd64_microcode` hook drives it the same way.
+- The initramfs hook now stages every binary its boot scripts use. `fetch_key` copied `curl`, `jq`,
+  `openssl` and friends but not `head`, `tr`, `cut`, `sed`, `awk` or `wc` — those were present only
+  because an unrelated package hook happened to stage them. Removing the unused `overlayroot` hook
+  took them away, and the guest failed to boot with
+  `fetch_key_and_unlock: line 153: head: not found`, aborting the LUKS unlock. Ubuntu initramfs
+  ships klibc-utils rather than busybox, which provides none of them.
+  A build-time check now lists the produced initramfs and fails the build if any required binary is
+  absent, so this class of breakage surfaces at build time instead of at boot.
+- `chute-log-shipper` can capture chute pod logs in production again. It failed with
+  `[Errno 13] Permission denied: /var/log/pods/chutes_<pod>/<container>`, and the cause was the
+  AppArmor profile, not the unit: the `10-security.conf` drop-in already grants
+  `CAP_DAC_READ_SEARCH` so the unprivileged service can traverse kubelet's root-owned `0750` log
+  dirs, but the profile never permitted the capability's use. Systemd granting a capability does
+  not make AppArmor allow it. Adding `capability dac_read_search` to the profile fixes it.
+  This only ever failed in production: debug images load the profile in complain mode, where the
+  capability is permitted, so shipping worked there and the matching `dac_read_search` entry looked
+  like harmless audit noise.
+- `/run/chutes` is now unreadable except to the services that declare what they need from
+  it. Its permissions decide whether four non-root services can reach secrets like the mTLS
+  client key, but no script actually set them: the directory was created as a side effect of
+  `mkdir -p` on a subdirectory, which leaves intermediate components at the umask default,
+  and six later attempts to set the mode were silently no-ops because it already existed. It
+  is now created 0700 everywhere, and the three services that genuinely read from it each get
+  a private view containing only their own subtree. The fourth turned out to need nothing at
+  all — its config file is read by the init system before it drops privileges — so its two
+  read grants have been removed.
+- The log shipper can no longer reach the container runtime socket directly. It discovers
+  pods through a wrapper that allows two read-only commands, but the wrapper ran with the
+  service's own permissions, so anything that compromised the service could skip it and drive
+  containerd itself — pulling and running any image, with neither admission control nor
+  signature verification in the way. Pod discovery now transitions into a separate, tighter
+  profile that owns the socket, and the service's own profile has neither the socket nor a
+  shell. The wrapper itself was rewritten from bash to POSIX sh in the same change: bash runs
+  whatever `$BASH_ENV` points at before the script starts, which would have let a caller run
+  its own code inside the tighter profile without passing the allowlist at all. This matters
+  because the log lines the service parses are written by the chutes it watches, which makes
+  it the one component with a genuinely hostile input.
+- Cache setup no longer fails to boot when the model cache contains a directory it cannot read.
+  The recursive ownership pass ran before the mode repair and the service is configured to power
+  the VM off on failure, so a workload leaving an unreadable directory in the cache prevented the
+  VM from starting again. Directory modes are now repaired before ownership is changed, so the
+  walk can descend regardless of what a workload left behind.
+- The RTMR3 measurement now has a single implementation. Four separate pieces of code decided
+  which files RTMR3 covers, in what order, and how each is hashed — the initramfs measurer, the
+  build-time manifest generator, `rtmr3-verify`, and the host-side measurement predictor — kept in
+  step by a comment asking maintainers to update them together. They had drifted apart in four
+  ways: only some stripped inline comments and trailing whitespace from `tdx-measure.conf`; a conf
+  entry that was itself a symlink was measured by two of them and skipped by the other two (and for
+  a symlinked directory the boot measurer silently covered *nothing* while the verifier expected
+  the whole tree); the boot-time sort was not pinned to `LC_ALL=C`, so a locale could reorder the
+  extend chain; and the build manifest hashed with `sha384sum FILE`, which prefixes its output with
+  a backslash for systemd's `\x2d`-escaped unit names, so such a file could never match the hash
+  computed at boot and would have powered the VM off on every boot. All four now run one
+  `tdx-measure` script, which also refuses a symlinked conf entry outright rather than resolving it
+  differently in different places. Measured values are unchanged for the current path list.
+- Fixed a trap in the measured-file list: a directory and a file beneath it could both be
+  listed, and those files were then measured twice. Nothing was left uncovered, but the
+  measurement depended on that redundancy — removing an entry that looked superfluous would
+  have changed the measurement, and a mismatch powers the machine off, so a tidy-up would
+  have stopped every VM booting and looked like tampering. Each file is now measured once
+  however the list names it.
+- Cluster-init secrets are now staged root-only. Three secrets are copied into a temporary
+  directory for the one boot step that needs each, then removed — but they were copied
+  world-readable into a world-traversable directory, widening files that are otherwise
+  owner-only for as long as that step ran. Every step already runs as root, so nothing
+  needed the wider access.
+- The two units that fix up permissions under `/run/chutes` now run their tools directly
+  instead of through `/bin/sh`. A shell there auto-attaches the AppArmor profile written for
+  stray and escaped shells, which denies reading that directory, so any recursive walk failed
+  unless the unit happened to run before AppArmor loaded. `registry-tls-config` was not
+  failing — all its arguments are named paths — but the trap is removed so a future recursive
+  change cannot hit it, where the group it sets is load-bearing.
+- The guest image build no longer aborts at "Configure libvirt to enable dynamic ownership"
+  with `The requested handler 'restart libvirtd' was not found`. The handler that restarts
+  libvirt was written as a named block, and a block in a handlers file is not notifiable by
+  name — so the very first build task that touched libvirt config failed the run outright. It
+  is now two handlers sharing a `listen` topic, which keeps the existing modular-libvirt
+  (`virtqemud`) first, monolithic (`libvirtd`) fallback behaviour.
+- The sr25519 role's "rustup not found" error now names the account it searched under and the
+  path it searched, and gives the command to install rustup for that account. rustup is a
+  per-user install, so the previous advice — run `build-setup.yml` — was a dead end for the case
+  that actually produces this error: build-setup having already run, for a different user.
+- The build no longer fails at "rtmr3-measure : Install tdx-measure" with `'repo_root' is
+  undefined`. `repo_root` was defined in `host` group scope but that role runs in a `vm` play,
+  so it resolved nowhere. It now lives in `all` scope, which also removes the `playbook_dir`
+  workaround the sr25519 role was carrying for the same reason.
+- Boot-time RTMR3 verification was O(n²) and made the measurement phase unusable once
+  `/usr/lib` was measured. Each of the 41,106 files spawned its own `awk` that rescanned the
+  whole expected-hashes manifest, so per-file cost grew from 5ms to 20ms over the first 3,600
+  files and the phase projected to roughly 67 minutes. The manifest is now read once into
+  memory and the hash list streamed past it in a single pass. Both formats carry the 96-char
+  hash at a fixed end of the line, so paths containing spaces are matched by offset rather than
+  by field splitting.
+- The rtmr3-measure initramfs hook now includes `xargs` and `tr`, which `tdx-measure` needs for
+  its batched hashing.
+
+### Removed
+- Hard-coded validator SS58 (`5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ`) removed from all Ansible role defaults (`common`, `admission-controller`, `attestation-service`, `system-manager`) and inventory files (`ansible/guest/inventory.yml`, `local/inventory.prod.yml`). The `validator` Ansible variable is no longer used anywhere in the guest image build.
+- `cosign_chutes_public_key_path`, `cosign_dockerhub_public_key_path`, and `helm_chart_public_key_path` inventory variables removed. Build machines now only require the root PGP public key (`root_signing_key_path`).
+- `setup-tls-certs.sh` userspace proxy-cert generator and its wiring in
+  `attestation-service-init.service` / `install-attestation-init-service.yml`.
+  The proxy server cert is now minted in the initramfs by `setup_vm_tls`.
+- `guest-tools/scripts/extract-acpi.sh` — dead: the old host-side ACPI dump that had to
+  be hand-synced with the launcher. Superseded by offline generation that shares the
+  launcher's exact `QemuCommand` and generates ACPI via `tdx-measure --create-acpi-tables`.
+- `guest-tools/scripts/run-image.sh` — dead, unreferenced libvirt/VNC/cloud-init test-boot
+  script predating the current `run-td` flow.
+- `guest-tools/README.md` — the old manual step-by-step measurement guide, superseded by
+  build-integrated `compute-rtmrs` + the `guest-tools/measurement/` tooling; the concepts
+  now live in `docs/specs/tdx-measurement-verification.md`.
+- `setup_vm_tls` no longer generates or registers the VM root CA. It now only signs the leaf certs from the CA generated in init-premount and deletes `ca.key` before `pivot_root`. The dedicated `PUT /servers/{vm}/vm-root-ca` registration call (and its nonce-less quote) is gone.
+- The `signing-keys` role no longer installs or stages `gpgv`; the RSA verifier
+  (`openssl`) is already staged for the LUKS/TLS paths and is reused.
+- Retired the userspace debug k3s secrets-encryption path (build-time static key baked at
+  `/etc/chutes` + k3s systemd drop-in). Debug now writes the k3s EncryptionConfiguration from
+  initramfs like prod (from a static well-known key), so debug and prod share the boot flow.
+- Dropped references to a `k3s-agent` service that the guest never runs. Seven units ordered
+  themselves before it and an Ansible handler restarted it; the guest has always installed k3s in
+  server mode, so systemd silently ignored the ordering and nothing ever notified the handler.
+  `setup-cache.service` was the only unit whose sole ordering constraint was the dead one, and now
+  orders against the real service. Also removed an unused `workers` group_vars file, which
+  contained only commented-out examples and never loaded.
+- Removed the boot-time unit that re-grouped the fetched signing keys, along with the
+  `chutes-keys` group it populated. Those keys are public verification keys, written
+  world-readable by the initramfs that fetches and signature-verifies them, so the group
+  gated nothing — its only observable effect was a unit that intermittently failed. The
+  admission controller reads the keys exactly as before, through the bind mount that was
+  already doing the work.
+- Removed an unfinished module-attestation and module-signing subsystem from the guest
+  security role. Neither was ever installed — both task includes were commented out — but
+  the leftovers read as live security controls, including a "reporting thresholds" block
+  setting a maximum acceptable number of unsigned kernel modules. Security posture here is
+  all-or-nothing and is enforced by measurement and AppArmor, so a threshold knob was
+  misleading as well as unused. Twelve files, four unused variables and a README entry
+  documenting a setting that configured nothing. The binary-attestation timer, which is
+  installed and does run, is unaffected.
+
+### Notes
+- This change alters the RTMR3 measurement baseline (new AppArmor profile, edited
+  service configs) and adds an RTMR2-measured initramfs script; measurement
+  re-baselining is handled at release time.
+- The chutes-miner chart registry DaemonSet/Service is intentionally NOT removed
+  in this change — that retirement is a later, separate step gated on full fleet
+  migration.
+
+### Security
+- **RTMR3 canonical hashes now cover every measured file, including privileged ones.** The
+  boot-time integrity gate (`/etc/tdx-rtmr3-expected-hashes`) is now generated over the fully
+  finalized image root — while assembling the boot image, right before the final initramfs is built
+  — instead
+  of mid-build. Previously it was computed while later build stages could still change files, which
+  forced excluding files that aren't final yet (notably `/root/.ssh`, which gates privileged
+  access) from pre-verification. Those files were measured into RTMR3 but not checked against a
+  build-time constant at boot, so offline tampering wasn't caught by the local power-off gate. The
+  gate now hashes each measured file in its true on-disk state, so nothing is excluded and a
+  tampered `/root/.ssh`, `/etc/fstab`, or verification tool aborts boot before RTMR3 is extended.
+- The `overlayroot` initramfs hook is no longer shipped in the guest. Besides its per-build random
+  seed, it installed an `init-bottom` script capable of mounting an overlay over the root
+  filesystem, and it sorted ahead of `rtmr3-measure` — an unused root-remount mechanism in the
+  measured boot path, ahead of the step that measures the root. Triggering it required either the
+  `overlayroot=` kernel cmdline (measured into RTMR2, so detectable) or an edit to
+  `/etc/overlayroot.conf` (behind the LUKS key, so post-attestation), but it had no reason to be
+  in the boot chain.
+
 ## [1.3.1] - 2026-06-20
 
 ### Added

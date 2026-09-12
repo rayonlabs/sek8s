@@ -126,7 +126,7 @@ echo "Cache volume ready: /path/to/cache-volume.raw"
 
 ## Using the Cache Volume
 
-`quick-launch.sh` creates cache and storage volumes automatically based on your `config.yaml`. You normally don't need to create them manually. If you do pre-create a cache volume, reference it in your config:
+`chutes-cvm guest launch` creates cache and storage volumes automatically based on your `config.yaml`. You normally don't need to create them manually. If you do pre-create a cache volume, reference it in your config:
 
 ```yaml
 volumes:
@@ -138,7 +138,7 @@ volumes:
 Then launch as usual:
 
 ```bash
-./quick-launch.sh config.yaml
+chutes-cvm guest launch config.yaml
 ```
 
 ## Verification at Boot
@@ -235,7 +235,7 @@ sudo qemu-nbd --disconnect /dev/nbd0
 
 ## Storage Volume
 
-In addition to the cache volume (HF/model caches at `/var/snap`), the guest requires a **storage volume** for k3s state, containerd data, kubelet pods, admission controller certs, and chutes agent state. This volume is created by `quick-launch.sh` using the same `create-cache.sh` script with the label `storage`. It is configured via `volumes.storage` in `config.yaml`.
+In addition to the cache volume (HF/model caches at `/var/snap`), the guest requires a **storage volume** for k3s state, containerd data, kubelet pods, admission controller certs, and chutes agent state. This volume is created by `chutes-cvm guest launch` using the same `create-cache.sh` script with the label `storage`. It is configured via `volumes.storage` in `config.yaml`.
 
 See the [host-tools README](../README.md) for the full volume architecture.
 

@@ -11,7 +11,10 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Optional
+
+from sek8s_common.constants import MTLS_CLIENT_CERT, MTLS_CLIENT_KEY
 
 from sek8s.config import CosignVerificationConfig
 
@@ -22,6 +25,25 @@ logger = logging.getLogger(__name__)
 # admission controller and image pull verification.
 # DOCKER_CONFIG is set by systemd (shared drop-in); inherit from os.environ — do not override here.
 _COSIGN_ENV = {**os.environ, "SIGSTORE_NO_CACHE": "1"}
+
+# The VM's mTLS client identity (shared across all CVM->Chutes mTLS), minted at boot.
+# cosign/go-containerregistry ignores /etc/docker/certs.d, so the cert must be passed
+# explicitly; it is presented only when registry.chutes.ai requests it, inert otherwise.
+# Absent on build/test hosts, where the flags are omitted.
+_MTLS_CLIENT_CERT = Path(os.environ.get("SEK8S_MTLS_CLIENT_CERT", MTLS_CLIENT_CERT))
+_MTLS_CLIENT_KEY = Path(os.environ.get("SEK8S_MTLS_CLIENT_KEY", MTLS_CLIENT_KEY))
+
+
+def _registry_mtls_args() -> list[str]:
+    """`--registry-client-cert/key` flags for registry.chutes.ai mTLS, when the leaf exists."""
+    if _MTLS_CLIENT_CERT.exists() and _MTLS_CLIENT_KEY.exists():
+        return [
+            "--registry-client-cert",
+            str(_MTLS_CLIENT_CERT),
+            "--registry-client-key",
+            str(_MTLS_CLIENT_KEY),
+        ]
+    return []
 
 
 class CosignRateLimitError(Exception):
@@ -101,6 +123,7 @@ class CosignClient:
             cmd.append("--allow-insecure-registry")
         if config.rekor_url:
             cmd.extend(["--rekor-url", config.rekor_url])
+        cmd.extend(_registry_mtls_args())
         cmd.append(image)
 
         success, stdout, stderr = await self._run_cosign(cmd, timeout=timeout)
@@ -134,6 +157,7 @@ class CosignClient:
             cmd.extend(["--rekor-url", config.rekor_url])
         if config.fulcio_url:
             cmd.extend(["--fulcio-url", config.fulcio_url])
+        cmd.extend(_registry_mtls_args())
 
         success, stdout, _stderr = await self._run_cosign(cmd, timeout=timeout)
         if success:

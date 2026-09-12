@@ -1,0 +1,220 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-bottom/setup_vm_tls
+#
+# Signs both VM mTLS leaf certs (attestation proxy server cert + registry mTLS
+# client cert) from the per-boot VM root CA, then deletes the CA private key —
+# all within the RTMR2-measured initramfs, before pivot_root.
+#
+# Domain: VM mTLS leaf-certificate signing + CA key deletion only.
+# Block devices, LUKS, and k3s encryption config are out of scope — see
+# setup_storage.
+#
+# The VM root CA (/run/chutes/vm-root-ca/ca.{key,crt}) is generated earlier, in
+# fetch_key_and_unlock (init-premount), and is the VM's single mTLS client
+# identity for every boot API call. The validator records it as the VM root CA
+# from the RTMR3-attested /provision call (setup_storage), so this script no
+# longer generates or registers a CA — it only consumes the existing one to sign
+# the leaf certs and then destroys ca.key.
+#
+# Ordering: PREREQ="setup_storage setup_storage_debug" — runs in init-bottom AFTER
+# whichever storage script this image carries (prod installs setup_storage, debug
+# installs setup_storage_debug; only one is ever present, and an absent PREREQ name
+# is simply ignored by initramfs ordering). Both run after rtmr3-measure and keep the
+# CA in place (they use it as the /provision mTLS client cert and must not delete it),
+# so ca.key is still present when this script runs. This script deletes ca.key before
+# pivot_root; the key never reaches userspace (RTMR2 is the attestation proof).
+# openssl is copied into the initramfs by the luks fetch_key hook.
+
+PREREQ="setup_storage setup_storage_debug"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+
+# The initramfs ships the openssl binary but no default openssl.cnf, so a bare
+# `openssl req` (e.g. the registry client cert below, which uses -subj without its own
+# -config) cannot load a config and fails. Point openssl at an empty config — the same
+# idiom the existing initramfs mTLS code uses (attest-common, main's fetch_key_and_unlock).
+# The proxy cert's explicit `-config` still overrides this for its SAN/EKU extensions.
+export OPENSSL_CONF=/dev/null
+
+CA_DIR="/run/chutes/vm-root-ca"
+
+# ── Cleanup on any exit ───────────────────────────────────────────────────────
+#
+# Ensures ca.key is never left on tmpfs if the script exits early for any
+# reason (failure, signal).  Also removes scratch CSR/config files.
+
+cleanup() {
+    rm -f "${CA_DIR}/ca.key" "${CA_DIR}/ca.srl" \
+          /tmp/proxy_server.cnf /tmp/proxy_server.csr \
+          /tmp/registry_client.csr /tmp/registry_client_ext.cnf
+}
+trap cleanup EXIT INT TERM
+
+# ── Failure handler ───────────────────────────────────────────────────────────
+
+on_failure() {
+    log_failure_msg "VM TLS setup failed: $1"
+    echo "SETUP-VM-TLS-FAILED: $1" > /dev/kmsg 2>/dev/null || true
+    sleep 10
+    poweroff -f
+}
+
+# ── Leaf cert: attestation proxy server ──────────────────────────────────────
+
+generate_proxy_server_cert() {
+    local ca_dir="/run/chutes/vm-root-ca"
+    local tls_dir="/run/chutes/proxy-tls"
+    local real_root="${rootmnt:-/root}"
+
+    log_begin_msg "Generating attestation proxy server certificate"
+
+    # Resolve the tdx-attest GID from the real root's /etc/group so we can set
+    # ownership correctly without hard-coding a numeric GID.
+    local tdx_attest_gid
+    tdx_attest_gid=$(grep "^tdx-attest:" "${real_root}/etc/group" 2>/dev/null \
+                     | cut -d: -f3)
+    if [ -z "$tdx_attest_gid" ]; then
+        log_failure_msg "Could not resolve tdx-attest GID from ${real_root}/etc/group"
+        return 1
+    fi
+
+    mkdir -m 750 -p "$tls_dir"
+    chown "0:${tdx_attest_gid}" "$tls_dir"
+
+    if ! openssl genrsa -out "${tls_dir}/server.key" 2048 2>/dev/null; then
+        log_failure_msg "Failed to generate proxy server key"
+        return 1
+    fi
+
+    # Static SANs are sufficient: validators authenticate the proxy via the
+    # TDX-attested VM root CA, not the SAN.  The CA is the trust anchor.
+    local openssl_cnf="/tmp/proxy_server.cnf"
+    cat > "$openssl_cnf" << 'EOF'
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = attestation-service
+
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = attestation-service
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+IP.2 = ::1
+EOF
+
+    local csr="/tmp/proxy_server.csr"
+    if ! openssl req -new \
+            -key "${tls_dir}/server.key" \
+            -out "$csr" \
+            -config "$openssl_cnf" 2>/dev/null; then
+        log_failure_msg "Failed to generate proxy server CSR"
+        return 1
+    fi
+
+    if ! openssl x509 -req -days 365 \
+            -in "$csr" \
+            -CA "${ca_dir}/ca.crt" \
+            -CAkey "${ca_dir}/ca.key" \
+            -set_serial 1 \
+            -out "${tls_dir}/server.crt" \
+            -extensions v3_req \
+            -extfile "$openssl_cnf" 2>/dev/null; then
+        log_failure_msg "Failed to sign proxy server certificate"
+        return 1
+    fi
+
+    chown "0:${tdx_attest_gid}" "${tls_dir}/server.key" "${tls_dir}/server.crt"
+    chmod 640 "${tls_dir}/server.key" "${tls_dir}/server.crt"
+
+    log_success_msg "Attestation proxy server certificate generated"
+    return 0
+}
+
+# ── Leaf cert: registry mTLS client ──────────────────────────────────────────
+
+generate_registry_client_cert() {
+    local ca_dir="/run/chutes/vm-root-ca"
+    local tls_dir="/run/chutes/registry-tls"
+
+    log_begin_msg "Generating registry mTLS client certificate"
+
+    mkdir -m 700 -p "$tls_dir"
+
+    if ! openssl genrsa -out "${tls_dir}/client.key" 2048 2>/dev/null; then
+        log_failure_msg "Failed to generate registry client key"
+        return 1
+    fi
+
+    local csr="/tmp/registry_client.csr"
+    if ! openssl req -new \
+            -key "${tls_dir}/client.key" \
+            -subj "/O=chutes/OU=sek8s/CN=sek8s-cvm-mtls-client" \
+            -out "$csr" 2>/dev/null; then
+        log_failure_msg "Failed to generate registry client CSR"
+        return 1
+    fi
+
+    # Use a separate ext file instead of process substitution (POSIX sh).
+    local ext_cnf="/tmp/registry_client_ext.cnf"
+    printf 'extendedKeyUsage=clientAuth\n' > "$ext_cnf"
+
+    if ! openssl x509 -req -days 365 \
+            -in "$csr" \
+            -CA "${ca_dir}/ca.crt" \
+            -CAkey "${ca_dir}/ca.key" \
+            -set_serial 2 \
+            -extfile "$ext_cnf" \
+            -out "${tls_dir}/client.crt" 2>/dev/null; then
+        log_failure_msg "Failed to sign registry client certificate"
+        return 1
+    fi
+
+    chmod 600 "${tls_dir}/client.key"
+    chmod 644 "${tls_dir}/client.crt"
+
+    log_success_msg "Registry mTLS client certificate generated"
+    return 0
+}
+
+# ── CA key deletion ───────────────────────────────────────────────────────────
+
+delete_vm_ca_key() {
+    local ca_dir="/run/chutes/vm-root-ca"
+
+    log_begin_msg "Deleting VM root CA private key"
+    rm -f "${ca_dir}/ca.key" "${ca_dir}/ca.srl"
+    log_success_msg "VM root CA private key deleted — key never existed in userspace"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+log_begin_msg "Starting VM TLS setup"
+
+# The VM root CA is generated in fetch_key_and_unlock (init-premount) and kept in
+# place by setup_storage. If it is missing, an earlier initramfs stage failed —
+# refuse to boot rather than come up without leaf certs.
+if [ ! -f "${CA_DIR}/ca.key" ] || [ ! -f "${CA_DIR}/ca.crt" ]; then
+    on_failure "VM root CA not found at ${CA_DIR} (generated in init-premount)"
+fi
+
+if ! generate_proxy_server_cert; then
+    on_failure "Proxy server certificate generation failed"
+fi
+
+if ! generate_registry_client_cert; then
+    on_failure "Registry mTLS client certificate generation failed"
+fi
+
+delete_vm_ca_key
+
+log_success_msg "VM TLS setup completed"

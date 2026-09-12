@@ -1,0 +1,41 @@
+#!/bin/sh
+# crictl-pods-helper: Restricted wrapper for the chute-log-shipper service.
+# Allows ONLY the read-only CRI verbs the agent needs (pod/container discovery
+# as JSON). No exec, no rm, no image ops, no arbitrary crictl/kubectl access.
+# Mirrors the k3s-images-helper allowlist pattern used by system-manager.
+#
+# POSIX sh, not bash, and that is load-bearing: this script is the only door into
+# the sek8s.chute-log-shipper//crictl profile, which holds the CRI socket. bash
+# sources $BASH_ENV before the script body runs, so a caller that already has code
+# execution in the parent profile could have run its own payload in here. dash reads
+# neither $BASH_ENV nor (non-interactively) $ENV.
+
+set -eu
+
+K3S_BIN="/usr/local/bin/k3s"
+# k3s crictl forces its own root-only config; --config points at our readable copy instead.
+CRICTL_CONFIG="/etc/chute-log-shipper/crictl.yaml"
+
+case "${1:-}" in
+    pods)
+        # Only `crictl pods -o json` (sandbox list). Reject any extra args
+        # (selectors, --name, etc.) so the wrapper cannot be repurposed.
+        if [ "${2:-}" = "-o" ] && [ "${3:-}" = "json" ] && [ -z "${4:-}" ]; then
+            exec "$K3S_BIN" crictl --config "$CRICTL_CONFIG" pods -o json
+        fi
+        echo "error: only 'pods -o json' allowed" >&2
+        exit 1
+        ;;
+    ps)
+        # Only `crictl ps -a -o json` (container list, read-only).
+        if [ "${2:-}" = "-o" ] && [ "${3:-}" = "json" ] && [ -z "${4:-}" ]; then
+            exec "$K3S_BIN" crictl --config "$CRICTL_CONFIG" ps -a -o json
+        fi
+        echo "error: only 'ps -o json' allowed" >&2
+        exit 1
+        ;;
+    *)
+        echo "error: unknown subcommand (allowed: pods -o json, ps -o json)" >&2
+        exit 1
+        ;;
+esac

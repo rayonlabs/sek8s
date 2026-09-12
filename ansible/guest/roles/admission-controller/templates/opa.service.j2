@@ -1,0 +1,38 @@
+[Unit]
+Description=Open Policy Agent
+After=network.target
+Before=admission-controller.service
+
+[Service]
+Type=simple
+User=opa
+Group=opa
+ExecStart=/usr/local/bin/opa run --server \
+    --config-file=/etc/opa/opa.yaml \
+    --addr=localhost:8181 \
+    --log-level={{ opa_log_level }} \
+    /etc/opa/policies
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/opa
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+[Install]
+WantedBy=multi-user.target

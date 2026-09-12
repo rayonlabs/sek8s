@@ -6,7 +6,7 @@ from fastapi import HTTPException, Query, status
 from loguru import logger
 
 from sek8s.config import AttestationServiceConfig
-from sek8s.exceptions import AttestationException, NvmlException
+from sek8s.exceptions import AttestationException, NonceError, NvmlException
 from sek8s.models import DeviceInfo
 from sek8s.providers.gpu import GpuDeviceProvider
 from sek8s.providers.nvtrust import NvEvidenceProvider
@@ -75,6 +75,9 @@ class AttestationServer(WebServer):
                 nvtrust_evidence=nvtrust_evidence,
             )
 
+        except NonceError as e:
+            logger.warning(f"Rejected attestation request with invalid nonce: {e}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         except AttestationException as e:
             logger.error(f"Error generating attestation evidence: {e}")
             raise HTTPException(
@@ -125,6 +128,9 @@ class AttestationServer(WebServer):
             return base64.b64encode(quote_content).decode("utf-8")
         except HTTPException:
             raise
+        except NonceError as e:
+            logger.warning(f"Rejected quote request with invalid nonce: {e}")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         except Exception as e:
             logger.error(f"Unexpected error generating TDX quote:{e}")
             raise HTTPException(

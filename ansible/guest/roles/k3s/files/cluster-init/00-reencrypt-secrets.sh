@@ -39,7 +39,9 @@ log() {
 
 export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
 STATE_DB="${STATE_DB:-/var/lib/rancher/k3s/server/db/state.db}"
-ENCRYPTION_CONFIG="${ENCRYPTION_CONFIG:-/run/chutes/k3s-encryption-config.yaml}"
+# Staged into $STAGED_DIR by the k3s-post-start wrapper; /run/chutes is denied to this script
+# by sek8s.k3s-init.00-reencrypt-secrets. The bare path only resolves when run unconfined.
+ENCRYPTION_CONFIG="${ENCRYPTION_CONFIG:-${STAGED_DIR:-/run/chutes}/k3s-encryption-config.yaml}"
 K3S_CONFIG="${K3S_CONFIG:-/etc/rancher/k3s/config.yaml}"
 
 # Returns 0 if every live secret AND configmap in kine is encrypted at rest, 1 if

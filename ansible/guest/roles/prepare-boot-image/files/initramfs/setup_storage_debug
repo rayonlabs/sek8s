@@ -1,0 +1,51 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-bottom/setup_storage_debug
+#
+# DEBUG IMAGE ONLY. The debug counterpart to setup_storage. Two jobs, both fail-open:
+#
+#   1. Write the k3s EncryptionConfiguration from a STATIC key, UNCONDITIONALLY — so
+#      k3s comes up even when the VM can't join the network (e.g. a miner debugging
+#      hardware with no operator key). This is the "k3s always works" behavior.
+#   2. Best-effort register the VM root CA via /provision (miner-hotkey proof via
+#      hotkey-sign, shared with prod) so WE can join a debug VM to the network for testing.
+#
+# No volume LUKS: the debug image is unencrypted (storage/cache mounted plain by the
+# cache-volume role in debug mode). This script exists only in the debug initramfs, so
+# prod carries none of it and keeps a distinct measurement.
+PREREQ="rtmr3-measure"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+[ -f /etc/tdx-luks.conf ] && . /etc/tdx-luks.conf
+. /scripts/provision-common
+
+# Static, well-known debug k3s secretbox key (base64, decodes to exactly 32 bytes).
+# NOT secret — debug builds are not production-hardened; the goal is code-path parity
+# and "k3s always comes up". Same value the retired userspace debug-encryption used,
+# so secrets in a reused debug volume stay readable across image upgrades.
+# base64("chutes-debug-k3s-secretbox-key01") = 32 bytes.
+DEBUG_K3S_KEY="Y2h1dGVzLWRlYnVnLWszcy1zZWNyZXRib3gta2V5MDE="
+
+# Fail-open: log and keep booting instead of powering off.
+handle_failure() {
+    log_failure_msg "debug storage/provision failed (continuing boot): $1"
+    echo "DEBUG-PROVISION-FAILED: $1" > /dev/kmsg 2>/dev/null || true
+}
+
+log_begin_msg "Starting debug storage setup (fail-open, static k3s key, no LUKS)"
+
+# (1) k3s encryption ALWAYS comes up in debug — static key, independent of /provision,
+# so a hardware-debugging VM that can't reach the network still runs k3s.
+K3S_ENCRYPTION_KEY="$DEBUG_K3S_KEY"
+write_k3s_encryption_config || true
+
+# (2) Best-effort CA registration + validator auth (network join). Empty volume list:
+# register the CA only, no volume secrets. Requires the boot state written by
+# fetch_key_and_unlock_debug; if attestation didn't succeed, this simply fails open.
+if load_vm_data; then
+    provision_request "" || true
+fi
+
+log_end_msg 0
+exit 0

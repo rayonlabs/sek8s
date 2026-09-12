@@ -1,5 +1,5 @@
 ---
-# Render config, start the VM via quick-launch.sh, and wait for node-health.
+# Render config, start the VM via `chutes-cvm guest launch`, and wait for node-health.
 # Used by upgrade-guest.yml and upgrade-host.yml after the guest has been shut down.
 #
 # Expects (from caller scope or vars):
@@ -7,70 +7,44 @@
 #   chutes_hotkey_path            — controller path to Bittensor hotkey JSON
 #   chutes_miner_api              — miner API URL
 #   chutes_config_remote_path     — path to config.yaml on the remote host
-#   sek8s_remote_host_tools       — path to host-tools checkout on the remote host
 #   upgrade_health_poll_seconds   — seconds to poll node-health before giving up
 
 - name: Render config.yaml on host before launch
   ansible.builtin.include_role:
     name: chutes_vm_config
 
-- name: Check if base image exists
+# ── Image-set pre-flight ─────────────────────────────────────────────────────
+# Launch is decoupled from download: the image set must already be staged (by
+# upgrade-guest.yml, or `chutes-cvm image download`). We do NOT auto-download here — a
+# missing set is an explicit failure with a remediation hint, not a silent fetch.
+# When present, verify it is coherent against its manifest (chutes_cvm.guest.image_set
+# resolve — presence/size, cheap, the bytes were fully hashed when staged) so a stale or
+# out-of-sync set fails here with a clear message rather than cryptically inside chutes-cvm guest launch.
+
+- name: Check the base image set exists
   ansible.builtin.stat:
     path: "{{ upgrade_default_base_image }}"
     get_checksum: false
   register: _base_img_stat
 
-- name: Download base image when missing
-  ansible.builtin.shell: |
-    set -euo pipefail
-    ./quick-launch.sh --download 2>&1 | tee /tmp/chutes-download.log
-    exit ${PIPESTATUS[0]}
-  args:
-    chdir: "{{ sek8s_remote_host_tools }}/scripts"
-    executable: /bin/bash
-  when: not _base_img_stat.stat.exists
-  changed_when: true
-
-# ── Image integrity pre-flight ───────────────────────────────────────────────
-# Validate the base image SHA256 against what quick-launch.sh expects before
-# attempting to start the VM. Failing here gives a clear actionable message;
-# failing inside quick-launch.sh produces a cryptic checksum error with no
-# remediation hint.
-
-- name: Read expected base image SHA256 from quick-launch.sh
-  ansible.builtin.shell: |
-    grep -E '^EXPECTED_BASE_SHA256=' "{{ sek8s_remote_host_tools }}/scripts/quick-launch.sh" \
-      | head -1 | cut -d= -f2 | tr -d '"' | tr -d "'"
-  args:
-    executable: /bin/bash
-  register: _launch_expected_sha
-  changed_when: false
-
-- name: Compute SHA256 of current base image
-  ansible.builtin.command:
-    argv:
-      - sha256sum
-      - "{{ upgrade_default_base_image }}"
-  register: _launch_actual_sha
-  changed_when: false
-  # Skip when the caller already verified this image (e.g. upgrade-guest.yml just
-  # promoted a freshly checksummed staged image). Nothing touched the file between
-  # verification and launch, so recomputing is pure waste (~111s on a large qcow2).
-  when: (_prevalidated_base_sha | default('')) != (_launch_expected_sha.stdout | trim)
-
-- name: Use pre-validated SHA when available
-  ansible.builtin.set_fact:
-    _launch_actual_sha: "{{ _launch_actual_sha | combine({'stdout': (_prevalidated_base_sha | default('')) + '  ' + upgrade_default_base_image}) }}"
-  when: (_prevalidated_base_sha | default('')) == (_launch_expected_sha.stdout | trim)
-
-- name: Fail with clear message when base image SHA does not match
+- name: Fail clearly when the base image set is missing
   ansible.builtin.fail:
     msg: >-
-      Base image checksum mismatch — cannot launch safely.
-      Expected: {{ _launch_expected_sha.stdout | trim }}.
-      Actual:   {{ _launch_actual_sha.stdout.split()[0] }}.
-      Run upgrade-guest.yml to download and promote the correct image before launching.
-  when: _launch_actual_sha.stdout.split()[0] != (_launch_expected_sha.stdout | trim)
+      Base image set not found at {{ upgrade_default_base_image }}. Launch does not
+      auto-download — stage it first with `upgrade-guest.yml` or
+      `chutes-cvm image download` (populates the set + manifest), then relaunch.
+  when: not (_base_img_stat.stat.exists and _base_img_stat.stat.isdir)
+
+- name: Verify the base image set against its manifest
+  ansible.builtin.command:
+    argv:
+      - chutes-cvm
+      - image
+      - verify
+      - "{{ upgrade_default_base_image }}"
+  register: _image_set_resolve
+  changed_when: false
+  failed_when: _image_set_resolve.rc != 0
 
 # ── PCI passthrough wedge guard ──────────────────────────────────────────────
 # GPU passthrough hosts occasionally wedge the PCI subsystem: a vfio-pci unbind
@@ -78,16 +52,15 @@
 # SBR/CC-mode op (and therefore VM launch) fails with "SBR cannot run until the
 # host is rebooted". Only a reboot clears it. We detect this up front, and again
 # if the launch itself wedges the host, rebooting and waiting for SSH to return
-# before (re)trying the launch. chutes.guest.vfio.pci_operations_wedged() is the
-# same predicate run-td uses internally (scans ps for D-state vfio/gpu-tools).
+# before (re)trying the launch. chutes_cvm.vfio.pci_operations_wedged() is the
+# same predicate chutes-cvm guest launch uses internally (scans ps for D-state vfio/gpu-tools).
 
 - name: Pre-flight — detect a wedged PCI subsystem
   ansible.builtin.command:
-    chdir: "{{ sek8s_remote_host_tools }}/scripts"
     argv:
-      - python3
-      - -c
-      - "import sys; from chutes.guest.vfio import pci_operations_wedged; sys.exit(0 if pci_operations_wedged() else 1)"
+      - chutes-cvm
+      - host
+      - vfio-wedged
   register: _pci_wedged
   failed_when: false
   changed_when: false
@@ -100,25 +73,25 @@
 
 - name: Launch VM (reboot and retry once if the launch wedges the PCI subsystem)
   block:
-    - name: Launch VM via quick-launch.sh
+    - name: Launch VM via chutes-cvm guest launch
       ansible.builtin.command:
-        chdir: "{{ sek8s_remote_host_tools }}/scripts"
         argv:
-          - ./quick-launch.sh
+          - chutes-cvm
+          - guest
+          - launch
           - "{{ chutes_config_remote_path }}"
       register: _qlaunch
       changed_when: true
   rescue:
     # Authoritative signal: the D-state tasks that wedge the PCI subsystem persist
     # until reboot, so re-running the predicate after the failure tells us directly
-    # whether a reboot would help. Fall back to matching run-td's error text.
+    # whether a reboot would help. Fall back to matching chutes-cvm guest launch's error text.
     - name: Re-check PCI wedge state after launch failure
       ansible.builtin.command:
-        chdir: "{{ sek8s_remote_host_tools }}/scripts"
         argv:
-          - python3
-          - -c
-          - "import sys; from chutes.guest.vfio import pci_operations_wedged; sys.exit(0 if pci_operations_wedged() else 1)"
+          - chutes-cvm
+          - host
+          - vfio-wedged
       register: _post_wedge
       failed_when: false
       changed_when: false
@@ -134,7 +107,7 @@
     - name: Fail when the launch error is not a recoverable PCI wedge
       ansible.builtin.fail:
         msg: >-
-          quick-launch.sh failed (rc={{ _qlaunch.rc | default('?') }}) for a reason
+          chutes-cvm guest launch failed (rc={{ _qlaunch.rc | default('?') }}) for a reason
           other than a PCI wedge — not retrying. stderr={{ _qlaunch.stderr | default('') }}
       when: not (_launch_pci_wedged | bool)
 
@@ -145,9 +118,10 @@
 
     - name: Retry VM launch after reboot
       ansible.builtin.command:
-        chdir: "{{ sek8s_remote_host_tools }}/scripts"
         argv:
-          - ./quick-launch.sh
+          - chutes-cvm
+          - guest
+          - launch
           - "{{ chutes_config_remote_path }}"
       register: _qlaunch_retry
       changed_when: true
@@ -156,7 +130,7 @@
     - name: Fail if launch still fails after reboot
       ansible.builtin.fail:
         msg: >-
-          quick-launch.sh still failing after a reboot to clear the PCI wedge
+          chutes-cvm guest launch still failing after a reboot to clear the PCI wedge
           (rc={{ _qlaunch_retry.rc }}). stderr={{ _qlaunch_retry.stderr | default('') }}
       when: _qlaunch_retry.rc != 0
 

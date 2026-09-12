@@ -14,5 +14,5 @@
       Or run Ansible from ansible/host:
         ansible-playbook -i <inventory> {{ playbook_dir }}/shutdown.yml
       (same inventory as upgrade: chutes_hotkey_path, chutes_miner_api from host_tools defaults or inventory; optional tee_server_name).
-      See host-tools/scripts/quick-launch.sh; --force bypasses the duplicate guard and is unsafe.
+      See src/chutes-cvm/chutes_cvm/guest/launch.py; --force bypasses the duplicate guard and is unsafe.
   when: (chutes_td_live_check.rc | default(1)) == 0

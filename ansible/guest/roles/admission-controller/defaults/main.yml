@@ -8,6 +8,10 @@ opa_version: "1.15.2"
 # which is stable across v2 and v3; staying on v2 avoids any v3 bundle-format changes.
 cosign_version: "2.6.3"
 opa_log_level: "info"
+# Per-decision logging (full AdmissionReview input → journal). OFF in prod: it is
+# high-volume noise that evicts the boot/attestation history from the journal window,
+# and it puts tenant pod specs into a log the miner can read via the status API.
+# Debug builds can opt in with -e opa_decision_logs=true.
 opa_decision_logs: false
 
 # Admission controller settings
@@ -20,9 +24,6 @@ cache_enabled: true
 cache_ttl: 300
 debug_mode: false
 metrics_enabled: true
-# Chutes config
-validator: 5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ
-
 # Registry allowlist
 allowed_registries:
   - docker.io
@@ -32,5 +33,4 @@ allowed_registries:
   - rancher
   - nvcr.io
   - parachutes
-  - bitnami
-  - "{{ validator }}.localregistry.chutes.ai:30500"
+  - "registry.chutes.ai"

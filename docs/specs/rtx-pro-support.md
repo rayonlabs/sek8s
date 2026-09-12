@@ -12,12 +12,12 @@ pipeline. The RTX Pro 6000 is a PCIe Gen 5 workstation/server GPU with 96 GB
 GDDR7 and NVIDIA Confidential Computing support. Unlike H200/B200, it has **no
 NVSwitch and no NVLink** -- inter-GPU communication is PCIe-only.
 
-- **Packages affected**: `host-tools/scripts/chutes/guest`
+- **Packages affected**: `src/chutes-cvm/chutes_cvm/guest`
 - **Key files**:
-  - `host-tools/scripts/chutes/guest/gpu/profiles.py` (new profile)
-  - `host-tools/scripts/chutes/guest/gpu/tools.py` (nvidia-gpu-tools compat)
-  - `host-tools/scripts/chutes/guest/detection.py` (detection driven by profile)
-  - `host-tools/scripts/chutes/guest/passthrough.py` (orchestration driven by profile)
+  - `src/chutes-cvm/chutes_cvm/guest/gpu/profiles.py` (new profile)
+  - `src/chutes-cvm/chutes_cvm/guest/gpu/tools.py` (nvidia-gpu-tools compat)
+  - `src/chutes-cvm/chutes_cvm/guest/detection.py` (detection driven by profile)
+  - `src/chutes-cvm/chutes_cvm/guest/passthrough.py` (orchestration driven by profile)
   - `ansible/guest/roles/gpu/files/nvidia-fabricmanager-mask.sh` (no changes, already handles no-NVSwitch)
   - `ansible/guest/roles/gpu/files/nvidia-persistenced-config.sh` (no changes, already handles no-NVSwitch)
 - **Dependencies**: `nvidia-gpu-tools` (bundled wheel from NVIDIA/gpu-admin-tools) must support GB202 CC mode
@@ -61,13 +61,13 @@ Success = TDX VM launches with RTX Pro 6000 GPU(s) passed through in CC mode, wi
 - BAR size (`bar_size_mb`) is **131072 MB (128 GiB)**, validated on Server Edition hardware: `lspci -vvv -d 10de:` reports **Physical Resizable BAR / BAR 2: current size: 128GB** on each GPU. (Optional cross-check: `nvidia-smi -q -d BAR1` in a VM with driver.)
 - Do not modify passthrough orchestration (`passthrough.py`, `detection.py`, `vfio.py`) -- all behavior must be driven by the profile.
 - Single guest image for all GPU topologies -- no topology-specific Ansible changes.
-- `nvidia-gpu-tools` bundled wheel must support Blackwell GB202. If not, re-bundle from latest `gpu-admin-tools` main via `host-tools/scripts/gpu-tools/bundle-tools.sh`.
+- `nvidia-gpu-tools` bundled wheel must support Blackwell GB202. If not, re-bundle from latest `gpu-admin-tools` main via `make bundle-gpu-tools` (`src/chutes-cvm/tools/gpu-tools/bundle-tools.sh`).
 
 ---
 
 ## Output Format
 
-1. New `RTXPro6000Profile` class in `host-tools/scripts/chutes/guest/gpu/profiles.py`
+1. New `RTXPro6000Profile` class in `src/chutes-cvm/chutes_cvm/guest/gpu/profiles.py`
 2. New entry in `GPU_PROFILES` dict keyed as `'RTX_PRO_6000'`
 3. Unit tests in `tests/` covering profile resolution, CC mode args, NVSwitch=False, IB=False, mixed-model rejection, and RAM sizing (`N * 96G`)
 

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "attestation-proxy"
-version = "0.3.1"
+version = "0.3.2"
 description = "Dual-port attestation proxy for sek8s"
 authors = ["Kyle Widmann <kyle@chutes.ai>"]
 readme = "README.md"

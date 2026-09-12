@@ -43,8 +43,3 @@
 - name: Setup seccomp profiles
   ansible.builtin.include_tasks: seccomp-profiles.yml
   tags: seccomp-profiles
-
-- name: Setup debug encryption config
-  ansible.builtin.include_tasks: debug-encryption.yml
-  tags: k3s-debug-encryption
-  when: debug_build | default(false)

@@ -59,97 +59,80 @@ if [ ! -f /etc/tdx-measure.conf ]; then
     handle_failure "tdx-measure.conf not found in initramfs"
 fi
 
-# ── Helper: look up expected hash for a canonical file ───────────────────────
-# Returns the expected SHA-384 hex string for $1, or empty string if the path
-# has no entry in /etc/tdx-rtmr3-expected-hashes (meaning it is not canonical
-# and is measured without pre-verification).
-
 EXPECTED_HASHES_FILE=/etc/tdx-rtmr3-expected-hashes
 
-expected_hash_for() {
-    [ -f "$EXPECTED_HASHES_FILE" ] || return 0
-    # Skip comment lines; match path in field 1; print hash from field 2.
-    awk -v path="$1" \
-        'substr($0,1,1)=="#" { next } $1 == path { print $2; exit }' \
-        "$EXPECTED_HASHES_FILE" 2>/dev/null
-}
+# ── Collect and hash every file to measure ──────────────────────────────────
+# Paths in the config are relative to the real root (e.g. /etc/ssh), so they are
+# read from ${rootmnt}/etc/ssh and emitted root-relative.
+#
+# WHICH files, in WHAT ORDER and HOW they are hashed all live in tdx-measure — the
+# same script the build-time manifest generator, rtmr3-verify and the host-side
+# measurement predictor run. This script owns only what is boot-specific: checking
+# each hash against the canonical manifest and extending the hardware register.
+# Do not re-derive the file list or the hashes here; that is how four walkers came
+# to disagree four ways. tdx-measure sorts under LC_ALL=C, refuses a symlinked conf
+# entry, and exits non-zero if nothing is measurable; its progress goes to stderr,
+# routed here to /dev/kmsg for the miner-visible measurement phase.
 
-# ── Collect and sort all files to measure ───────────────────────────────────
-# Paths in the config are relative to the real root (e.g. /etc/ssh).
-# We read them from ${rootmnt}/etc/ssh, etc.
-# Only regular files are measured; symlinks, pipes, and device nodes are skipped.
+measure_start=$(date +%s)
+hash_list=$(mktemp)
 
-filelist=$(mktemp)
-
-while IFS= read -r cfg_path || [ -n "$cfg_path" ]; do
-    # Strip inline comments and leading/trailing whitespace
-    cfg_path="${cfg_path%%#*}"
-    cfg_path="${cfg_path#"${cfg_path%%[! ]*}"}"
-    cfg_path="${cfg_path%"${cfg_path##*[! ]}"}"
-    [ -z "$cfg_path" ] && continue
-
-    realpath="${rootmnt}${cfg_path}"
-
-    if [ -d "$realpath" ]; then
-        # Collect all regular files under the directory, record their
-        # root-relative paths for deterministic cross-machine sorting.
-        find "$realpath" -type f | while IFS= read -r f; do
-            # Strip the rootmnt prefix so paths sort consistently
-            printf '%s\n' "${f#"${rootmnt}"}"
-        done >> "$filelist"
-    elif [ -f "$realpath" ]; then
-        printf '%s\n' "$cfg_path" >> "$filelist"
-    fi
-done < /etc/tdx-measure.conf
-
-# Sort lexicographically to guarantee a deterministic extend chain, writing
-# result to a temp file so the extend loop runs in the same shell (not a
-# pipe subshell) and can call handle_failure directly.
-sorted_list=$(mktemp)
-sort "$filelist" > "$sorted_list"
-rm -f "$filelist"
-
-if [ ! -s "$sorted_list" ]; then
-    rm -f "$sorted_list"
-    handle_failure "no files found to measure — check tdx-measure.conf paths"
+if ! tdx-measure hash "${rootmnt}" /etc/tdx-measure.conf \
+        > "$hash_list" 2> /dev/kmsg; then
+    rm -f "$hash_list"
+    handle_failure "measured-file enumeration failed — check tdx-measure.conf paths"
 fi
+
+collect_elapsed=$(($(date +%s) - measure_start))
+echo "RTMR3: file collection complete in ${collect_elapsed}s" > /dev/kmsg
 
 # ── Hash each file and extend RTMR3 ─────────────────────────────────────────
 
-count=0
+total_files=$(wc -l < "$hash_list")
 
-while IFS= read -r relpath; do
-    [ -z "$relpath" ] && continue
+# Verify every measured file against the build-time manifest in ONE awk pass: the manifest is
+# read into memory, then the hash list is streamed past it. The previous form spawned an awk per
+# file that rescanned the whole manifest, which is O(n^2) -- at 41k files the per-file cost grew
+# from 5ms to 20ms and the phase projected to ~67 minutes.
+#
+# Both formats carry the 96-char hash at a fixed end of the line, so paths containing spaces are
+# handled by offset rather than by field splitting: manifest is "<path> <hash>", the hash list is
+# "<hash> <path>".
+echo "RTMR3: verifying ${total_files} files against the canonical manifest..." > /dev/kmsg
 
-    fullpath="${rootmnt}${relpath}"
-    [ -f "$fullpath" ] || continue
-
-    # sha384sum outputs "<hash>  <filename>" — extract just the hash
-    hash=$(sha384sum "$fullpath" 2>/dev/null | awk '{print $1}')
-    if [ -z "$hash" ]; then
-        rm -f "$sorted_list"
-        handle_failure "could not hash ${relpath}"
+if [ -f "$EXPECTED_HASHES_FILE" ]; then
+    tampered=$(awk '
+        NR==FNR {
+            if (substr($0,1,1) == "#" || length($0) < 98) next
+            expect[substr($0, 1, length($0)-97)] = substr($0, length($0)-95)
+            next
+        }
+        { if ((substr($0,98) in expect) && expect[substr($0,98)] != substr($0,1,96)) {
+              print substr($0,98); exit 1 } }
+    ' "$EXPECTED_HASHES_FILE" "$hash_list")
+    if [ $? -ne 0 ]; then
+        rm -f "$hash_list"
+        handle_failure "canonical file tampered: ${tampered}"
     fi
+fi
 
-    # For canonical files: verify the actual hash matches the build-time
-    # constant embedded in the initramfs.  A mismatch means the file was
-    # tampered with offline; power off rather than boot with broken tools.
-    expected=$(expected_hash_for "$relpath")
-    if [ -n "$expected" ] && [ "$hash" != "$expected" ]; then
-        rm -f "$sorted_list"
-        handle_failure "canonical file tampered: ${relpath}"
-    fi
+# One extend over a digest of the whole chain, not one extend per file. 41k TDCALLs cost ~167s
+# of boot and bind nothing a single extend over the ordered list does not: RTMR3 becomes
+# SHA384(0^48 || SHA384(hash-list)). Hashing the list text binds the paths too, which the
+# per-file content chain did not. chutes_cvm.measurement.rtmr3.fold_chain computes the same.
+chain_digest=$(sha384sum < "$hash_list" | cut -d' ' -f1)
+rm -f "$hash_list"
 
-    if ! tdx-rtmr-extend --index 3 --data "$hash" 2>/dev/null; then
-        rm -f "$sorted_list"
-        handle_failure "failed to extend RTMR3 for ${relpath}"
-    fi
+if [ -z "$chain_digest" ]; then
+    handle_failure "could not compute the chain digest"
+fi
 
-    count=$((count + 1))
-done < "$sorted_list"
+if ! tdx-rtmr-extend --index 3 --data "$chain_digest" 2>/dev/null; then
+    handle_failure "failed to extend RTMR3"
+fi
 
-rm -f "$sorted_list"
-
-log_success_msg "RTMR3: extended with ${count} file measurement(s)"
+total_elapsed=$(($(date +%s) - measure_start))
+echo "RTMR3: completed — ${total_files} files measured in ${total_elapsed}s" > /dev/kmsg
+log_success_msg "RTMR3: extended with ${total_files} file measurement(s) in ${total_elapsed}s"
 
 exit 0

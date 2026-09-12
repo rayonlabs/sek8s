@@ -19,6 +19,67 @@
     state: stopped
   failed_when: false
 
+# ── PCCS suite transition: noble -> resolute (26.04) ─────────────────────────
+# Intel's noble-suite sgx-dcap-pccs now Depends: nodejs (>= 22.13.0), which is
+# unsatisfiable on 25.10 (questing ships nodejs 20.x). apt therefore offers an
+# uninstallable upgrade that is permanently "kept back", and do-release-upgrade
+# refuses to run while the release is not fully up to date. Holding the package
+# does not help — do-release-upgrade also refuses with held packages present.
+#
+# Back up the PCCS artifacts (config/ holds the API key + token hashes + cached
+# collateral; ssl_key/ holds the self-signed TLS cert), then remove the package
+# so do-release-upgrade can proceed. On 26.04 the init_2604 hook restores these
+# artifacts before chutes-cvm host setup reinstalls sgx-dcap-pccs from the resolute
+# suite (nodejs 22.13+ is available there). Preserving them is required because
+# the upgrade path re-runs chutes-cvm host setup but does not re-apply the PCCS config
+# (API key), unlike a fresh setup.yml provision.
+
+- name: "Pre 25.10: query sgx-dcap-pccs install state"
+  ansible.builtin.command: dpkg-query -W -f='${Status}' sgx-dcap-pccs
+  register: _pccs_status
+  changed_when: false
+  failed_when: false
+
+- name: "Pre 25.10: back up PCCS artifacts and remove package before upgrade"
+  when: "'install ok installed' in (_pccs_status.stdout | default(''))"
+  block:
+    - name: "Pre 25.10: create PCCS backup directory"
+      ansible.builtin.file:
+        path: "{{ pccs_upgrade_backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: "Pre 25.10: stat PCCS artifacts to preserve"
+      ansible.builtin.stat:
+        path: "{{ pccs_install_dir }}/{{ item }}"
+      register: _pccs_artifacts
+      loop:
+        - config
+        - ssl_key
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Pre 25.10: back up PCCS artifacts (preserve owner/perms)"
+      ansible.builtin.command:
+        cmd: "cp -a {{ pccs_install_dir }}/{{ item.item }} {{ pccs_upgrade_backup_dir }}/{{ item.item }}"
+        creates: "{{ pccs_upgrade_backup_dir }}/{{ item.item }}"
+      loop: "{{ _pccs_artifacts.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists
+
+    - name: "Pre 25.10: stop tdx-qgs before PCCS removal"
+      ansible.builtin.service:
+        name: tdx-qgs
+        state: stopped
+      failed_when: false
+
+    - name: "Pre 25.10: remove sgx-dcap-pccs so do-release-upgrade can proceed"
+      ansible.builtin.apt:
+        name: sgx-dcap-pccs
+        state: absent
+        purge: false
+
 # ── Detect kobuk presence (idempotent across retries) ────────────────────────
 # Search all directories that can carry kobuk evidence:
 #   sources.list.d   — PPA source files (removed below)
@@ -106,7 +167,7 @@
 
 - name: "Pre 25.10: remove stale PCCS directory left by apt purge"
   # apt purge warns "directory not empty so not removed" and leaves the tree
-  # behind. The fresh install via setup-tdx-host --noninteractive would then
+  # behind. The fresh install via chutes-cvm host setup --noninteractive would then
   # skip npm install (directory already exists), producing a broken install
   # with no node_modules. Remove it so the reinstall starts clean.
   ansible.builtin.file:

@@ -1,0 +1,177 @@
+# vim: ft=apparmor
+# sek8s.system-manager — AppArmor profile for the system-manager service.
+# Applied via systemd AppArmorProfile= directive (not auto-attached).
+# Grants: cache rw, credential read, containerd socket, network, subprocesses.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# attach_disconnected: the service runs in a systemd sandbox mount namespace, which leaves some
+# /dev and /run nodes "disconnected" from this profile's root (they surface in the audit without a
+# leading slash, e.g. dev/null). Without the flag AppArmor fails the path lookup even in complain.
+profile sek8s.system-manager flags=(enforce, attach_disconnected) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+  include <abstractions/python>
+
+  # Python interpreter and venv. The venv python is a symlink chain to /usr/bin/python3.12, and
+  # AppArmor mediates the RESOLVED target at exec — so cache-download's worker subprocess (spawned
+  # from within this profile) needs the real interpreter granted, not just the venv symlink path.
+  # mr on the venv because C-extension .so files (hf_transfer, pydantic-core, aiohttp, …) are mmap'd.
+  /opt/sek8s/ r,
+  /opt/sek8s/venv/bin/python3{,.*} mrix,
+  /usr/bin/python3.12 mrix,
+  /usr/bin/python3{,.*} mrix,
+  /opt/sek8s/venv/** mr,
+  # /opt/sek8s/src is READ-ONLY here on purpose: it is RTMR3-measured, and the services run with
+  # PYTHONDONTWRITEBYTECODE=1 (see the unit files) so nothing writes .pyc into the measured tree at
+  # runtime. No __pycache__ write grant — a runtime write would drift RTMR3 on the next boot.
+  /opt/sek8s/src/** r,
+
+  # Environment files
+  /etc/system-manager/** r,
+
+  # HF model cache — read/write for downloads
+  /var/snap/ r,
+  /var/snap/cache/ rw,
+  /var/snap/cache/** rwlk,
+
+  # Logging and runtime dirs
+  /var/log/system-manager/ rw,
+  /var/log/system-manager/** rw,
+  /run/system-manager/ rw,
+  /run/system-manager/** rw,
+
+  # `journalctl` (the /status log-streaming endpoint) reads the journal directly — persistent
+  # and/or volatile store — plus machine-id. Without these it execs but returns nothing.
+  /var/log/journal/ r,
+  /var/log/journal/** r,
+  /run/log/journal/ r,
+  /run/log/journal/** r,
+  /etc/machine-id r,
+
+  # containerd socket for image operations
+  /run/k3s/containerd/containerd.sock rw,
+
+  # Docker config and cosign key for image verification (ImageConfig)
+  /etc/admission-controller/docker-config/** r,
+  /etc/admission-controller/cosign/cosign.pub r,
+
+  # No /run/chutes rules: nothing here reads it. EnvironmentFile=/run/chutes/validator-auth.env
+  # is read by PID 1 as root before the drop to User=, and the cosign key paths belong to
+  # AdmissionConfig, not this service.
+
+  # Helper binaries (sudoers-restricted)
+  /usr/local/bin/k3s-images-helper mrix,
+  # `tee disk` runs `sudo du` (directory sizes) and `sudo df` (filesystem usage). Both transition to
+  # the read-only disk_diag child profile (defined below) rather than inheriting this one: disk
+  # diagnostics need to reach ANY path — du walks arbitrary trees, df statfs's every mountpoint
+  # (journals/logs/cache blowing up is exactly the case you want to catch) — but the long-running
+  # FastAPI process must NOT get filesystem-wide read. Confining the broad-read reach to these two
+  # short-lived, read-only subprocesses keeps both goals.
+  /usr/bin/du cx -> disk_diag,
+  /usr/bin/df cx -> disk_diag,
+  /usr/bin/rm mrix,
+  /sbin/shutdown mrix,
+  /usr/bin/sudo mrix,
+  /usr/bin/systemctl mrix,
+  /usr/bin/journalctl mrix,
+  # `tee gpu` runs nvidia-smi (GPU status). It inherits this profile; its device deps are below.
+  /usr/bin/nvidia-smi mrix,
+
+  # System libraries
+  /usr/lib/** rm,
+  /usr/local/lib/** rm,
+  # sudo 1.9.15+ loads its plugins from /usr/libexec/sudo, not /usr/lib/sudo. Without this every
+  # sudo call dies with "libsudo_util.so.0: cannot open shared object file".
+  /usr/libexec/** rm,
+  /etc/ld.so.cache r,
+  /etc/ld.so.conf r,
+  /etc/ld.so.conf.d/** r,
+
+  # sudo reads login policy defaults (umask/env) here; harmless read-only config.
+  /etc/login.defs r,
+
+  # sudo logs each authorized command to the journal/syslog socket.
+  /dev/log w,
+  /run/systemd/journal/socket w,
+  /run/systemd/journal/dev-log w,
+
+  # Proc, sys, dev
+  @{PROC}/ r,
+  @{PROC}/** r,
+  @{sys}/** r,
+  /dev/null rw,
+  /dev/urandom r,
+  # NVIDIA device nodes for nvidia-smi (@{PROC}/** + @{sys}/** above cover /proc/driver/nvidia +
+  # /sys; /usr/lib/** covers the NVML libs).
+  /dev/nvidiactl rw,
+  /dev/nvidia[0-9]* rw,
+  /dev/nvidia-uvm rw,
+  /dev/nvidia-uvm-tools rw,
+  /dev/nvidia-modeset rw,
+  /dev/nvidia-caps/ r,
+  /dev/nvidia-caps/** rw,
+  owner @{PROC}/@{pid}/fd/ r,
+
+  # Temp files (HF downloads use tmp)
+  /tmp/ r,
+  /tmp/** rwlk,
+  owner /var/tmp/** rwlk,
+
+  # Network for API calls and model downloads
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+  network unix stream,
+  network unix dgram,
+
+  # System D-Bus. Two legitimate needs, both over the polkit-gated system bus:
+  #   - login1 (logind): `sudo /sbin/shutdown` requests the graceful poweroff from logind.
+  #   - systemd1 (the manager): `systemctl show <unit> --property=...` reads unit status for the
+  #     /status service-health endpoint.
+  # AppArmor mediates both the socket connect (file rule) and the method calls (abi 4.0), and that
+  # mediation is NOT relaxed by complain mode — so without these, both fail "Failed to connect to
+  # bus: Permission denied" even though sudo escalates fine.
+  #
+  # We deliberately do NOT grant /run/systemd/private (PID 1's private control socket, which
+  # BYPASSES polkit) — only the system bus, where a non-root caller's management methods stay
+  # polkit-gated. That keeps this profile from becoming a bypass-polkit control primitive if a
+  # sudo-allowlisted root command (cache-rm et al.) were ever abused.
+  /run/dbus/system_bus_socket rw,
+  dbus (send, receive) bus=system peer=(name=org.freedesktop.login1),
+  dbus (send, receive) bus=system peer=(name=org.freedesktop.systemd1),
+  dbus (send, receive) bus=system peer=(name=org.freedesktop.DBus),
+
+  # Subprocess spawning (download workers inherit this profile)
+  signal send peer=sek8s.system-manager,
+  signal receive peer=sek8s.system-manager,
+
+  # disk_diag child profile for `du`/`df` (see the `cx` rules above). Read-only reach across the
+  # whole filesystem so disk diagnostics can size/statfs any path — journals, logs, cache — but it
+  # can never write or exec. This deliberately does NOT widen the parent profile's read scope.
+  profile disk_diag flags=(enforce) {
+    include <abstractions/base>
+    /usr/bin/du mr,
+    /usr/bin/df mr,
+    # du/df only stat/list/statfs to compute sizes; r on dirs = list, r on files = stat. No write,
+    # no exec.
+    / r,
+    /** r,
+    # Crown-jewel secrets: du/df would only ever emit sizes, but deny read entirely so they cannot
+    # reveal even the existence or size of key material. `deny` overrides the /** r above. These are
+    # the per-VM ephemeral secrets and LUKS/credential material; the service reaches the few it
+    # legitimately needs via the PARENT profile's narrow grants, never through du/df.
+    # /run/chutes is hidden completely — the directory listing itself is denied, so du cannot even
+    # enumerate the secret category names, not just their sizes.
+    deny /run/chutes r,
+    deny /run/chutes/ r,
+    deny /run/chutes/** rwklx,
+    deny /etc/shadow r,
+    deny /etc/gshadow r,
+    deny /etc/tdx-luks.conf r,
+    deny /etc/admission-controller/certs/** rwklx,
+  }
+}

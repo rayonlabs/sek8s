@@ -11,9 +11,19 @@ Type=simple
 User=system-manager
 Group=tdx
 WorkingDirectory=/opt/sek8s
+# Never write .pyc into /opt/sek8s/src (RTMR3-measured, on the writable persistent root). Lazy
+# bytecode compilation at runtime would add files to the measured tree and drift RTMR3 on the next
+# boot. Subprocesses (e.g. the cache-download worker) inherit this, so they stay clean too.
+Environment="PYTHONDONTWRITEBYTECODE=1"
 EnvironmentFile=/etc/system-manager/system-manager.env
 # Miner credentials for cache pre-download; written at runtime by config-manager from config volume
 EnvironmentFile=/etc/system-manager/miner.env
+# Per-VM ephemeral validator auth (ALLOWED_VALIDATORS); written to /run/chutes/ by the
+# initramfs write-validator-auth script.  /run is a tmpfs moved from initramfs at boot,
+# so this file is fully ephemeral — it is never on the root filesystem and is cleared
+# automatically on every reboot.  If this file is missing the service will fail to start,
+# which is the correct safe-failure behaviour (means the initramfs script didn't run).
+EnvironmentFile=/run/chutes/validator-auth.env
 ExecStart=/opt/sek8s/venv/bin/python -m sek8s.services.manager
 Restart=always
 RestartSec=5

@@ -1,0 +1,42 @@
+---
+# Drop vestigial cloud-image machinery from the initramfs before it is built.
+#
+# The initramfs is measured into RTMR2, so anything inside it that varies between builds makes the
+# image non-reproducible and defeats the third-party verification inventory-reproduce.yml
+# documents. Two cloud-image features that sek8s does not use were doing exactly that:
+#
+#   overlayroot  writes a fresh /.random-seed into every initramfs. It also installs an
+#                init-bottom script that can mount an overlay over the root filesystem, and it
+#                sorts BEFORE rtmr3-measure — an unused root-remount mechanism sitting in the
+#                measured boot path ahead of the thing that measures the root. sek8s uses a
+#                LUKS-encrypted writable root and never an overlay.
+#   mdadm        bakes a generation timestamp into mdadm.conf. RAID is a HOST concern here
+#                (ansible/host/playbooks/storage-setup.yml builds md0 across the large disks); the
+#                guest is handed individual virtio-blk devices and never sees an array.
+#
+# Removing the hooks rather than the packages avoids any dependency risk, and is durable because
+# this runs immediately before the final update-initramfs — no apt operation follows it in the
+# build that could restore them.
+- name: Remove unused cloud-image initramfs hooks (per-build variability in a measured artifact)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    root="{{ newroot_mount }}"
+    root="${root%/}"
+    removed=0
+    for name in overlayroot mdadm; do
+      while IFS= read -r f; do
+        rm -f "$f"
+        echo "removed $f"
+        removed=$((removed + 1))
+      done < <(find "$root/usr/share/initramfs-tools" "$root/etc/initramfs-tools" \
+                    -type f -name "$name" 2>/dev/null)
+    done
+    echo "total removed: $removed"
+  args:
+    executable: /bin/bash
+  register: _initramfs_hook_removal
+  changed_when: true
+
+- name: Show which initramfs hooks were removed
+  ansible.builtin.debug:
+    var: _initramfs_hook_removal.stdout_lines

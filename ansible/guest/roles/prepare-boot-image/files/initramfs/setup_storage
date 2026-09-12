@@ -1,0 +1,681 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-bottom/setup_storage
+PREREQ="rtmr3-measure"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+. /scripts/luks-helpers
+. /scripts/provision-common
+
+# The initramfs stops udevd after mounting the root filesystem (local-bottom),
+# but leaves /run/udev/control behind.  libdevmapper sees this stale socket,
+# assumes udevd is alive, and creates SysV semaphore cookies on DM operations
+# — then deadlocks on semtimedop() waiting for a signal that never arrives.
+# Restart udevd so the cookie mechanism works and the udev database is properly
+# populated for systemd device discovery after pivot_root.
+/usr/lib/systemd/systemd-udevd --daemon 2>/dev/null || true
+
+# Configuration
+[ -f /etc/tdx-luks.conf ] && . /etc/tdx-luks.conf
+
+# Volume config: label is used for device detection and as API volume name; LUKS name defaults to label
+STORAGE_LABEL="${STORAGE_LABEL:-storage}"
+STORAGE_LUKS_NAME="${STORAGE_LUKS_NAME:-$STORAGE_LABEL}"
+CACHE_LABEL="${CACHE_LABEL:-tdx-cache}"
+CACHE_LUKS_NAME="${CACHE_LUKS_NAME:-$CACHE_LABEL}"
+
+# Global variables
+STORAGE_DEVICE=""
+STORAGE_KEY=""       # current passphrase (for luksOpen)
+STORAGE_KEY_NEXT=""  # next passphrase (rotation target)
+STORAGE_KEY_ADDED=0  # 1 if luksAddKey succeeded for storage this boot
+STORAGE_OLD_SLOTS="" # slot numbers present before luksAddKey; killed by number after confirm
+CACHE_DEVICE=""
+CACHE_KEY=""
+CACHE_KEY_NEXT=""
+CACHE_KEY_ADDED=0    # 1 if luksAddKey succeeded for cache this boot
+CACHE_OLD_SLOTS=""   # slot numbers present before luksAddKey; killed by number after confirm
+CONFIRM_NONCE=""     # one-time token returned by API for confirming rotation
+K3S_ENCRYPTION_KEY="" # base64-encoded secretbox key for k3s EncryptionConfiguration
+VM_NAME=""
+HOTKEY=""
+SUCCESS_FLAG=0
+
+# Function to securely clear sensitive data
+clear_sensitive_data() {
+    for var in STORAGE_KEY STORAGE_KEY_NEXT \
+               CACHE_KEY CACHE_KEY_NEXT \
+               CONFIRM_NONCE K3S_ENCRYPTION_KEY \
+               STORAGE_OLD_SLOTS CACHE_OLD_SLOTS; do
+        eval "if [ -n \"\${${var}}\" ]; then
+            ${var}=\"\$(head -c 1000 /dev/urandom 2>/dev/null | base64 | tr -d '\\n' | head -c 1000)\"
+            ${var}=\"\"
+            unset ${var}
+        fi"
+    done
+
+    # NB: the VM root CA (/run/chutes/vm-root-ca) is intentionally NOT removed
+    # here — setup_vm_tls owns its lifecycle and deletes ca.key before pivot_root.
+    rm -f /tmp/storage_response /tmp/luks_response /tmp/luks_key_cur \
+          /tmp/luks_key_nxt /tmp/luks_key_fb /tmp/luks_key_old \
+          /run/chutes/cert-hash
+
+    # If script exits without success flag, shutdown the VM
+    if [ "$SUCCESS_FLAG" -ne 1 ]; then
+        log_failure_msg "Storage setup failed - VM will shut down in 10 seconds..."
+        echo "STORAGE-SETUP-FAILED" > /dev/kmsg
+        sleep 10
+        poweroff -f
+    fi
+}
+
+trap clear_sensitive_data EXIT INT TERM
+
+log_begin_msg "Starting storage setup"
+
+# load_vm_data, provision_request, and write_k3s_encryption_config are sourced from
+# /scripts/provision-common (the shared init-bottom /provision flow).
+
+# ── Device detection ─────────────────────────────────────────────────────────
+
+detect_storage_device() {
+    log_begin_msg "Detecting storage device by label: $STORAGE_LABEL"
+
+    sleep 2
+
+    STORAGE_DEVICE=$(blkid -l -o device -t LABEL="$STORAGE_LABEL" 2>/dev/null)
+
+    if [ -z "$STORAGE_DEVICE" ]; then
+        log_begin_msg "Filesystem label not found, checking for LUKS devices"
+
+        for dev in $(blkid -o device 2>/dev/null); do
+            [ -b "$dev" ] || continue
+
+            if cryptsetup isLuks "$dev" 2>/dev/null; then
+                luks_label=$(cryptsetup luksDump "$dev" 2>/dev/null \
+                             | grep -E "^Label:" | sed 's/^Label:[[:space:]]*//')
+
+                log_begin_msg "Checking device $dev: label='$luks_label'"
+
+                if [ "$luks_label" = "$STORAGE_LABEL" ]; then
+                    STORAGE_DEVICE="$dev"
+                    log_success_msg "Found LUKS device with label: $STORAGE_DEVICE"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [ -z "$STORAGE_DEVICE" ]; then
+        log_failure_msg "No device found with label '$STORAGE_LABEL'"
+        log_failure_msg "Ensure the storage volume was created with create-cache.sh script"
+        return 1
+    fi
+
+    if [ ! -b "$STORAGE_DEVICE" ]; then
+        log_failure_msg "Device $STORAGE_DEVICE is not a block device"
+        return 1
+    fi
+
+    log_success_msg "Found storage device: $STORAGE_DEVICE"
+    return 0
+}
+
+detect_cache_device() {
+    log_begin_msg "Detecting cache device by label: $CACHE_LABEL"
+
+    CACHE_DEVICE=$(blkid -l -o device -t LABEL="$CACHE_LABEL" 2>/dev/null)
+
+    if [ -z "$CACHE_DEVICE" ]; then
+        log_begin_msg "Filesystem label not found, checking for LUKS devices with cache label"
+        for dev in $(blkid -o device 2>/dev/null); do
+            [ -b "$dev" ] || continue
+            if cryptsetup isLuks "$dev" 2>/dev/null; then
+                luks_label=$(cryptsetup luksDump "$dev" 2>/dev/null \
+                             | grep -E "^Label:" | sed 's/^Label:[[:space:]]*//')
+                if [ "$luks_label" = "$CACHE_LABEL" ]; then
+                    CACHE_DEVICE="$dev"
+                    log_success_msg "Found LUKS cache device: $CACHE_DEVICE"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [ -z "$CACHE_DEVICE" ]; then
+        log_failure_msg "No device found with label '$CACHE_LABEL' - cache is required for VM"
+        return 1
+    fi
+
+    if [ ! -b "$CACHE_DEVICE" ]; then
+        log_failure_msg "Device $CACHE_DEVICE is not a block device"
+        return 1
+    fi
+
+    log_success_msg "Found cache device: $CACHE_DEVICE"
+    return 0
+}
+
+# ── LUKS key sync (POST) ─────────────────────────────────────────────────────
+#
+# Fetches passphrases from the API.  The API always returns the rotation format
+# (top-level "volumes" object) for this VM version — response format is
+# determined by the VM's attestation measurements, which are fixed at image
+# build time.  A missing "volumes" key is treated as a fatal error.
+#
+# Passphrases are plain strings — protected by mTLS in transit and
+# Fernet-encrypted at rest in the API DB.  Boot-token wrapping was evaluated
+# and removed because mTLS makes in-transit interception unrealistic, and
+# API-process compromise has access to the boot token header regardless.
+
+post_sync_keys() {
+    local volumes_json="\"${STORAGE_LABEL}\",\"${CACHE_LABEL}\""
+
+    # The /provision POST (quote generation, headers, curl) lives in provision-common;
+    # it leaves the response at $PROVISION_RESPONSE. Parsing the rotation payload stays here.
+    provision_request "$volumes_json" || return 1
+    local response_file="$PROVISION_RESPONSE"
+
+    # The API always returns the rotation format for this VM version (determined
+    # by the attestation measurements fixed at image build time).  Any other
+    # response shape is a misconfiguration or API version mismatch — fail hard.
+    local has_volumes
+    has_volumes=$(jq -r 'if .volumes then "true" else "false" end' \
+                  "$response_file" 2>/dev/null)
+    if [ "$has_volumes" != "true" ]; then
+        rm -f "$response_file"
+        log_failure_msg "Unexpected API response format (missing 'volumes' — wrong API version?)"
+        return 1
+    fi
+
+    STORAGE_KEY=$(jq -r \
+        --arg lbl "$STORAGE_LABEL" '.volumes[$lbl].current // empty' \
+        "$response_file" 2>/dev/null)
+    STORAGE_KEY_NEXT=$(jq -r \
+        --arg lbl "$STORAGE_LABEL" '.volumes[$lbl].next // empty' \
+        "$response_file" 2>/dev/null)
+
+    CACHE_KEY=$(jq -r \
+        --arg lbl "$CACHE_LABEL" '.volumes[$lbl].current // empty' \
+        "$response_file" 2>/dev/null)
+    CACHE_KEY_NEXT=$(jq -r \
+        --arg lbl "$CACHE_LABEL" '.volumes[$lbl].next // empty' \
+        "$response_file" 2>/dev/null)
+
+    CONFIRM_NONCE=$(jq -r '.confirm_nonce // empty' "$response_file" 2>/dev/null)
+
+    # k3s secrets-encryption key (optional — absent means identity-only config)
+    K3S_ENCRYPTION_KEY=$(jq -r '.k3s_encryption_key // empty' \
+                         "$response_file" 2>/dev/null)
+
+    rm -f "$response_file"
+
+    # current=null means no passphrase exists in the API DB yet (first boot or
+    # volume never provisioned).  The VM knows its own disk state via cryptsetup
+    # isLuks; but we still need a key for the luksFormat path.  Promote next→current
+    # so the format and open paths both use STORAGE_KEY / CACHE_KEY uniformly.
+    if [ -z "$STORAGE_KEY" ]; then
+        STORAGE_KEY="$STORAGE_KEY_NEXT"
+        STORAGE_KEY_NEXT=""
+    fi
+    if [ -z "$CACHE_KEY" ]; then
+        CACHE_KEY="$CACHE_KEY_NEXT"
+        CACHE_KEY_NEXT=""
+    fi
+
+    log_success_msg "POST LUKS sync completed"
+    return 0
+}
+
+# ── Rotation helpers ─────────────────────────────────────────────────────────
+#
+# After luksOpen, add the next key slot, confirm with the API, then remove
+# the old key slot only if the API confirms it committed the new passphrase.
+# Using two separate operations (luksAddKey then luksRemoveKey) means the
+# volume always has at least one valid key regardless of crash timing.
+#
+# write_key_file, shred_key_file, luks_add_key, luks_remove_key are sourced
+# from /scripts/luks-helpers above.
+
+# POST to the confirm endpoint so the API promotes the pending passphrase to
+# current.  Returns 0 on HTTP 200, 1 on any failure.
+confirm_rotation() {
+    if [ -z "$CONFIRM_NONCE" ]; then
+        return 1
+    fi
+
+    local timeout="${TDX_TIMEOUT:-30}"
+    local ca_cert="/etc/ssl/certs/ca-certificates.crt"
+    local client_cert="/run/chutes/vm-root-ca/ca.crt"
+    local client_key="/run/chutes/vm-root-ca/ca.key"
+    local confirm_url
+    confirm_url="${TDX_BASE_URL}/servers/${VM_NAME}/provision/confirm"
+
+    local body
+    body="{\"volumes\":{"
+    body="${body}\"${STORAGE_LABEL}\":{\"rotated\":$([ "$STORAGE_KEY_ADDED" = "1" ] && echo true || echo false)},"
+    body="${body}\"${CACHE_LABEL}\":{\"rotated\":$([ "$CACHE_KEY_ADDED" = "1" ] && echo true || echo false)}"
+    body="${body}}}"
+
+    log_begin_msg "Confirming LUKS passphrase rotation"
+
+    # Miner-hotkey proof-of-possession over the chained confirm nonce: sr25519 over
+    # {ss58}:{CONFIRM_NONCE}:{sha256(body)}. X-Chutes-Nonce carries the same nonce as X-Confirm-Nonce.
+    local hk_hdr="" _hk_sig
+    _hk_sig=$(hotkey_sign "$CONFIRM_NONCE" "$body")
+    [ -n "$_hk_sig" ] && hk_hdr="-H X-Chutes-Signature:$_hk_sig"
+
+    local http_code resp_file=/tmp/confirm_response
+    http_code=$(curl -s -w "%{http_code}" \
+        -X POST \
+        -H "X-Confirm-Nonce: $CONFIRM_NONCE" \
+        -H "X-Chutes-Nonce: $CONFIRM_NONCE" \
+        -H "X-Chutes-Hotkey: $HOTKEY" \
+        ${hk_hdr} \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: TDX-LUKS-Storage/1.0" \
+        --max-time "$timeout" \
+        --retry 0 \
+        --cacert "$ca_cert" \
+        --cert "$client_cert" \
+        --key "$client_key" \
+        -d "$body" \
+        -o "$resp_file" \
+        "$confirm_url")
+
+    # The cert-hash scratch file is done after this call. Do NOT delete the VM
+    # root CA here — setup_vm_tls still needs ca.key to sign the attestation-proxy
+    # and registry leaf certs, and deletes it before pivot_root.
+    rm -f /run/chutes/cert-hash
+
+    # Last hotkey-signed API call is done — shred the stashed seed before init-bottom finishes, so
+    # it never survives the initramfs /run -> real-root /run move into userspace. Runs on both the
+    # success and failure paths below.
+    hotkey_shred_seed
+
+    if [ "$http_code" = "200" ]; then
+        rm -f "$resp_file"
+        log_success_msg "LUKS passphrase rotation confirmed by API"
+        return 0
+    fi
+
+    # Surface the API's own reason if it sent one (FastAPI `detail`; message/error too).
+    local api_msg
+    api_msg=$(jq -r '.detail // .message // .error // empty' "$resp_file" 2>/dev/null | tr '\n' ' ' | cut -c1-300)
+    rm -f "$resp_file"
+    log_failure_msg "LUKS rotation confirm failed (HTTP $http_code)${api_msg:+: $api_msg}"
+    return 1
+}
+
+# ── Track 1: Purge admin kubeconfig ─────────────────────────────────────────
+#
+# After luksOpen, temporarily mount the storage volume, remove the admin
+# kubeconfig (written there by k3s during the previous session), then unmount.
+# k3s regenerates the kubeconfig at runtime so this does not break cluster
+# operation.  The absence is then measured into RTMR3 so that attestation
+# verifiers can detect any boot that skips the purge.
+
+purge_admin_kubeconfig() {
+    local mnt="/run/storage-kubeconfig-purge"
+    local kubeconfig_subpath="rancher-config/k3s.yaml"
+
+    log_begin_msg "Purging admin kubeconfig from storage volume"
+
+    mkdir -p "$mnt"
+
+    if ! mount -t xfs "/dev/mapper/${STORAGE_LUKS_NAME}" "$mnt" 2>/dev/null; then
+        log_failure_msg "Failed to mount storage volume for kubeconfig purge"
+        umount "$mnt" 2>/dev/null || true
+        rmdir "$mnt" 2>/dev/null || true
+        return 1
+    fi
+
+    if [ -f "${mnt}/${kubeconfig_subpath}" ]; then
+        rm -f "${mnt}/${kubeconfig_subpath}"
+        log_success_msg "Admin kubeconfig purged from storage volume"
+    else
+        log_success_msg "Admin kubeconfig absent on storage (first boot or already purged)"
+    fi
+
+    # Check for the file AFTER the purge attempt, while the volume is still
+    # mounted.  If absent (the expected case) this is a no-op — RTMR3 is not
+    # extended and the baseline measurement is preserved.  If the file somehow
+    # still exists (purge failed), hash it and extend RTMR3 so that the
+    # attestation verifier sees a value that differs from the expected baseline
+    # and rejects the boot.  This is deterministic across all VMs because the
+    # expected state ("absent") produces no extension at all.
+    local purge_failed=0
+    if [ -f "${mnt}/${kubeconfig_subpath}" ]; then
+        purge_failed=1
+        local kubeconfig_hash
+        kubeconfig_hash=$(sha384sum "${mnt}/${kubeconfig_subpath}" 2>/dev/null \
+                          | awk '{print $1}')
+        log_failure_msg "Admin kubeconfig still present after purge attempt"
+        sync
+        umount "$mnt" 2>/dev/null || true
+        rmdir "$mnt" 2>/dev/null || true
+        if [ -n "$kubeconfig_hash" ]; then
+            if ! tdx-rtmr-extend --index 3 --data "$kubeconfig_hash" 2>/dev/null; then
+                log_failure_msg "FATAL: tdx-rtmr-extend failed — powering off"
+                echo "SETUP-STORAGE: tdx-rtmr-extend failed" > /dev/kmsg 2>/dev/null || true
+                sleep 5
+                poweroff -f
+            fi
+        fi
+        return 1
+    fi
+
+    sync
+    umount "$mnt" 2>/dev/null || true
+    rmdir "$mnt" 2>/dev/null || true
+
+    log_success_msg "Admin kubeconfig absent — RTMR3 baseline unchanged"
+    return 0
+}
+
+# ── Volume setup functions ───────────────────────────────────────────────────
+
+setup_storage() {
+    local is_encrypted=false
+
+    if cryptsetup isLuks "$STORAGE_DEVICE" 2>/dev/null; then
+        is_encrypted=true
+        log_begin_msg "Storage device is LUKS encrypted"
+    else
+        log_begin_msg "Storage device is NOT encrypted (first boot)"
+    fi
+
+    if [ "$is_encrypted" = "true" ]; then
+        if [ -z "$STORAGE_KEY" ]; then
+            log_failure_msg "No storage key available for unlock"
+            return 1
+        fi
+
+        log_begin_msg "Unlocking storage"
+        if ! printf '%s' "$STORAGE_KEY" | \
+               cryptsetup luksOpen "$STORAGE_DEVICE" "$STORAGE_LUKS_NAME" \
+               --key-file=- --batch-mode 2>/dev/null; then
+            log_failure_msg "Failed to unlock storage"
+            return 1
+        fi
+        log_success_msg "Storage unlocked"
+    else
+        log_begin_msg "Encrypting storage (first boot)"
+        if [ -z "$STORAGE_KEY" ]; then
+            log_failure_msg "No storage key available for encryption"
+            return 1
+        fi
+        wipefs -a "$STORAGE_DEVICE" || true
+        dd if=/dev/zero of="$STORAGE_DEVICE" bs=1M count=10 2>/dev/null || true
+        cryptsetup erase "$STORAGE_DEVICE" 2>/dev/null || true
+
+        log_begin_msg "Creating LUKS container with label..."
+        if ! printf '%s' "$STORAGE_KEY" | \
+               cryptsetup luksFormat --type luks2 --label "$STORAGE_LABEL" \
+               "$STORAGE_DEVICE" --key-file=- --batch-mode 2>/dev/null; then
+            log_failure_msg "Failed to create LUKS container"
+            return 1
+        fi
+
+        if ! printf '%s' "$STORAGE_KEY" | \
+               cryptsetup luksOpen "$STORAGE_DEVICE" "$STORAGE_LUKS_NAME" \
+               --key-file=- --batch-mode 2>/dev/null; then
+            log_failure_msg "Failed to open LUKS container"
+            return 1
+        fi
+        log_begin_msg "Formatting storage..."
+        if ! mkfs.xfs -L "$STORAGE_LABEL" "/dev/mapper/$STORAGE_LUKS_NAME"; then
+            log_failure_msg "Failed to format storage"
+            return 1
+        fi
+        # Freshly formatted with the promoted next→current passphrase: mark the key as
+        # applied this boot so confirm_rotation sends rotated=true. Without this the API
+        # would keep the old/null current and discard the passphrase we just formatted
+        # with, bricking the volume on the next boot. No rotation slot was added
+        # (STORAGE_KEY_NEXT is now empty), so finalize_rotation's slot cleanup is guarded
+        # off for this case.
+        STORAGE_KEY_ADDED=1
+        log_success_msg "Storage encrypted and formatted"
+    fi
+
+    # Track 1: Remove admin kubeconfig before any userspace touches the volume.
+    if ! purge_admin_kubeconfig; then
+        log_failure_msg "Admin kubeconfig purge or RTMR3 measurement failed"
+        return 1
+    fi
+
+    # Rotate passphrase: add next slot while current is still valid.
+    # luksRemoveKey for the old slot is deferred until the API confirms, so a
+    # crash between here and confirm always leaves the volume openable.
+    # Skip rotation entirely if the API did not provide a confirm_nonce — without
+    # it we cannot finalize, and adding a slot we can never confirm would leave
+    # the volume in a permanently dual-slot state.
+    if [ -n "$STORAGE_KEY_NEXT" ] && [ -n "$CONFIRM_NONCE" ]; then
+        STORAGE_OLD_SLOTS=$(cryptsetup luksDump --dump-json-metadata "$STORAGE_DEVICE" 2>/dev/null \
+            | jq -r '.keyslots | keys[]' 2>/dev/null | tr '\n' ' ')
+        log_begin_msg "Adding next storage key slot (rotation)"
+        if luks_add_key "$STORAGE_DEVICE" "$STORAGE_KEY" "$STORAGE_KEY_NEXT"; then
+            STORAGE_KEY_ADDED=1
+            log_success_msg "Next storage key slot added"
+        else
+            log_failure_msg "luksAddKey failed for storage (non-fatal, current slot unchanged)"
+        fi
+    elif [ -n "$STORAGE_KEY_NEXT" ]; then
+        log_failure_msg "Storage rotation key present but no confirm_nonce — skipping rotation"
+    fi
+
+    return 0
+}
+
+setup_cache() {
+    local is_encrypted=false
+
+    if cryptsetup isLuks "$CACHE_DEVICE" 2>/dev/null; then
+        is_encrypted=true
+        log_begin_msg "Cache device is LUKS encrypted"
+    else
+        log_begin_msg "Cache device is NOT encrypted (first boot)"
+    fi
+
+    if [ "$is_encrypted" = "true" ]; then
+        if [ -z "$CACHE_KEY" ]; then
+            log_failure_msg "No cache key available for unlock"
+            return 1
+        fi
+
+        log_begin_msg "Unlocking cache"
+        if ! printf '%s' "$CACHE_KEY" | \
+               cryptsetup luksOpen "$CACHE_DEVICE" "$CACHE_LUKS_NAME" \
+               --key-file=- --batch-mode 2>/dev/null; then
+            log_failure_msg "Failed to unlock cache"
+            return 1
+        fi
+        log_success_msg "Cache unlocked"
+    else
+        log_begin_msg "Encrypting cache (first boot)"
+        if [ -z "$CACHE_KEY" ]; then
+            log_failure_msg "No cache key available for encryption"
+            return 1
+        fi
+        wipefs -a "$CACHE_DEVICE" 2>/dev/null || true
+        dd if=/dev/zero of="$CACHE_DEVICE" bs=1M count=10 2>/dev/null || true
+        cryptsetup erase "$CACHE_DEVICE" 2>/dev/null || true
+        log_begin_msg "Creating LUKS cache container with label..."
+        if ! printf '%s' "$CACHE_KEY" | \
+               cryptsetup luksFormat --type luks2 --label "$CACHE_LABEL" \
+               "$CACHE_DEVICE" --key-file=- --batch-mode 2>/dev/null; then
+            log_failure_msg "Failed to create LUKS cache container"
+            return 1
+        fi
+        if ! printf '%s' "$CACHE_KEY" | \
+               cryptsetup luksOpen "$CACHE_DEVICE" "$CACHE_LUKS_NAME" \
+               --key-file=- --batch-mode 2>/dev/null; then
+            log_failure_msg "Failed to open LUKS cache container"
+            return 1
+        fi
+        log_begin_msg "Formatting cache..."
+        if ! mkfs.xfs -L "$CACHE_LABEL" "/dev/mapper/$CACHE_LUKS_NAME"; then
+            log_failure_msg "Failed to format cache"
+            return 1
+        fi
+        # See storage note above: mark fresh-format key applied so rotated=true is sent,
+        # preventing the API from discarding the passphrase we just formatted with.
+        CACHE_KEY_ADDED=1
+        log_success_msg "Cache encrypted and formatted"
+    fi
+
+    if [ -n "$CACHE_KEY_NEXT" ] && [ -n "$CONFIRM_NONCE" ]; then
+        CACHE_OLD_SLOTS=$(cryptsetup luksDump --dump-json-metadata "$CACHE_DEVICE" 2>/dev/null \
+            | jq -r '.keyslots | keys[]' 2>/dev/null | tr '\n' ' ')
+        log_begin_msg "Adding next cache key slot (rotation)"
+        if luks_add_key "$CACHE_DEVICE" "$CACHE_KEY" "$CACHE_KEY_NEXT"; then
+            CACHE_KEY_ADDED=1
+            log_success_msg "Next cache key slot added"
+        else
+            log_failure_msg "luksAddKey failed for cache (non-fatal, current slot unchanged)"
+        fi
+    elif [ -n "$CACHE_KEY_NEXT" ]; then
+        log_failure_msg "Cache rotation key present but no confirm_nonce — skipping rotation"
+    fi
+
+    return 0
+}
+
+# Called after confirm_rotation() succeeds or fails.
+#   confirmed=1: kill all pre-existing slots by number (removes the rotated-away slot and any
+#                stale slots from prior incomplete rotations); authorises with the new passphrase.
+#   confirmed=0: remove the newly-added slot by passphrase to revert to single-slot state.
+# Any failure powers off the VM to avoid leaving untracked key slots on the device.
+finalize_rotation() {
+    local confirmed="$1"
+    local f_auth slot
+
+    # The [ -n "$*_KEY_NEXT" ] guards distinguish a real rotation (next passphrase added
+    # as a new slot alongside the current one → OLD_SLOTS populated) from a fresh-format
+    # boot (KEY_ADDED=1 was set to send rotated=true, but the volume has a single slot and
+    # NEXT was promoted to empty). A fresh volume has no old slot to kill or added slot to
+    # revert, so it correctly skips both branches.
+    if [ "$confirmed" = "1" ]; then
+        if [ "$STORAGE_KEY_ADDED" = "1" ] && [ -n "$STORAGE_KEY_NEXT" ]; then
+            f_auth=$(write_key_file "$STORAGE_KEY_NEXT")
+            for slot in $STORAGE_OLD_SLOTS; do
+                if ! cryptsetup luksKillSlot --key-file="$f_auth" \
+                        "$STORAGE_DEVICE" "$slot" 2>/dev/null; then
+                    shred_key_file "$f_auth"
+                    handle_failure "storage key slot cleanup failed"
+                fi
+            done
+            shred_key_file "$f_auth"
+            log_success_msg "Storage key rotation complete"
+        fi
+        if [ "$CACHE_KEY_ADDED" = "1" ] && [ -n "$CACHE_KEY_NEXT" ]; then
+            f_auth=$(write_key_file "$CACHE_KEY_NEXT")
+            for slot in $CACHE_OLD_SLOTS; do
+                if ! cryptsetup luksKillSlot --key-file="$f_auth" \
+                        "$CACHE_DEVICE" "$slot" 2>/dev/null; then
+                    shred_key_file "$f_auth"
+                    handle_failure "cache key slot cleanup failed"
+                fi
+            done
+            shred_key_file "$f_auth"
+            log_success_msg "Cache key rotation complete"
+        fi
+    else
+        if [ "$STORAGE_KEY_ADDED" = "1" ] && [ -n "$STORAGE_KEY_NEXT" ]; then
+            log_begin_msg "Reverting storage key slot (confirm failed)"
+            luks_remove_key "$STORAGE_DEVICE" "$STORAGE_KEY_NEXT" \
+                && log_success_msg "Storage key slot reverted" \
+                || handle_failure "storage key slot rollback failed"
+        fi
+        if [ "$CACHE_KEY_ADDED" = "1" ] && [ -n "$CACHE_KEY_NEXT" ]; then
+            log_begin_msg "Reverting cache key slot (confirm failed)"
+            luks_remove_key "$CACHE_DEVICE" "$CACHE_KEY_NEXT" \
+                && log_success_msg "Cache key slot reverted" \
+                || handle_failure "cache key slot rollback failed"
+        fi
+    fi
+}
+
+# write_k3s_encryption_config is sourced from /scripts/provision-common (shared with
+# the debug setup_storage entry). Prod supplies $K3S_ENCRYPTION_KEY from the /provision
+# response; a missing key routes through handle_failure below (fail closed).
+
+handle_failure() {
+    local reason="$1"
+
+    log_failure_msg "Storage setup failed: $reason"
+    log_failure_msg "VM will shut down in 10 seconds..."
+
+    echo "STORAGE-SETUP-FAILED: $reason" > /dev/kmsg
+
+    clear_sensitive_data
+
+    sleep 10
+
+    poweroff -f
+}
+
+# ── Main execution ───────────────────────────────────────────────────────────
+
+main() {
+    if ! load_vm_data; then
+        handle_failure "Cannot proceed without VM ID"
+        return 1
+    fi
+
+    if ! detect_storage_device; then
+        handle_failure "No storage device found"
+        return 1
+    fi
+
+    if ! detect_cache_device; then
+        handle_failure "Cache device not found (required for VM)"
+        return 1
+    fi
+
+    if ! post_sync_keys; then
+        handle_failure "POST LUKS sync failed"
+        return 1
+    fi
+
+    if ! setup_storage; then
+        handle_failure "Failed to setup storage"
+        return 1
+    fi
+
+    if ! setup_cache; then
+        handle_failure "Failed to setup cache"
+        return 1
+    fi
+
+    # Write k3s encryption config to /run (tmpfs) so k3s can read it at startup.
+    if ! write_k3s_encryption_config; then
+        handle_failure "Failed to write k3s encryption config"
+        return 1
+    fi
+
+    # Confirm passphrase rotation with the API.
+    # On success: remove the old key slot (next is now the only valid slot).
+    # On failure: remove the newly added slot to revert to a clean single-slot state.
+    if [ -n "$CONFIRM_NONCE" ]; then
+        if confirm_rotation; then
+            finalize_rotation 1
+        else
+            finalize_rotation 0
+        fi
+    fi
+
+    SUCCESS_FLAG=1
+    clear_sensitive_data
+
+    log_success_msg "Storage and cache setup completed successfully"
+    return 0
+}
+
+# Run main
+main
+exit_code=$?
+
+log_end_msg $exit_code
+exit $exit_code

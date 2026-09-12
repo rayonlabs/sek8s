@@ -42,6 +42,14 @@
         group: root
         mode: '0644'
 
+    - name: Copy AppArmor verification dependency drop-in
+      ansible.builtin.copy:
+        src: files/k3s.service.d/apparmor-verify.conf
+        dest: /etc/systemd/system/k3s.service.d/apparmor-verify.conf
+        owner: root
+        group: root
+        mode: '0644'
+
     - name: Copy chroot restriction drop-in
       ansible.builtin.copy:
         src: files/k3s.service.d/chroot-restrictions.conf
@@ -74,15 +82,6 @@
         owner: root
         group: root
         mode: "0644"
-
-    - name: Copy debug encryption drop-in (copies build-time key to /run/chutes/ on boot)
-      ansible.builtin.copy:
-        src: files/k3s.service.d/debug-encryption.conf
-        dest: /etc/systemd/system/k3s.service.d/debug-encryption.conf
-        owner: root
-        group: root
-        mode: "0644"
-      when: debug_build | default(false)
 
     - name: Set sysctl parameters for mount security
       ansible.posix.sysctl:

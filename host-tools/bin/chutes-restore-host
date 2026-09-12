@@ -1,9 +1,0 @@
-#!/bin/bash
-# PATH-accessible wrapper to restore host CPU settings saved by chutes-tune-host.
-# Delegates to host-tools/scripts/restore-host.sh
-#
-# Installed as a symlink under /usr/local/bin; BASH_SOURCE is that path, so we
-# must resolve the real file under host-tools/bin before using ../scripts/...
-_SELF=$(readlink -f "${BASH_SOURCE[0]}")
-SCRIPT_DIR=$(cd -- "$(dirname -- "$_SELF")" && pwd)
-exec "${SCRIPT_DIR}/../scripts/restore-host.sh" "$@"

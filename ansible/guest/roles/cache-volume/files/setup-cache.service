@@ -4,7 +4,7 @@ Documentation=man:systemd.service(5)
 Requires=var-snap.mount
 After=var-snap.mount
 After=verify-cache-volume.service
-Before=k3s-agent.service
+Before=k3s.service
 # Without the HF cache we don't have enough room for model weights; shut down on failure
 OnFailure=poweroff.target
 

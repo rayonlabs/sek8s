@@ -1,0 +1,14 @@
+---
+# Accounts that must SURVIVE the "remove all non-system accounts (uid >= 1000)" sweep.
+#
+# Several sek8s service accounts are deliberately given uids ABOVE the system range so they sit
+# outside the distro's system-uid allocations — which makes the uid >= 1000 heuristic in that sweep
+# match them. They must be listed here or they are deleted, and because `userdel --remove` also
+# deletes the account's HOME, any of them homed under /opt/sek8s takes the whole application tree
+# (src/ + venv/) with it.
+#
+# ADD EVERY NEW SERVICE ACCOUNT WITH uid >= 1000 HERE.
+lock_accounts_preserve:
+  - nobody
+  - system-manager      # uid 10150, home /opt/sek8s
+  - chute-log-shipper   # uid 10151, home /opt/sek8s

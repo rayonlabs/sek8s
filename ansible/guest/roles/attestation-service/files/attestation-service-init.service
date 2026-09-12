@@ -8,9 +8,11 @@ Before=attestation-service.service
 Type=oneshot
 WorkingDirectory=/etc/attestation-service
 
-# Set up environment
+# Write runtime hostname into attestation-service.env.
+# TLS cert generation was moved into the RTMR2-measured initramfs (setup_vm_tls,
+# vm-tls role): the proxy server cert now arrives via the /run/chutes/proxy-tls
+# hostPath
 ExecStart=/etc/attestation-service/scripts/setup-environment.sh
-ExecStart=/etc/attestation-service/scripts/setup-tls-certs.sh
 
 # Only run if not already completed successfully
 RemainAfterExit=yes

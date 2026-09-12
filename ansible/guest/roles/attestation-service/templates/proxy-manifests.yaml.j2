@@ -80,19 +80,11 @@ subjects:
     apiGroup: rbac.authorization.k8s.io
 
 ---
-# Secret containing allowed validator hotkeys
-apiVersion: v1
-kind: Secret
-metadata:
-  name: validator-auth
-  namespace: attestation-system
-type: Opaque
-stringData:
-  # Comma-separated list of allowed validator SS58 addresses
-  allowed-validators: "{{ validator }}"
-
----
 # DaemonSet - runs on all control plane nodes
+# NOTE: The validator-auth Secret (ALLOWED_VALIDATORS) is NOT defined here.
+# It is created at runtime by cluster-init script 03-k3s-validator-auth.sh from
+# /run/chutes/validator-ss58 (per-VM ephemeral SS58 written by initramfs at boot).
+# This keeps the dynamic per-VM value out of the measured manifest directory.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -108,6 +100,8 @@ spec:
     metadata:
       labels:
         app: attestation-proxy
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/attestation-proxy: localhost/sek8s.attestation-proxy
     spec:
       serviceAccountName: attestation-proxy
       tolerations:
@@ -124,7 +118,7 @@ spec:
       # and fail its /health probe (503: unix socket unavailable). Gate on the real socket
       # file here so the proxy only starts once the UDS is actually bound.
       - name: wait-for-attestation-socket
-        image: bitnami/kubectl:latest
+        image: parachutes/busybox:{{ busybox_image_tag }}
         command:
         - /bin/sh
         - -c
@@ -200,6 +194,14 @@ spec:
             secretKeyRef:
               name: miner-credentials
               key: ss58
+        # Miner sr25519 seed for the release-candidate hotkey proof-of-possession. optional so
+        # the same image still runs on VMs whose secret predates the seed key.
+        - name: MINER_SEED
+          valueFrom:
+            secretKeyRef:
+              name: miner-credentials
+              key: seed
+              optional: true
         - name: ALLOWED_VALIDATORS
           valueFrom:
             secretKeyRef:
@@ -207,6 +209,11 @@ spec:
               key: allowed-validators
         - name: OPENBLAS_NUM_THREADS
           value: '1'
+        # The external port (8443) presents the initramfs-minted server cert
+        # (mounted from /run/chutes/proxy-tls via host-certs), which the
+        # validator pins to this VM's registered attestation CA. Validators
+        # authenticate with signed request headers, not a client cert, so
+        # client-cert mTLS (MTLS_REQUIRED) is intentionally NOT enabled here.
         securityContext:
           runAsNonRoot: true
           runAsUser: 1000
@@ -268,7 +275,11 @@ spec:
           type: Directory
       - name: host-certs
         hostPath:
-          path: /etc/attestation-service/certs
+          # Proxy server cert (server.{key,crt}) is minted in the RTMR2-measured
+          # initramfs by setup_vm_tls (vm-tls role) and written to this tmpfs
+          # path, signed by the per-boot VM root CA. Replaces the old userspace
+          # setup-tls-certs.sh generator that wrote /etc/attestation-service/certs.
+          path: /run/chutes/proxy-tls
           type: Directory
       - emptyDir:
           sizeLimit: 50Mi

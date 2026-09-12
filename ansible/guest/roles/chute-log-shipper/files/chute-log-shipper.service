@@ -1,0 +1,28 @@
+[Unit]
+Description=sek8s Chute Log Shipper (guest-side crash-log capture)
+# Needs k3s (CRI socket + pod logs). Registry mTLS leaf access (group + ordering
+# after the leaf-perms unit) is layered on by the vm-tls role's drop-in.
+After=network-online.target k3s.service
+Wants=network-online.target k3s.service
+
+[Service]
+Type=simple
+User=chute-log-shipper
+Group=chute-log-shipper
+WorkingDirectory=/opt/sek8s
+# Keep the RTMR3-measured /opt/sek8s/src tree free of runtime-written .pyc (see the note in
+# system-manager.service) so the measurement stays stable across reboots.
+Environment="PYTHONDONTWRITEBYTECODE=1"
+EnvironmentFile=/etc/chute-log-shipper/chute-log-shipper.env
+ExecStart=/opt/sek8s/venv/bin/python -m sek8s.services.log_shipper
+Restart=always
+RestartSec=5
+# Cursor persistence: systemd creates /var/lib/chute-log-shipper owned by User.
+StateDirectory=chute-log-shipper
+StateDirectoryMode=0750
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chute-log-shipper
+
+[Install]
+WantedBy=multi-user.target

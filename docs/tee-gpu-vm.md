@@ -54,10 +54,10 @@ cd ansible/guest
 ansible-playbook -i inventory.yml playbooks/tee-gpu-vm.yml
 ```
 
-The resulting image is written to:
+The resulting image set is written to its own directory:
 
 ```
-<img_dir>/<build_env>/<vm_version>.qcow2
+<img_dir>/<build_env>/<vm_version>/<vm_version>.qcow2   (+ .vmlinuz/.initrd/.cmdline, manifest.json)
 ```
 
 ### 3. Reset inventory after building
@@ -66,17 +66,17 @@ Clear `benchmark_build` and `benchmark_ssh_keys` before any subsequent non-TEE b
 
 ## Launching the VM
 
-Use `quick-launch.sh` with the `--benchmark` flag:
+Use `chutes-cvm guest launch` with the `--benchmark` flag:
 
 ```bash
 cd host-tools/scripts
 cp config/config.benchmark.example.yaml config.yaml
 # Edit config.yaml — at minimum set network.public_interface and network.vm_ip
-./quick-launch.sh config.yaml --benchmark
+chutes-cvm guest launch --benchmark config.yaml
 ```
 
 The `--benchmark` flag:
-- Sets the default base image to `tdx-guest-benchmark.qcow2`
+- Sets the default base image to the `tdx-guest-benchmark/` image set
 - Skips cache and config volume setup
 - Auto-installs and starts the `benchmark-netlog` service on the host
 - Skips miner credential validation (only hostname is checked)
@@ -207,7 +207,7 @@ luks-setup open /dev/vdb /data
 
 ## Host-side network logging
 
-When launched with `--benchmark`, `quick-launch.sh` installs and starts the
+When launched with `--benchmark`, `chutes-cvm guest launch` installs and starts the
 `benchmark-netlog` systemd service on the host. It uses `conntrack` to stream all
 connection events for the VM's bridge subnet, writing them to daily log files:
 

@@ -1,7 +1,0 @@
-/var/log/module-monitor.log {
-    weekly
-    rotate 2
-    compress
-    missingok
-    notifempty
-}

@@ -3,6 +3,14 @@
     path: /etc/system-manager/miner.env
     state: absent
 
+# On /run (tmpfs) so it never reaches the image regardless, but remove it explicitly to
+# match the miner.env pattern — the initramfs write-validator-auth script writes the real
+# per-VM auth here on every boot.
+- name: Remove build-time dummy validator-auth.env (initramfs writes real one at boot)
+  ansible.builtin.file:
+    path: /run/chutes/validator-auth.env
+    state: absent
+
 - name: Clean build artifacts
   ansible.builtin.file:
     path: "{{ item }}"

@@ -76,6 +76,69 @@
     - /tmp/tdx-rtmr-extend.c
     - /tmp/tdx-rtmr-extend
 
+# ── Install the shared measurement implementation ───────────────────────────
+# tdx-measure decides WHICH files are measured, in WHAT ORDER, and HOW each is hashed.
+# The initramfs measurer (via the hook), prepare-boot-image's manifest generator,
+# rtmr3-verify and the host-side measurement predictor all run this one script. Four
+# separate walkers of this conf used to exist and they disagreed four ways; keeping
+# exactly one is the fix. /usr/local/bin is RTMR3-measured, so the script is covered by
+# the measurement it produces.
+#
+# Source of truth is the chutes-cvm package, because that is the copy which must ship
+# standalone (bundled into the wheel, so a `pip install chutes-cvm` on a host can
+# predict a guest measurement with no checkout). The guest gets the same bytes copied
+# out of this checkout at build time — one authored file, not a vendored pair.
+
+- name: Remove immutable flag from tdx-measure (idempotency)
+  ansible.builtin.shell: chattr -i /usr/local/bin/tdx-measure 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Install tdx-measure
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/src/chutes-cvm/chutes_cvm/scripts/tdx-measure"
+    dest: /usr/local/bin/tdx-measure
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Set tdx-measure immutable
+  ansible.builtin.command: chattr +i /usr/local/bin/tdx-measure
+  changed_when: false
+
+# The Python half — the chain fold and a parser for tdx-measure's output. Installed to
+# /usr/local/lib (RTMR3-measured) rather than into the sek8s venv, because rtmr3-verify
+# runs on the system interpreter before k3s and /opt/sek8s/venv is outside the
+# measured-path list. Same file as the host-side predictor imports, for the same reason
+# as tdx-measure above.
+
+- name: Create /usr/local/lib/sek8s
+  ansible.builtin.file:
+    path: /usr/local/lib/sek8s
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Remove immutable flag from the rtmr3 helper module (idempotency)
+  ansible.builtin.shell: chattr -i /usr/local/lib/sek8s/rtmr3.py 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Install the rtmr3 helper module
+  ansible.builtin.copy:
+    src: "{{ repo_root }}/src/chutes-cvm/chutes_cvm/measurement/rtmr3.py"
+    dest: /usr/local/lib/sek8s/rtmr3.py
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Set the rtmr3 helper module immutable
+  ansible.builtin.command: chattr +i /usr/local/lib/sek8s/rtmr3.py
+  changed_when: false
+
 # ── Detect VM type from installed components ─────────────────────────────────
 # Rather than requiring an explicit flag, we detect the VM type from what other
 # roles have already installed.  setup-storage-bind-mounts.sh is only present
@@ -122,50 +185,19 @@
     group: root
     mode: '0644'
 
-# ── Compute and embed expected hashes for canonical files ────────────────────
-# Hashes are computed here (at build time) and written to
-# /etc/tdx-rtmr3-expected-hashes.  The hook copies that file into the
-# initramfs, so the constants are covered by RTMR1.  At boot the initramfs
-# verifies each canonical file's actual hash matches before extending RTMR3.
-
-- name: Remove immutable flag from /etc/tdx-rtmr3-expected-hashes (idempotency)
-  ansible.builtin.shell: chattr -i /etc/tdx-rtmr3-expected-hashes 2>/dev/null || true
-  args:
-    executable: /bin/bash
-  changed_when: false
-
-- name: Compute and write /etc/tdx-rtmr3-expected-hashes
-  ansible.builtin.shell: |
-    {
-      printf '# Expected SHA-384 hashes for canonical files verified at boot.\n'
-      printf '# Generated at image build time — baked into the initramfs (covered by RTMR1).\n'
-      printf '# Any mismatch at boot causes the VM to power off rather than boot\n'
-      printf '# with a potentially tampered verification tool.\n'
-      printf '# Format: <absolute-path> <sha384hex>\n'
-      printf '# /root/.ssh is intentionally absent: the partner SSH key is injected\n'
-      printf '# after this file is generated, so no build-time hash is available.\n'
-      printf '# It is measured into RTMR3 but not pre-verified here.\n'
-      # Read all paths from the installed conf, skipping comments and blank lines.
-      # /root/.ssh is excluded: its content is set by setup-ssh-access AFTER this
-      # task runs, so no stable build-time hash exists for it.
-      grep -v '^\s*#' /etc/tdx-measure.conf | grep -v '^\s*$' | grep -v '^/root/\.ssh$' | \
-      while IFS= read -r path; do
-        if [ -f "$path" ]; then
-          sha384sum "$path" | awk '{ print $2 " " $1 }'
-        elif [ -d "$path" ]; then
-          find "$path" -type f | sort | while IFS= read -r f; do
-            sha384sum "$f" | awk '{ print $2 " " $1 }'
-          done
-        fi
-      done
-    } > /etc/tdx-rtmr3-expected-hashes
-  args:
-    executable: /bin/bash
-  notify: update initramfs
-
-- name: Set /etc/tdx-rtmr3-expected-hashes immutable
-  ansible.builtin.command: chattr +i /etc/tdx-rtmr3-expected-hashes
-  changed_when: false
+# ── Expected hashes for canonical files: NOT generated here ──────────────────
+# This role owns only the BOOT-TIME side of RTMR3: the path list (/etc/tdx-measure.conf), the
+# initramfs hook, and the init-bottom verifier below. The canonical MANIFEST
+# (/etc/tdx-rtmr3-expected-hashes) is generated later, by the prepare-boot-image role
+# (roles/prepare-boot-image/tasks/generate-expected-hashes.yml), over the fully-assembled image
+# root — because several measured files reach their final on-disk content only in that stage:
+# /etc/fstab is rewritten to /dev/mapper by encryption, /root/.ssh is set by setup-ssh-access,
+# cleanup adds systemd drop-ins, /etc/tdx-luks.conf is written there. Hashing them HERE would bake
+# a stale hash (failing the boot pre-check) or force excluding privileged files (/root/.ssh,
+# /etc/fstab) from verification — the wrong trade-off. Hashing the FINAL root covers every measured
+# file in its true state, so nothing is excluded and offline tampering of any of them is caught at
+# boot. The hook below copies the manifest into the initramfs only `if [ -f ]`, so its absence here
+# is expected; prepare-boot-image writes it before the FINAL initramfs rebuild that embeds it (RTMR1).
 
 # ── Install initramfs hook and init-bottom script ────────────────────────────
 

@@ -258,7 +258,7 @@ typetest = ["mypy ; implementation_name == \"cpython\"", "pyright", "typing-exte
 
 [[package]]
 name = "attestation-proxy"
-version = "0.3.1"
+version = "0.3.2"
 description = "Dual-port attestation proxy for sek8s"
 optional = false
 python-versions = ">=3.12,<3.15"
@@ -850,6 +850,25 @@ files = [
     {file = "charset_normalizer-3.4.4-py3-none-any.whl", hash = "sha256:7a32c560861a02ff789ad905a2fe94e3f840803362c84fecf1851cb4cf3dc37f"},
     {file = "charset_normalizer-3.4.4.tar.gz", hash = "sha256:94537985111c35f28720e43603b8e7b43a6ecfb2ce1d3058bbe955b73404e21a"},
 ]
+
+[[package]]
+name = "chutes-cvm"
+version = "0.1.0"
+description = "CLI and toolkit for operating Chutes confidential GPU VMs (host inspection, launch, attestation preflight, measurement generation)"
+optional = false
+python-versions = ">=3.12,<3.15"
+groups = ["main"]
+files = []
+develop = true
+
+[package.dependencies]
+pydantic-settings = "^2.10.0"
+pyyaml = "^6.0.2"
+substrate-interface = "^1.7.11"
+
+[package.source]
+type = "directory"
+url = "src/chutes-cvm"
 
 [[package]]
 name = "click"
@@ -3838,7 +3857,7 @@ test = ["coverage", "pytest"]
 
 [[package]]
 name = "sek8s"
-version = "0.3.1"
+version = "0.4.0"
 description = "GPU infrastructure for Chutes miners and zero-trust workloads"
 optional = false
 python-versions = ">=3.12,<3.15"
@@ -4560,4 +4579,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.15"
-content-hash = "72e07805f45c2a7c355b1c9f4512bfd5d3ac54ce6487caa80caa6b6336b616b3"
+content-hash = "74dabc335dd288ee1ad266b6f58ef8b5b5f08b52b04c2471e9541e2cacd1366f"

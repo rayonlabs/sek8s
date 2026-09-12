@@ -84,7 +84,7 @@ class TestAdmissionConfig:
             "docker.io",
             "gcr.io",
             "quay.io",
-            "localhost:30500",
+            "registry.chutes.ai",
         ]
         assert config.enforcement_mode == "enforce"
         assert config.debug is False
@@ -323,7 +323,7 @@ class TestCosignConfig:
         assert default_registry.require_signature is True
         assert default_registry.verification_method == "key"
         assert default_registry.public_key == Path(
-            "/etc/admission-controller/.cosign/cosign.pub"
+            "/run/chutes/signing-keys/cosign/chutes.pub"
         )
 
     def test_cosign_config_from_env(self):

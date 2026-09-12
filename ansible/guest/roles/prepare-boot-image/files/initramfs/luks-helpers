@@ -1,0 +1,58 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/luks-helpers
+# Shared LUKS key-management helpers sourced by fetch_key_and_unlock (init-premount)
+# and setup_storage (init-bottom).  Not executed directly.
+
+# Write a passphrase string to a temp file with restricted permissions.
+# Caller must remove the file when done.
+write_key_file() {
+    local key="$1"
+    local tmpfile
+    tmpfile=$(mktemp /tmp/luks_key_XXXXXXXX)
+    chmod 600 "$tmpfile"
+    printf '%s' "$key" > "$tmpfile"
+    printf '%s' "$tmpfile"
+}
+
+# Securely erase and delete a temp key file.
+shred_key_file() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    dd if=/dev/urandom of="$f" bs=1 count="$(wc -c < "$f")" conv=notrunc 2>/dev/null || true
+    rm -f "$f"
+}
+
+# Add a new key slot to a LUKS device.  current_key authenticates the
+# operation; next_key is the new passphrase to add.
+# Returns 0 on success, 1 on failure.
+luks_add_key() {
+    local device="$1"
+    local current_key="$2"
+    local next_key="$3"
+
+    local f_cur f_nxt
+    f_cur=$(write_key_file "$current_key")
+    f_nxt=$(write_key_file "$next_key")
+
+    cryptsetup luksAddKey "$device" "$f_nxt" --key-file="$f_cur" 2>/dev/null
+    local rc=$?
+
+    shred_key_file "$f_cur"
+    shred_key_file "$f_nxt"
+    return $rc
+}
+
+# Remove a key slot matching the given passphrase.
+luks_remove_key() {
+    local device="$1"
+    local old_key="$2"
+
+    local f_old
+    f_old=$(write_key_file "$old_key")
+
+    cryptsetup luksRemoveKey "$device" --key-file="$f_old" 2>/dev/null
+    local rc=$?
+
+    shred_key_file "$f_old"
+    return $rc
+}

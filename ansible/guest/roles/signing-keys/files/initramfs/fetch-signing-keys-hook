@@ -1,0 +1,30 @@
+#!/bin/sh
+# /etc/initramfs-tools/hooks/fetch-signing-keys
+#
+# Stages the root RSA public key and signing-keys.conf into the initramfs.
+# curl, jq, base64, and openssl (the RSA verifier) are already copied in by the
+# luks fetch_key hook, so this hook only adds the trust anchor and its config.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Root RSA public key (PEM) — trust anchor for all dynamically-fetched leaf keys.
+if [ -f /etc/chutes/root-signing-key.pem ]; then
+    mkdir -p "$DESTDIR/etc/chutes"
+    cp /etc/chutes/root-signing-key.pem "$DESTDIR/etc/chutes/root-signing-key.pem"
+    chmod 644 "$DESTDIR/etc/chutes/root-signing-key.pem"
+else
+    echo "fetch-signing-keys-hook: WARNING: /etc/chutes/root-signing-key.pem not found" >&2
+fi
+
+# API URL config for the fetch script.
+if [ -f /etc/chutes/signing-keys.conf ]; then
+    mkdir -p "$DESTDIR/etc/chutes"
+    cp /etc/chutes/signing-keys.conf "$DESTDIR/etc/chutes/signing-keys.conf"
+    chmod 644 "$DESTDIR/etc/chutes/signing-keys.conf"
+else
+    echo "fetch-signing-keys-hook: WARNING: /etc/chutes/signing-keys.conf not found" >&2
+fi

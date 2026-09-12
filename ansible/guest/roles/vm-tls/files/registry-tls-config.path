@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for the registry mTLS leaf cert
+# Omit default paths.target ordering to avoid cycles, mirroring k3s-ctr-socket.path.
+DefaultDependencies=no
+After=systemd-remount-fs.service
+
+[Path]
+# Minted by the initramfs setup_vm_tls script; appears on the /run tmpfs after pivot_root.
+PathExists=/run/chutes/registry-tls/client.key
+
+[Install]
+WantedBy=multi-user.target

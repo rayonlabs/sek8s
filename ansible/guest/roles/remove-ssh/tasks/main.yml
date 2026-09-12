@@ -34,10 +34,34 @@
     state: absent
   failed_when: false
 
-- name: Remove sudo to prevent privilege escalation
+# sudo stays installed: system-manager needs it for the three commands allowlisted in
+# /etc/sudoers.d/system-manager (shutdown, du, cache-rm). What matters is that no ACCOUNT can
+# escalate, which is enforced here rather than by deleting the package.
+- name: Remove sudo-ldap
   ansible.builtin.package:
     name:
-      - sudo
       - sudo-ldap
     state: absent
   failed_when: false
+
+- name: Strip sudo access from every account except the system-manager allowlist
+  ansible.builtin.shell: |
+    set -uo pipefail
+    find /etc/sudoers.d -type f ! -name README ! -name system-manager -print -delete
+    for g in sudo admin; do
+      getent group "$g" >/dev/null 2>&1 || continue
+      members=$(getent group "$g" | cut -d: -f4 | tr , " ")
+      for u in $members; do
+        [ -n "$u" ] && gpasswd -d "$u" "$g" >/dev/null 2>&1 || true
+      done
+    done
+    echo "remaining sudoers.d:"
+    ls /etc/sudoers.d
+  args:
+    executable: /bin/bash
+  register: _sudo_strip
+  changed_when: true
+
+- name: Show remaining sudo access
+  ansible.builtin.debug:
+    var: _sudo_strip.stdout_lines

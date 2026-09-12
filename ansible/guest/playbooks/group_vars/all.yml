@@ -1,6 +1,10 @@
 ---
 # Common variables for all hosts
 
+# Checkout root. In `all` (not `host`) scope so roles running in the `vm` plays resolve
+# control-host paths too — they read files from this checkout via `copy: src=`.
+repo_root: "{{ playbook_dir }}/../../.."
+
 # Build control
 no_cache: "{{ lookup('env', 'NO_CACHE') | default('false', true) | lower }}"
 
@@ -47,7 +51,9 @@ ubuntu_minor: "04"
 # baseline. Pinning it to an exact version makes the guest kernel reproducible and
 # bumps deliberate. Trade-off: opts out of automatic HWE kernel security updates.
 # MUST stay >= 6.16 (RTMR3 depends on the tsm-mr sysfs interface merged in 6.16).
-guest_hwe_kernel_version: "6.17.0-35.35~24.04.1"
+# Expires: the pocket keeps only the newest HWE ABI, so a superseded pin stops resolving. Current
+# version: people.canonical.com/~ubuntu-archive/madison.cgi?package=linux-image-generic-hwe-24.04
+guest_hwe_kernel_version: "7.0.0-31.31~24.04.1"
 # CUDA version - leave as-is unless skipping CUDA entirely (skip_cuda: true) for providers with pre-installed drivers
 cuda_version: "13-2"
 # NVIDIA driver branch
@@ -75,14 +81,10 @@ ipv6_enabled: true
 
 # Module Security Configuration
 enable_module_security: true
-enable_module_signing: true
 
 # Attestation settings
-attestation_endpoint: "{{ lookup('env', 'ATTESTATION_ENDPOINT') | default('https://api.example.com/attestation', true) }}"
-attestation_interval: 300  # 5 minutes
 
 # Module monitoring
-module_monitoring_enabled: true
 alert_on_unsigned_modules: true
 alert_on_tainted_kernel: true
 

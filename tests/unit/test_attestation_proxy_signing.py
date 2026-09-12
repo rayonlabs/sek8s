@@ -1,10 +1,17 @@
 """Unit tests for attestation_proxy.signing and X-Signature header injection."""
 
 import base64
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from attestation_proxy.signing import load_private_key, sign_response_body
+from attestation_proxy.signing import (
+    HOTKEY_SIGNING_PURPOSE,
+    load_miner_keypair,
+    load_private_key,
+    sign_response,
+    sign_response_body,
+)
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import (
@@ -46,7 +53,7 @@ def _make_proxy_config():
     return config
 
 
-def _make_server(server_class, private_key=None):
+def _make_server(server_class, private_key=None, miner_keypair=None):
     """Construct a proxy server instance bypassing __init__ and inject attrs."""
     shared = MagicMock()
     shared.consecutive_socket_failures = 0
@@ -57,8 +64,19 @@ def _make_server(server_class, private_key=None):
     server.shared = shared
     server.server_name = server_class.__name__.upper()
     server._private_key = private_key
+    server._miner_keypair = miner_keypair
     server.app = MagicMock()
     return server
+
+
+# 32-byte hex seed for a deterministic sr25519 keypair in tests (never a real miner seed).
+_TEST_SEED = "0x" + "ab" * 32
+
+
+def _make_test_keypair():
+    from substrateinterface import Keypair
+
+    return Keypair.create_from_seed(_TEST_SEED)
 
 
 # ---------------------------------------------------------------------------
@@ -265,22 +283,201 @@ async def test_proxy_request_strips_upstream_server_header_internal():
     assert "server" not in {k.lower() for k in response.headers.keys()}
 
 
+# ---------------------------------------------------------------------------
+# Miner-hotkey proof-of-possession signing
+# ---------------------------------------------------------------------------
+
+
+def test_load_miner_keypair_none_seed():
+    assert load_miner_keypair(None) is None
+    assert load_miner_keypair("") is None
+
+
+def test_load_miner_keypair_invalid_seed():
+    assert load_miner_keypair("not-a-valid-seed") is None
+
+
+def test_load_miner_keypair_from_seed():
+    keypair = load_miner_keypair(_TEST_SEED)
+    assert keypair is not None
+    assert keypair.ss58_address == _make_test_keypair().ss58_address
+
+
+def test_sign_response_round_trip():
+    from substrateinterface import Keypair
+
+    keypair = _make_test_keypair()
+    ss58, nonce, signature = sign_response(keypair)
+
+    assert ss58 == keypair.ss58_address
+    assert nonce.isdigit()
+    message = f"{ss58}:{nonce}:{HOTKEY_SIGNING_PURPOSE}"
+    # Verify exactly as the validator's rc gate does (hex signature over the string message).
+    assert Keypair(ss58_address=ss58).verify(message, bytes.fromhex(signature))
+
+
 @pytest.mark.asyncio
-async def test_proxy_request_strips_upstream_server_header_external(rsa_key):
-    """Same guarantee holds for the external (signed) proxy path."""
+async def test_proxy_request_does_not_add_hotkey_headers(rsa_key):
+    """The shared proxy path signs the body but must not mint the bearer PoP.
+
+    The PoP is attached per endpoint via @attach_hotkey_headers, so a route that does not need
+    it cannot inherit a credential. See test_proxy_hotkey_pop_scope.py.
+    """
     from attestation_proxy.service import ExternalProxyServer
 
-    server = _make_server(ExternalProxyServer, private_key=rsa_key)
+    keypair = _make_test_keypair()
+    server = _make_server(
+        ExternalProxyServer, private_key=rsa_key, miner_keypair=keypair
+    )
     server.shared.http_client.request = AsyncMock(
-        return_value=_make_httpx_response_with_server_header(content=b"body")
+        return_value=_make_httpx_response(content=b"body")
     )
 
     response = await server.proxy_request(
         target_url="http://fake-upstream",
         method="GET",
-        path="/server/devices",
+        path="/service/chute-service-x/verify",
         headers={},
         body=b"",
     )
 
-    assert "server" not in {k.lower() for k in response.headers.keys()}
+    lower = {k.lower() for k in response.headers}
+    assert "x-signature" in lower  # body signature is bound to what it signs and stays
+    assert not lower & {"x-chutes-hotkey", "x-chutes-nonce", "x-chutes-signature"}
+
+
+@pytest.mark.asyncio
+async def test_attach_hotkey_headers_signs_the_expected_message(rsa_key):
+    """The decorator produces a proof the validator can verify."""
+    from attestation_proxy.service import ExternalProxyServer
+    from substrateinterface import Keypair
+
+    keypair = _make_test_keypair()
+    server = _make_server(
+        ExternalProxyServer, private_key=rsa_key, miner_keypair=keypair
+    )
+    server.shared.unix_client = AsyncMock()
+    server.shared.unix_client.request = AsyncMock(
+        return_value=_make_httpx_response(content=b"body")
+    )
+    server.extract_client_cert_info = MagicMock(return_value={})
+
+    request = MagicMock()
+    request.method = "GET"
+    request.body = AsyncMock(return_value=b"")
+    request.query_params = {}
+    request.headers = {}
+
+    response = await server.proxy_to_host_service_authenticated(
+        "attest", request, _auth=True
+    )
+
+    lower = {k.lower(): v for k, v in response.headers.items()}
+    assert lower["x-chutes-hotkey"] == keypair.ss58_address
+    assert lower["x-chutes-nonce"].isdigit()
+    message = (
+        f"{keypair.ss58_address}:{lower['x-chutes-nonce']}:{HOTKEY_SIGNING_PURPOSE}"
+    )
+    assert Keypair(ss58_address=keypair.ss58_address).verify(
+        message, bytes.fromhex(lower["x-chutes-signature"])
+    )
+
+
+def test_error_detail_is_exposed_only_on_validator_only_routes():
+    """Upstream error text may go to the validator, never to a chute or the miner.
+
+    An httpx error carries the address it was dialling. The gate is per ROUTE, not per
+    port, because port is the wrong granularity: the external app also serves
+    `/server/health` with no authentication at all, and `/server/devices` with
+    `allow_miner=True` -- the miner being the party the guest keeps tenants from. So the
+    invariant is that a handler opts into `expose_errors=True` only if its own
+    `authorize(...)` admits the validator and nobody else.
+
+    Checked on the AST rather than by grep so renaming a handler cannot quietly drop it
+    out of the check.
+    """
+    import ast
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "src/attestation-proxy/attestation_proxy/service.py"
+    ).read_text()
+    tree = ast.parse(source)
+
+    def authorize_kwargs(fn):
+        """The authorize(...) kwargs on a handler's dependencies, if any."""
+        for arg in list(fn.args.args) + list(fn.args.kwonlyargs):
+            pass
+        for default in fn.args.defaults + [d for d in fn.args.kw_defaults if d]:
+            for node in ast.walk(default):
+                if (
+                    isinstance(node, ast.Call)
+                    and getattr(node.func, "id", None) == "authorize"
+                ):
+                    return {
+                        kw.arg: getattr(kw.value, "value", None) for kw in node.keywords
+                    }
+        return None
+
+    exposing = set()
+    handlers = {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        handlers[fn.name] = fn
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and any(
+                kw.arg == "expose_errors"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                exposing.add(fn.name)
+
+    assert exposing, "no handler exposes error detail; the gate has been removed"
+
+    for name in exposing:
+        auth = authorize_kwargs(handlers[name])
+        assert auth is not None, f"{name} exposes error detail but has no authorize()"
+        assert (
+            auth.get("allow_validator") is True
+        ), f"{name} does not admit the validator"
+        assert not auth.get(
+            "allow_miner"
+        ), f"{name} exposes upstream error detail to the miner"
+
+
+def test_error_detail_is_never_interpolated_directly_into_a_response():
+    """Every error body must route through _error_detail, not format the exception.
+
+    The gate only works if nothing bypasses it. A handler that builds its own
+    f"...{e}" would return upstream text regardless of the route's authorisation, which
+    is exactly the shape this finding was about.
+    """
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "src/attestation-proxy/attestation_proxy/service.py"
+    ).read_text()
+
+    for line in source.splitlines():
+        stripped = line.strip()
+        if "detail=" not in stripped or "_error_detail" in stripped:
+            continue
+        assert (
+            "{e}" not in stripped and "str(e)" not in stripped
+        ), f"error detail bypasses the route gate: {stripped}"
+
+    assert "request.url.path" not in source, "the 404 handler must not reflect the path"
+
+
+def test_error_detail_helper_respects_the_flag():
+    from attestation_proxy.service import BaseProxyServer
+
+    upstream = RuntimeError("dialling http://chute-abc123.chutes.svc:8002/probe")
+    assert (
+        BaseProxyServer._error_detail("Upstream unavailable", upstream, False)
+        == "Upstream unavailable"
+    )
+    assert "chute-abc123" in BaseProxyServer._error_detail(
+        "Upstream unavailable", upstream, True
+    )

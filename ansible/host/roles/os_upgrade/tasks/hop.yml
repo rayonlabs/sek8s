@@ -2,14 +2,21 @@
 # Common OS upgrade hop skeleton. Called by upgrade-host.yml for each entry in
 # _upgrade_hops with _next_version set by the loop.
 #
-# Version-specific hooks follow the naming convention:
-#   roles/os_upgrade/tasks/pre_<major><minor>.yml   — before do-release-upgrade
-#   roles/os_upgrade/tasks/post_<major><minor>.yml  — after do-release-upgrade, BEFORE reboot
+# Version-specific hooks. pre_/post_ are keyed on the SOURCE version (the one
+# being upgraded away from); init_ is keyed on the TARGET version (the one just
+# booted into), since it initializes the new OS. For a 25.10 -> 26.04 hop that
+# means pre_2510 / post_2510 and init_2604:
+#   roles/os_upgrade/tasks/pre_<major><minor>.yml   — before do-release-upgrade (source ver)
+#   roles/os_upgrade/tasks/post_<major><minor>.yml  — after do-release-upgrade, BEFORE reboot (source ver)
+#   roles/os_upgrade/tasks/init_<major><minor>.yml  — on the new OS after reboot,
+#                                                     BEFORE chutes-cvm host setup (target ver, final hop only)
 #
-# Both are silently skipped when no file exists for the current version.
-# post_ hooks are the right place for fixes that must be in place before the
-# first boot into the new OS (e.g. systemd unit overrides). After reboot,
-# setup-tdx-host (via host_prerequisites + tdx_bootstrap) owns full OS state.
+# All are silently skipped when no file exists for the relevant version.
+# post_ hooks are for fixes that must be in place before the first boot into the
+# new OS (e.g. systemd unit overrides). init_ hooks run on the upgraded OS before
+# chutes-cvm host setup, for state that must exist before it runs (e.g. restoring
+# artifacts a pre_ hook removed). chutes-cvm host setup (via host_prerequisites +
+# tdx_bootstrap) then owns full OS state.
 
 - name: "-> {{ _next_version }}: check free disk space on /"
   ansible.builtin.shell: |
@@ -118,8 +125,22 @@
       {{ ansible_facts['distribution_version'] }}.
       do-release-upgrade output: {{ _upgrade_result.stdout | default('') }}
 
+# ── Version-specific init hook (new OS, before chutes-cvm host setup, final hop) ───
+# Runs on the upgraded OS after the reboot but before chutes-cvm host setup, so any
+# artifacts a pre_ hook removed can be put back before chutes-cvm host setup reinstalls
+# and (re)starts the affected services. Final hop only — intermediate hops do
+# not run chutes-cvm host setup.
+
+- name: "-> {{ _next_version }}: run init tasks for {{ _next_version }} on new OS"
+  ansible.builtin.include_tasks: "{{ item }}"
+  with_first_found:
+    - files:
+        - "init_{{ _next_version | replace('.', '') }}.yml"
+      skip: true
+  when: _next_version == _upgrade_hops | last
+
 # ── Re-provision for new OS (final hop only) ──────────────────────────────
-# Run setup-tdx-host via the same roles used by setup.yml so the host lands
+# Run chutes-cvm host setup via the same roles used by setup.yml so the host lands
 # in an identical state to a freshly provisioned machine: Intel DCAP repo,
 # attestation packages, correct kernel selected, TDX verified in dmesg.
 # PCCS config and chutes_dirs survive the OS upgrade and are not re-run here.
@@ -132,7 +153,7 @@
     name: host_prerequisites
   when: _next_version == _upgrade_hops | last
 
-- name: "-> {{ _next_version }}: run setup-tdx-host for new OS profile"
+- name: "-> {{ _next_version }}: run chutes-cvm host setup for new OS profile"
   ansible.builtin.include_role:
     name: tdx_bootstrap
   when: _next_version == _upgrade_hops | last

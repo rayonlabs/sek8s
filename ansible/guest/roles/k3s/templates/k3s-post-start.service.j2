@@ -3,6 +3,12 @@ Description=k3s post-start setup scripts
 Documentation=man:k3s(1)
 Requires=k3s.service
 After=k3s.service
+# Rate limiting lives in [Unit] on modern systemd. These were previously in
+# [Service] under their legacy names, where they are parsed as unknown keys and
+# silently ignored — a failing post-start restarted forever instead of giving up
+# after 3 tries and surfacing the failure.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=notify
@@ -13,17 +19,24 @@ Group=root
 ExecStart=/usr/local/bin/k3s-post-start.sh
 
 # Restart policy - only restart on failure, not on clean exit
+# (StartLimitIntervalSec/StartLimitBurst are in [Unit] above.)
 Restart=on-failure
 RestartSec=30
-StartLimitInterval=300
-StartLimitBurst=3
 
 # Timeout settings
-TimeoutStartSec=600
+# The unit stays in `activating` until every step script has run, so the start
+# timeout has to cover the worst case the wrapper itself allows: 9 steps bounded
+# at MAX_SCRIPT_TIMEOUT=300s each, plus slack. A genuinely wedged wrapper is
+# caught far sooner by WatchdogSec below, so this is a ceiling, not the detector.
+TimeoutStartSec=3000
 TimeoutStopSec=60
 
-# Watchdog settings - script will send keepalives
-WatchdogSec=120
+# Watchdog settings - the wrapper sends keepalives every WATCHDOG_PING_INTERVAL
+# (30s), including while a step script runs. Keep this above MAX_SCRIPT_TIMEOUT
+# (300s) anyway: if a keepalive is ever dropped, a slow-but-healthy step must not
+# be killed mid-run — that failure mode restart-loops the VM, because the step's
+# completion marker is only written when it finishes.
+WatchdogSec=360
 NotifyAccess=main
 
 # Environment (Helm paths under ReadWritePaths so helm works with ProtectHome=true)

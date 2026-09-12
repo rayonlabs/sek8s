@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "sek8s"
-version = "0.3.1"
+version = "0.4.0"
 description = "GPU infrastructure for Chutes miners and zero-trust workloads"
 authors = ["Kyle Widmann <kyle@chutes.ai>"]
 readme = "README.md"
@@ -34,6 +34,7 @@ sek8s-common = {path = "../sek8s-common", develop = true}
 admission-controller = 'sek8s.services.admission_controller:run'
 attestation-service = 'sek8s.services.attestation:run'
 system-manager = 'sek8s.services.manager:run'
+chute-log-shipper = 'sek8s.services.log_shipper:run'
 
 [build-system]
 requires = ["poetry-core"]

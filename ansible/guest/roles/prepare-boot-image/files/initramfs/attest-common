@@ -1,0 +1,467 @@
+# /etc/initramfs-tools/scripts/attest-common
+#
+# Shared boot-attestation flow, sourced by the prod and debug init-premount entry
+# scripts. This is the identical implementation for both — CA generation, config
+# volume + network, nonce/quote, the POST /boot/attestation loop, and writing the
+# ephemeral /run/chutes state. The prod/debug differences live entirely in the
+# entry scripts via four hooks, so no rc / fail-open / signing code appears here or
+# in the prod initramfs:
+#
+#   handle_failure <reason>   fatal-error behavior. Prod: poweroff -f (fail closed).
+#                             Debug: log and continue (fail open). Default here is
+#                             fail-closed, so a missing override can only fail safe.
+#   detect_first_boot         sets FIRST_BOOT. Prod: inspect the LUKS2 first-boot
+#                             token. Debug (no LUKS): stays "false".
+#
+# Entry scripts source this AFTER /scripts/functions, then override the hooks they
+# need, then call run_boot_attestation.
+
+# sr25519 miner-hotkey signer (hotkey_stash_seed / hotkey_sign / hotkey_shred_seed → the
+# X-Chutes-Signature proof). Sourced here so every entry that sources attest-common — and
+# provision-common, which sources it likewise — can prove hotkey possession over each call's
+# server-issued nonce.
+. /scripts/hotkey-sign
+
+# ── Shared globals (attestation) ──────────────────────────────────────────────
+NONCE=""
+CERT_HASH=""
+QUOTE_B64=""
+VM_NAME=""
+HOTKEY=""
+VM_AUTH_SS58=""        # per-VM ephemeral SR25519 SS58 for validator auth (rotates every boot)
+LUKS_KEY=""            # root passphrase returned by boot attestation
+LUKS_QUOTE_NONCE=""    # single-use nonce for the init-bottom POST /provision quote
+ROOT_NEXT=""           # next root passphrase returned by boot attestation (rotation target)
+ROOT_CONFIRM_NONCE=""  # nonce for confirming root passphrase rotation
+FIRST_BOOT="false"     # set by detect_first_boot hook
+FETCH_ATTEMPTS=0
+
+# The per-boot VM root CA — the VM's single mTLS client identity for every boot API
+# call (nonce, boot attestation, /provision). Lives in TDX-encrypted DRAM (tmpfs);
+# deleted before pivot_root by setup_vm_tls after it signs the leaf certs.
+CA_DIR="/run/chutes/vm-root-ca"
+CLIENT_CERT="${CA_DIR}/ca.crt"
+CLIENT_KEY="${CA_DIR}/ca.key"
+API_CA_CERT="/etc/ssl/certs/ca-certificates.crt"
+
+# Endpoints (paths are stable, not configurable). TDX_BASE_URL comes from /etc/tdx-luks.conf.
+API_ENDPOINT="${TDX_BASE_URL}/servers/boot/attestation"
+NONCE_ENDPOINT="${TDX_BASE_URL}/servers/nonce"
+TIMEOUT="${TDX_TIMEOUT:-30}"
+RETRY_COUNT="${TDX_RETRY_COUNT:-3}"
+
+log_msg() {
+    if [ "$quiet" != "y" ]; then
+        echo "$@"
+    fi
+}
+
+# ── Hook defaults (entry scripts override) ────────────────────────────────────
+# Default is fail-closed: an entry that forgets to define handle_failure powers off
+# rather than silently continuing.
+handle_failure() {
+    log_failure_msg "TDX attestation failed: $1"
+    echo "TDX-ATTEST-FAILED: $1" > /dev/kmsg 2>/dev/null || true
+    sleep 5
+    poweroff -f
+}
+detect_first_boot() { FIRST_BOOT="false"; }
+
+# ── VM root CA ────────────────────────────────────────────────────────────────
+generate_vm_root_ca() {
+    log_begin_msg "Generating per-boot VM root CA"
+
+    export RANDFILE=/tmp/.rnd
+    export OPENSSL_CONF=/dev/null
+
+    mkdir -p /tmp
+    # First thing on either boot path to touch /run/chutes, so this sets its mode.
+    # Explicit because `mkdir -m` does not apply to intermediates created by `-p`.
+    mkdir -m 0700 -p /run/chutes
+    mkdir -m 700 -p "$CA_DIR"
+
+    # Fresh 4096-bit CA each boot — TDX-encrypted DRAM only, never on disk. Subject
+    # must stay CN=sek8s-vm-root-ca so the leaf certs setup_vm_tls signs still chain.
+    # 365-day validity: VMs run for months; per-boot rotation is preserved regardless.
+    if ! openssl genrsa -out "$CLIENT_KEY" 4096 2>/dev/null; then
+        log_end_msg 1
+        return 1
+    fi
+    if ! openssl req -new -x509 -sha256 \
+        -key "$CLIENT_KEY" -out "$CLIENT_CERT" -days 365 \
+        -subj "/O=chutes/OU=sek8s/CN=sek8s-vm-root-ca" -batch 2>/dev/null; then
+        log_end_msg 1
+        return 1
+    fi
+    chmod 600 "$CLIENT_KEY"
+    chmod 644 "$CLIENT_CERT"
+
+    if [ ! -f "$CLIENT_CERT" ] || [ ! -f "$CLIENT_KEY" ]; then
+        log_end_msg 1
+        return 1
+    fi
+
+    CERT_HASH=$(openssl x509 -in "$CLIENT_CERT" -pubkey -noout 2>/dev/null | \
+                openssl pkey -pubin -outform der 2>/dev/null | \
+                sha256sum | cut -d' ' -f1)
+    if [ -z "$CERT_HASH" ]; then
+        log_end_msg 1
+        return 1
+    fi
+
+    log_end_msg 0
+    return 0
+}
+
+# ── Config volume (vm_name, hotkey, network) ──────────────────────────────────
+mount_config_volume() {
+    local cfg_mount="/run/tdx-config"
+    log_begin_msg "Mounting config volume"
+    mkdir -p "$cfg_mount"
+    modprobe virtio_blk 2>/dev/null
+    modprobe virtio_pci 2>/dev/null
+    sleep 1
+    for device in /dev/disk/by-label/tdx-config; do
+        if [ -b "$device" ]; then
+            if mount -t ext4 -o ro "$device" "$cfg_mount" 2>/dev/null; then
+                log_end_msg 0
+                return 0
+            fi
+        fi
+    done
+    log_end_msg 1
+    return 1
+}
+
+unmount_config_volume() {
+    local cfg_mount="/run/tdx-config"
+    if grep -q "$cfg_mount" /proc/mounts 2>/dev/null; then
+        log_begin_msg "Unmounting config volume"
+        umount "$cfg_mount" 2>/dev/null || true
+        log_end_msg 0
+    fi
+}
+
+setup_network() {
+    local cfg_mount="/run/tdx-config"
+    local netconfig="$cfg_mount/network-config.yaml"
+
+    log_begin_msg "Parsing network config"
+    if [ ! -f "$netconfig" ]; then
+        log_end_msg 1
+        log_failure_msg "network-config.yaml not found"
+        return 1
+    fi
+
+    iface=$(ls /sys/class/net/ | grep '^en' | head -n1)
+    ip_addr=$(awk '/addresses:/{getline; gsub(/^[ -]+/,""); print; exit}' "$netconfig")
+    gateway=$(awk '/via:/{gsub(/^[ ]+via:[ ]+/,""); print; exit}' "$netconfig")
+    nameserver=$(awk '/nameservers:/,/addresses:/{if(/^[ ]+-/){gsub(/^[ -]+/,""); print; exit}}' "$netconfig")
+
+    if [ -z "$iface" ] || [ -z "$ip_addr" ] || [ -z "$gateway" ]; then
+        log_end_msg 1
+        log_failure_msg "Failed to detect interface or parse network-config.yaml"
+        return 1
+    fi
+    log_end_msg 0
+
+    log_begin_msg "Configuring $iface with $ip_addr"
+    modprobe virtio_net 2>/dev/null
+    sleep 1
+    if [ ! -e "/sys/class/net/$iface" ]; then
+        log_end_msg 1
+        log_failure_msg "Interface $iface not found"
+        return 1
+    fi
+    ip link set dev "$iface" up
+    sleep 1
+    ip addr add "$ip_addr" dev "$iface"
+    ip route add default via "$gateway"
+    mkdir -p /etc
+    echo "nameserver ${nameserver:-8.8.8.8}" > /etc/resolv.conf
+    if ! ip addr show "$iface" | grep -q "inet "; then
+        log_end_msg 1
+        log_failure_msg "Failed to configure IP"
+        return 1
+    fi
+    if ! ip route show | grep -q "default"; then
+        log_end_msg 1
+        log_failure_msg "Failed to configure default route"
+        return 1
+    fi
+    log_end_msg 0
+    return 0
+}
+
+read_vm_name() {
+    local cfg_mount="/run/tdx-config"
+    local hostname_file="$cfg_mount/hostname"
+    log_begin_msg "Reading VM name from config"
+    if [ ! -f "$hostname_file" ]; then
+        log_end_msg 1
+        log_failure_msg "VM name file not found: $hostname_file"
+        return 1
+    fi
+    VM_NAME=$(cat "$hostname_file" 2>/dev/null | tr -d '\n\r\t ' | grep -o '^[[:alnum:]_-]*')
+    if [ -n "$VM_NAME" ]; then
+        log_end_msg 0
+        log_msg "  VM name: $VM_NAME"
+        return 0
+    else
+        log_end_msg 1
+        log_failure_msg "VM name is empty or invalid in $hostname_file"
+        cat "$hostname_file" 2>/dev/null | od -c
+        return 1
+    fi
+}
+
+read_hotkey() {
+    local cfg_mount="/run/tdx-config"
+    log_begin_msg "Deriving miner hotkey from seed"
+    # Stash the seed to /run tmpfs and derive the AUTHORITATIVE ss58 from it. Deriving (rather
+    # than reading the claimed miner-ss58) is the proof-of-possession: the boot API calls sign
+    # each server nonce with this seed, so a caller cannot assert another miner's hotkey.
+    if ! hotkey_stash_seed "$cfg_mount"; then
+        log_end_msg 1
+        log_failure_msg "Failed to derive miner hotkey from $cfg_mount/miner-seed"
+        return 1
+    fi
+    HOTKEY="$(hotkey_ss58)"
+    # The claimed miner-ss58 is only a cross-check now — warn on mismatch, never trust it.
+    local claimed
+    claimed=$(cat "$cfg_mount/miner-ss58" 2>/dev/null | tr -d '\n\r\t ' | head -c 64)
+    if [ -n "$claimed" ] && [ "$claimed" != "$HOTKEY" ]; then
+        log_failure_msg "config miner-ss58 ($claimed) != seed-derived hotkey ($HOTKEY); using the seed's"
+    fi
+    log_end_msg 0
+    return 0
+}
+
+# ── Nonce + quote ─────────────────────────────────────────────────────────────
+fetch_nonce() {
+    local response_file="/tmp/nonce_response"
+    local result=1
+    local error_detail=""
+    log_begin_msg "Fetching nonce"
+    http_code=$(curl -s -w "%{http_code}" \
+        -X GET \
+        --max-time $TIMEOUT \
+        --retry 0 \
+        --cacert "$API_CA_CERT" \
+        --cert "$CLIENT_CERT" \
+        --key "$CLIENT_KEY" \
+        -o "$response_file" \
+        "${NONCE_ENDPOINT}?miner_hotkey=${HOTKEY}")
+    # The API's own explanation, if it sent one. FastAPI puts it in `detail`; accept
+    # message/error too. Single-lined and capped so a body can't mangle the console.
+    local api_msg
+    api_msg=$(jq -r '.detail // .message // .error // empty' "$response_file" 2>/dev/null | tr '\n' ' ' | cut -c1-300)
+    case "$http_code" in
+        200)
+            NONCE=$(jq -r '.nonce // empty' "$response_file" 2>/dev/null)
+            if [ -n "$NONCE" ]; then
+                result=0
+            else
+                error_detail="API response missing nonce field"
+            fi
+            ;;
+        401|403) error_detail="Authentication failed (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+        404)     error_detail="Nonce endpoint not found (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+        429)     error_detail="Rate limited (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+        5*)      error_detail="Server error (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+        000)     error_detail="Connection failed" ;;
+        *)       error_detail="Unexpected HTTP response: $http_code${api_msg:+: $api_msg}" ;;
+    esac
+    log_end_msg $result
+    [ -n "$error_detail" ] && log_failure_msg "$error_detail"
+    rm -f "$response_file"
+    return $result
+}
+
+generate_quote() {
+    local quote_file="/tmp/tdx_quote.bin"
+    log_begin_msg "Generating TDX quote"
+    REPORTDATA=$(echo -n "${NONCE}${CERT_HASH}" | cut -c1-128)
+    if ! /usr/bin/tdx-quote-generator --report-data "$REPORTDATA" --hex -o "$quote_file" 2>/dev/null; then
+        log_end_msg 1
+        return 1
+    fi
+    if [ ! -f "$quote_file" ]; then
+        log_end_msg 1
+        return 1
+    fi
+    QUOTE_B64=$(base64 -w 0 < "$quote_file")
+    rm -f "$quote_file"
+    log_end_msg 0
+    return 0
+}
+
+# ── Boot attestation POST (fresh nonce + quote per attempt) ───────────────────
+# Sets FETCH_ATTEMPTS to the number of attempts actually made. rc_headers_hook lets
+# the debug entry add the operator-signature header; empty for prod.
+fetch_luks_key() {
+    FETCH_ATTEMPTS=0
+    local response_file="/tmp/api_response"
+
+    while [ $FETCH_ATTEMPTS -lt $RETRY_COUNT ]; do
+        FETCH_ATTEMPTS=$((FETCH_ATTEMPTS + 1))
+        log_msg "LUKS key fetch attempt $FETCH_ATTEMPTS/$RETRY_COUNT"
+
+        if ! fetch_nonce; then
+            [ $FETCH_ATTEMPTS -lt $RETRY_COUNT ] && sleep 2
+            continue
+        fi
+        if ! generate_quote; then
+            [ $FETCH_ATTEMPTS -lt $RETRY_COUNT ] && sleep 2
+            continue
+        fi
+
+        # The exact request body — built once so the hotkey signature hashes the same bytes curl
+        # sends (the API hashes the received body; the two must be byte-identical).
+        local body
+        body="{\"quote\":\"$QUOTE_B64\",\"vm_name\":\"$VM_NAME\",\"miner_hotkey\":\"$HOTKEY\",\"first_boot\":${FIRST_BOOT}}"
+
+        # Miner-hotkey proof-of-possession: sr25519 over {ss58}:{NONCE}:{sha256(body)}. The
+        # X-Chutes-Hotkey and X-Chutes-Nonce headers below carry the other two fields, so the API
+        # reconstructs the same message. Spliced unquoted (hex sig, no spaces); absent when no seed
+        # was stashed, so no empty header is sent.
+        local hk_hdr="" _hk_sig
+        _hk_sig=$(hotkey_sign "$NONCE" "$body")
+        [ -n "$_hk_sig" ] && hk_hdr="-H X-Chutes-Signature:$_hk_sig"
+
+        local send_result=1
+        local send_error=""
+
+        log_begin_msg "Sending attestation for VM '$VM_NAME'"
+        http_code=$(curl -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: TDX-LUKS-Client/1.0" \
+            -H "X-Chutes-Nonce: $NONCE" \
+            -H "X-Chutes-Hotkey: $HOTKEY" \
+            ${hk_hdr} \
+            --max-time $TIMEOUT \
+            --retry 0 \
+            --cacert "$API_CA_CERT" \
+            --cert "$CLIENT_CERT" \
+            --key "$CLIENT_KEY" \
+            -d "$body" \
+            -o "$response_file" \
+            "$API_ENDPOINT")
+
+        # The API's own explanation, if it sent one (FastAPI `detail`; message/error too).
+        # This is the attestation verdict path — surface the reason, not just the code.
+        local api_msg
+        api_msg=$(jq -r '.detail // .message // .error // empty' "$response_file" 2>/dev/null | tr '\n' ' ' | cut -c1-300)
+        case "$http_code" in
+            200)
+                LUKS_KEY=$(jq -r '.key // empty' "$response_file" 2>/dev/null)
+                LUKS_QUOTE_NONCE=$(jq -r '.luks_quote_nonce // empty' "$response_file" 2>/dev/null)
+                VM_AUTH_SS58=$(jq -r '.vm_auth_ss58 // empty' "$response_file" 2>/dev/null)
+                ROOT_NEXT=$(jq -r '.root_next // empty' "$response_file" 2>/dev/null)
+                ROOT_CONFIRM_NONCE=$(jq -r '.root_confirm_nonce // empty' "$response_file" 2>/dev/null)
+                if [ -n "$LUKS_KEY" ] && [ -n "$LUKS_QUOTE_NONCE" ] && [ -n "$VM_AUTH_SS58" ]; then
+                    rm -f "$response_file"
+                    send_result=0
+                else
+                    send_error="API response missing key, luks_quote_nonce, or vm_auth_ss58 field"
+                fi
+                ;;
+            401|403) send_error="Attestation rejected (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+            404)     send_error="API endpoint not found (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+            429)     send_error="Rate limited (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+            5*)      send_error="Server error (HTTP $http_code)${api_msg:+: $api_msg}" ;;
+            000)     send_error="Connection failed" ;;
+            *)       send_error="Unexpected HTTP response: $http_code${api_msg:+: $api_msg}" ;;
+        esac
+
+        log_end_msg $send_result
+        [ -n "$send_error" ] && log_failure_msg "$send_error"
+        [ $send_result -eq 0 ] && return 0
+
+        case "$http_code" in
+            401|403|404) rm -f "$response_file"; return 1 ;;
+            429) sleep $((FETCH_ATTEMPTS * 2)) ;;
+        esac
+        [ $FETCH_ATTEMPTS -lt $RETRY_COUNT ] && sleep 2
+    done
+
+    rm -f "$response_file"
+    return 1
+}
+
+# ── Persist ephemeral /run/chutes state for later init-bottom scripts ─────────
+# 0700 is deliberate and load-bearing: the services that need a subtree here get it
+# bound into a private tmpfs by their unit, so nothing reaches it by traversal. Set
+# explicitly at every creation site -- `mkdir -m` does not apply to `-p` intermediates,
+# so this used to land on the umask default and every later `-m` was a silent no-op.
+write_boot_state() {
+    mkdir -m 0700 -p /run/chutes
+    echo "$VM_NAME" > /run/chutes/vm-name
+    echo "$HOTKEY" > /run/chutes/hotkey
+    if [ -n "$LUKS_QUOTE_NONCE" ]; then
+        printf '%s' "$LUKS_QUOTE_NONCE" > /run/chutes/luks-quote-nonce
+        chmod 600 /run/chutes/luks-quote-nonce
+    fi
+    # cert-hash binds the /provision REPORTDATA to the same VM root CA used at boot.
+    if [ -n "$CERT_HASH" ]; then
+        printf '%s' "$CERT_HASH" > /run/chutes/cert-hash
+        chmod 600 /run/chutes/cert-hash
+    fi
+    # Per-VM ephemeral validator auth SS58 for write-validator-auth + cluster-init.
+    if [ -n "$VM_AUTH_SS58" ]; then
+        printf '%s' "$VM_AUTH_SS58" > /run/chutes/validator-ss58
+        chmod 600 /run/chutes/validator-ss58
+    fi
+}
+
+# ── Orchestrator: the shared boot-attestation sequence ────────────────────────
+# On any failure calls handle_failure (fail-closed by default; the debug entry makes
+# it fail-open) and returns 1. On success the caller has NONCE/CERT_HASH/VM_NAME/
+# HOTKEY/LUKS_KEY/LUKS_QUOTE_NONCE/VM_AUTH_SS58/ROOT_NEXT populated. The caller then
+# persists /run/chutes state via write_boot_state at the point matching its flow
+# (prod: after LUKS rotation, preserving the original ordering; debug: right after
+# this returns). The prod entry unlocks + rotates LUKS; the debug entry stops.
+run_boot_attestation() {
+    if [ ! -c "/dev/tdx_guest" ]; then
+        handle_failure "TDX device not found - not running in TDX environment"
+        return 1
+    fi
+    if ! generate_vm_root_ca; then
+        handle_failure "VM root CA generation failed"
+        return 1
+    fi
+    if ! mount_config_volume; then
+        handle_failure "Failed to mount config volume"
+        return 1
+    fi
+    if ! setup_network; then
+        unmount_config_volume
+        handle_failure "Network setup failed"
+        return 1
+    fi
+    if ! read_vm_name; then
+        unmount_config_volume
+        handle_failure "Failed to read VM name from config volume"
+        return 1
+    fi
+    if ! read_hotkey; then
+        unmount_config_volume
+        handle_failure "Failed to read miner hotkey from config volume"
+        return 1
+    fi
+
+    unmount_config_volume
+
+    # Entry hook: prod inspects the LUKS2 first-boot token; debug leaves FIRST_BOOT=false.
+    detect_first_boot
+
+    if ! fetch_luks_key; then
+        handle_failure "Failed to retrieve boot attestation after $FETCH_ATTEMPTS attempt(s)"
+        return 1
+    fi
+
+    # NOTE: the caller persists /run/chutes state via write_boot_state at the point
+    # matching its flow — prod after rotation (original ordering), debug right after.
+    return 0
+}

@@ -1,0 +1,45 @@
+# vim: ft=apparmor
+# sek8s.deny-sensitive-default — the blanket profile for common shells, interpreters, and
+# data-transfer tools. This is what an ESCAPED OR STRAY shell gets: a chute pod that breaks out of
+# its container, an exploited service that shells out, an injected command. It must therefore be
+# the most restrictive shell profile in the system.
+#
+# It denies BOTH protected assets:
+#   * the model cache — private model weights, the highest-value asset on the box
+#   * /run/chutes     — miner seed, hotkey, mTLS keys, k3s secretbox config
+# and additionally hides /run/k3s-init, where the k3s-post-start wrapper stages per-script
+# secrets (see sek8s.k3s-init.* profiles).
+#
+# Services that legitimately need one of those assets do NOT get an exception here — AppArmor
+# gives `deny` precedence over any allow, so an exception is impossible to express in this file.
+# They get their own profile composed from sek8s-shell-base plus whichever denies still apply,
+# applied via systemd AppArmorProfile= or aa-exec, which overrides this auto-attachment.
+#
+# python3 is intentionally NOT in the attachment list: confining it would require explicit
+# overrides for every Python-based systemd service. Python launched from a confined shell inherits
+# this profile via ix.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+@{confined_bins} = /usr/bin/{bash,dash,cat,cp,tar,rsync,scp,curl,wget,perl,dd,socat,nc,ncat} /bin/{sh,dash}
+
+profile sek8s.deny-sensitive-default @{confined_bins} flags=(enforce) {
+  include <abstractions/sek8s-shell-base>
+  include <abstractions/sek8s-cache-deny>
+  include <abstractions/sek8s-secrets-deny>
+
+  @{confined_bins} mrix,
+
+  # A stray shell must not be able to reboot or power off the box. Measured init scripts DO need
+  # this (their fail-closed handler powers the VM off on a security-critical failure), so the deny
+  # lives here rather than in sek8s-shell-base.
+  deny capability sys_boot,
+
+  # The per-script staging area is invisible here. Only the sek8s.k3s-init.<script> profiles omit
+  # this deny, and each grants read to its OWN subdirectory only — so a stray shell cannot read a
+  # secret that the wrapper staged for a measured script, and no init script can read another's.
+  deny /run/k3s-init/ r,
+  deny /run/k3s-init/** rwlk,
+}

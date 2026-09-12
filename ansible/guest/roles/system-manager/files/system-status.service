@@ -8,6 +8,9 @@ Type=simple
 User=chutes
 Group=chutes
 WorkingDirectory=/opt/sek8s
+# Keep the RTMR3-measured /opt/sek8s/src tree free of runtime-written .pyc (see the note in
+# system-manager.service) so the measurement stays stable across reboots.
+Environment="PYTHONDONTWRITEBYTECODE=1"
 EnvironmentFile=/etc/system-status/system-status.env
 ExecStart=/opt/sek8s/venv/bin/python -m sek8s.services.system_status
 Restart=always

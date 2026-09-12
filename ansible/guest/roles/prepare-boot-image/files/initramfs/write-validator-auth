@@ -1,0 +1,123 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-bottom/write-validator-auth
+#
+# Writes the per-VM ephemeral validator auth SS58 to validator-auth.env on the
+# real root filesystem before pivot_root.
+#
+# The SS58 is saved to /run/chutes/validator-ss58 (tmpfs) by fetch_key_and_unlock
+# (init-premount) after successful TDX boot attestation.  This script writes it
+# into ${rootmnt}/etc/system-manager/validator-auth.env so system-manager can
+# load ALLOWED_VALIDATORS from a separate EnvironmentFile.
+#
+# Security model:
+#   - This script is part of the initramfs and is fully measured into RTMR2.
+#     Any tampering with the write logic is cryptographically detectable.
+#   - validator-auth.env is NOT listed in tdx-measure.conf, so it is NOT
+#     measured into RTMR3.  The ephemeral SS58 is unique per boot and would
+#     make RTMR3 non-deterministic if measured.
+#   - system-manager.env IS measured (RTMR3).  It no longer contains
+#     ALLOWED_VALIDATORS, making it fully static and deterministic.
+#   - The delivery channel (mTLS + TDX attestation in fetch_key_and_unlock)
+#     cryptographically binds the key to this VM's identity.
+#
+# Ordering:
+#   PREREQ="" — no init-bottom ordering dependency needed.
+#   The input (/run/chutes/validator-ss58) is written at init-premount by
+#   fetch_key_and_unlock, which always completes before any init-bottom script
+#   runs (guaranteed by initramfs-tools stage ordering).
+#   The output (/run/chutes/validator-auth.env) is not in tdx-measure.conf so
+#   rtmr3-measure never reads it — ordering relative to that script is irrelevant.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+
+# Write to the initramfs /run/chutes/ tmpfs — NOT to the root filesystem.
+# initramfs-tools moves this tmpfs to ${rootmnt}/run before exec'ing init, so
+# the file is accessible in userspace at /run/chutes/validator-auth.env.
+# This means:
+#   - No file ever persists on the root filesystem (fully ephemeral)
+#   - No build-time placeholder needed
+#   - Automatically cleared on every reboot
+#   - Consistent with k3s-encryption-config.yaml, validator-ss58, etc.
+VALIDATOR_SS58_FILE="/run/chutes/validator-ss58"
+VALIDATOR_AUTH_ENV="/run/chutes/validator-auth.env"
+
+log_begin_msg "write-validator-auth: writing ephemeral validator auth env"
+
+# Verify the source file exists (written by fetch_key_and_unlock)
+if [ ! -f "$VALIDATOR_SS58_FILE" ]; then
+    log_failure_msg "write-validator-auth: /run/chutes/validator-ss58 not found"
+    echo "WRITE-VALIDATOR-AUTH-FAILED: validator-ss58 missing" > /dev/kmsg
+    sleep 5
+    poweroff -f
+    exit 1
+fi
+
+VALIDATOR_SS58=$(cat "$VALIDATOR_SS58_FILE" 2>/dev/null | tr -d '\n\r\t ')
+
+# Validate SS58 format — must match process-config.py validate_ss58_address() exactly:
+#   - Non-empty
+#   - Length 40–50 chars
+#   - Every character in the base58 charset
+#   - Starts with '5' (Bittensor mainnet network prefix 42)
+#
+# The charset check uses `tr -d` to strip all valid base58 chars; if anything
+# remains the string contains an invalid character.  This validates the FULL
+# string, not just the first character — important because the value is written
+# directly into an env file and must not contain shell metacharacters.
+
+if [ -z "$VALIDATOR_SS58" ]; then
+    log_failure_msg "write-validator-auth: validator-ss58 is empty"
+    echo "WRITE-VALIDATOR-AUTH-FAILED: validator-ss58 empty" > /dev/kmsg
+    sleep 5
+    poweroff -f
+    exit 1
+fi
+
+# Length: 40–50 chars (matches process-config.py)
+SS58_LEN=$(printf '%s' "$VALIDATOR_SS58" | wc -c)
+if [ "$SS58_LEN" -lt 40 ] || [ "$SS58_LEN" -gt 50 ]; then
+    log_failure_msg "write-validator-auth: validator-ss58 length invalid: $SS58_LEN (expected 40-50)"
+    echo "WRITE-VALIDATOR-AUTH-FAILED: invalid SS58 length" > /dev/kmsg
+    sleep 5
+    poweroff -f
+    exit 1
+fi
+
+# Prefix: must start with '5'
+case "$VALIDATOR_SS58" in
+    5*) : ;;
+    *)
+        log_failure_msg "write-validator-auth: validator-ss58 does not start with '5'"
+        echo "WRITE-VALIDATOR-AUTH-FAILED: invalid SS58 prefix" > /dev/kmsg
+        sleep 5
+        poweroff -f
+        exit 1
+        ;;
+esac
+
+# Charset: every character must be in the base58 set (no 0, O, I, l and no shell metachars).
+# Strip all valid base58 chars; anything left is invalid.
+SS58_INVALID=$(printf '%s' "$VALIDATOR_SS58" | tr -d '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz')
+if [ -n "$SS58_INVALID" ]; then
+    log_failure_msg "write-validator-auth: validator-ss58 contains invalid characters"
+    echo "WRITE-VALIDATOR-AUTH-FAILED: invalid SS58 charset" > /dev/kmsg
+    sleep 5
+    poweroff -f
+    exit 1
+fi
+
+# /run/chutes/ already exists (created by fetch_key_and_unlock), but ensure it.
+mkdir -m 0700 -p /run/chutes
+
+# Write the env file into the initramfs /run tmpfs (mode 600 — root only)
+printf 'ALLOWED_VALIDATORS=%s\n' "$VALIDATOR_SS58" > "$VALIDATOR_AUTH_ENV"
+chmod 600 "$VALIDATOR_AUTH_ENV"
+
+log_end_msg 0
+log_success_msg "write-validator-auth: /run/chutes/validator-auth.env written (ephemeral)"
+
+exit 0

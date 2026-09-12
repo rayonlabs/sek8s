@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "chutes-cvm"
+version = "0.1.0"
+description = "CLI and toolkit for operating Chutes confidential GPU VMs (host inspection, launch, attestation preflight, measurement generation)"
+authors = ["Kyle Widmann <kyle@chutes.ai>"]
+readme = "README.md"
+packages = [{include = "chutes_cvm"}]
+# Bundled shell entrypoints + config schemas + vfio rules that travel with the package
+# (resolved via chutes_cvm.paths.SCRIPTS_DIR). The editable dev/host install reads them
+# in-place; this makes them ship in the built wheel/sdist for the PyPI install path too.
+include = [{ path = "chutes_cvm/scripts/**/*", format = ["sdist", "wheel"] }]
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.15"
+pyyaml = "^6.0.2"
+# Launch config is a pydantic-settings model (CLI > env > YAML > defaults); it also validates,
+# replacing the former hand-maintained JSON schema + jsonschema.
+pydantic-settings = "^2.10.0"
+# Attestation preflight signs the submission with the miner hotkey (sr25519).
+substrate-interface = "^1.7.11"
+
+[tool.poetry.scripts]
+chutes-cvm = "chutes_cvm.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

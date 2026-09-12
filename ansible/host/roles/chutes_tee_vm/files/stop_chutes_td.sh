@@ -5,7 +5,7 @@
 # must be rebooted before the qcow2 image lock will clear and the VM can relaunch).
 #
 # Detection logic must stay aligned with is_live_chutes_td.sh and
-# host-tools/scripts/quick-launch.sh (_live_chutes_td_qemu_running).
+# src/chutes-cvm/chutes_cvm/guest/launch.py (_chutes_td_running).
 #
 # Usage: stop_chutes_td.sh [term_wait_seconds] [kill_wait_seconds]
 set -euo pipefail

@@ -1,0 +1,149 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-bottom/fetch-signing-keys
+#
+# Fetches the signing key bundle from the validator API, verifies each key's
+# detached RSA signature against the attested root key, and writes verified
+# keys to /run/chutes/signing-keys/ on the tmpfs before pivot_root.
+#
+# Security model:
+#   - /etc/chutes/root-signing-key.pem is baked into the initramfs at build
+#     time and covered by RTMR1.  The same file on the root filesystem is
+#     measured into RTMR3 via the /etc/chutes/ recursive path list.  Any
+#     offline tampering with the root key changes RTMR3.
+#   - Signatures are RSA PKCS#1 v1.5 over SHA-256 of the raw (base64-decoded)
+#     key bytes.  Leaf keys (cosign, Helm) are not measured in RTMR3; trust is
+#     delegated via the RSA chain: RTMR3 attests root pubkey → root pubkey
+#     verifies the signature → signature authenticates the leaf key.
+#   - If any signature check fails, or the API is unreachable, the VM powers
+#     off.  Fail-closed by design — same pattern as rtmr3-measure.
+#
+# Ordering:
+#   PREREQ="" — no init-bottom ordering dependency needed.  Network was
+#   established by fetch_key_and_unlock (init-premount), which always
+#   completes before any init-bottom script runs (guaranteed by
+#   initramfs-tools stage ordering).  Output keys are not in tdx-measure.conf
+#   and are not measured into RTMR3.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+
+CONF_FILE="/etc/chutes/signing-keys.conf"
+ROOT_KEY="/etc/chutes/root-signing-key.pem"
+OUTPUT_DIR="/run/chutes/signing-keys"
+SIGNING_KEYS_URL=""
+TIMEOUT=30
+RETRY_COUNT=3
+
+fail() {
+    log_failure_msg "fetch-signing-keys: $1"
+    echo "FETCH-SIGNING-KEYS-FAILED: $1" > /dev/kmsg
+    sleep 5
+    poweroff -f
+    exit 1
+}
+
+log_begin_msg "fetch-signing-keys: fetching and verifying signing key bundle"
+
+# ── Load config ───────────────────────────────────────────────────────────────
+
+[ -f "$CONF_FILE" ] || fail "config not found: $CONF_FILE"
+# shellcheck source=/dev/null
+. "$CONF_FILE"
+[ -n "$SIGNING_KEYS_URL" ] || fail "SIGNING_KEYS_URL not set in $CONF_FILE"
+
+# ── Root key must be present in initramfs ────────────────────────────────────
+
+[ -f "$ROOT_KEY" ] || fail "root signing key not found: $ROOT_KEY"
+
+# ── Fetch key bundle with retries ────────────────────────────────────────────
+
+BUNDLE=""
+ATTEMPT=0
+while [ "$ATTEMPT" -lt "$RETRY_COUNT" ]; do
+    ATTEMPT=$((ATTEMPT + 1))
+    BUNDLE=$(curl -sf --max-time "$TIMEOUT" "$SIGNING_KEYS_URL" 2>/dev/null) && \
+        [ -n "$BUNDLE" ] && break
+    log_warning_msg "fetch-signing-keys: attempt $ATTEMPT/$RETRY_COUNT failed"
+    BUNDLE=""
+    [ "$ATTEMPT" -lt "$RETRY_COUNT" ] && sleep 2
+done
+
+[ -n "$BUNDLE" ] || fail "failed to fetch key bundle from $SIGNING_KEYS_URL after $RETRY_COUNT attempts"
+
+# ── Validate bundle structure ────────────────────────────────────────────────
+
+VERSION=$(printf '%s' "$BUNDLE" | jq -r '.version // empty' 2>/dev/null)
+[ -n "$VERSION" ] || fail "invalid key bundle: missing or null version field"
+
+KEY_NAMES=$(printf '%s' "$BUNDLE" | jq -r '.keys | keys[]' 2>/dev/null)
+[ -n "$KEY_NAMES" ] || fail "key bundle contains no keys"
+
+# ── Prepare output directories ───────────────────────────────────────────────
+
+mkdir -m 0700 -p /run/chutes
+mkdir -p "$OUTPUT_DIR/cosign"
+chmod 755 "$OUTPUT_DIR" "$OUTPUT_DIR/cosign"
+
+# ── Verify and install each key ──────────────────────────────────────────────
+
+for KEY_NAME in $KEY_NAMES; do
+    # Reject names with path traversal or absolute paths.
+    case "$KEY_NAME" in
+        /*|*..*)
+            fail "key name rejected (path traversal): $KEY_NAME"
+            ;;
+    esac
+
+    KEY_B64=$(printf '%s' "$BUNDLE" | jq -r --arg k "$KEY_NAME" '.keys[$k] // empty' 2>/dev/null)
+    SIG_B64=$(printf '%s' "$BUNDLE" | jq -r --arg k "$KEY_NAME" '.signatures[$k] // empty' 2>/dev/null)
+
+    [ -n "$KEY_B64" ] || fail "missing key content for: $KEY_NAME"
+    [ -n "$SIG_B64" ] || fail "missing signature for: $KEY_NAME"
+
+    TMPKEY=$(mktemp /tmp/sigkey.XXXXXXXX)
+    TMPSIG=$(mktemp /tmp/sigsig.XXXXXXXX)
+    chmod 600 "$TMPKEY" "$TMPSIG"
+
+    printf '%s' "$KEY_B64" | base64 -d > "$TMPKEY" 2>/dev/null || {
+        rm -f "$TMPKEY" "$TMPSIG"
+        fail "base64 decode failed for key: $KEY_NAME"
+    }
+    printf '%s' "$SIG_B64" | base64 -d > "$TMPSIG" 2>/dev/null || {
+        rm -f "$TMPKEY" "$TMPSIG"
+        fail "base64 decode failed for signature: $KEY_NAME"
+    }
+
+    # Verify the RSA signature (PKCS#1 v1.5, SHA-256) over the raw key bytes.
+    OPENSSL_ERR=$(openssl dgst -sha256 -verify "$ROOT_KEY" -signature "$TMPSIG" "$TMPKEY" 2>&1)
+    if [ $? -ne 0 ]; then
+        rm -f "$TMPKEY" "$TMPSIG"
+        echo "fetch-signing-keys: openssl output: $OPENSSL_ERR" > /dev/kmsg
+        fail "RSA signature verification FAILED for: $KEY_NAME"
+    fi
+
+    # Install to output directory (create subdirectories as needed).
+    DEST="$OUTPUT_DIR/$KEY_NAME"
+    DEST_DIR=$(dirname "$DEST")
+    mkdir -p "$DEST_DIR"
+    chmod 755 "$DEST_DIR"
+    mv "$TMPKEY" "$DEST"
+    chmod 644 "$DEST"
+    rm -f "$TMPSIG"
+
+    log_success_msg "fetch-signing-keys: verified $KEY_NAME"
+done
+
+# ── Assert required keys were served ─────────────────────────────────────────
+
+for REQUIRED in "cosign/chutes.pub" "cosign/dockerhub.pub" "helm-pubkey.gpg"; do
+    [ -f "$OUTPUT_DIR/$REQUIRED" ] || \
+        fail "required key missing from bundle: $REQUIRED"
+done
+
+log_end_msg 0
+log_success_msg "fetch-signing-keys: all signing keys verified and installed to $OUTPUT_DIR"
+
+exit 0

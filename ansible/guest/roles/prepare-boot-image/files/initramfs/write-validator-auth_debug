@@ -1,0 +1,62 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-bottom/write-validator-auth_debug
+#
+# DEBUG IMAGE ONLY. Fail-open counterpart to write-validator-auth.
+#
+# The debug image boots fail-open: its boot attestation (fetch_key_and_unlock_debug) is
+# best-effort, so /run/chutes/validator-ss58 exists only when the RC-gate attestation
+# actually succeeded. When it did, write ALLOWED_VALIDATORS from it (same as prod). When it
+# did not — e.g. an unregistered image being measured for the first time, whose dummy miner
+# hotkey the API rejects with a 500 — write an EMPTY validator-auth.env and continue booting
+# instead of powering off. system-manager still gets its required EnvironmentFile, and a
+# debug VM never serves real traffic, so an empty ALLOWED_VALIDATORS is safe.
+#
+# The prod write-validator-auth stays strictly fail-closed and is NOT installed in debug.
+#
+# PREREQ="" — no init-bottom ordering dependency. The input (/run/chutes/validator-ss58) is
+# written at init-premount by fetch_key_and_unlock_debug, which completes before any
+# init-bottom script runs. The output (/run/chutes/validator-auth.env) is not in
+# tdx-measure.conf, so rtmr3-measure never reads it — ordering there is irrelevant.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+
+VALIDATOR_SS58_FILE="/run/chutes/validator-ss58"
+VALIDATOR_AUTH_ENV="/run/chutes/validator-auth.env"
+
+log_begin_msg "write-validator-auth (debug): writing ephemeral validator auth env"
+
+mkdir -m 0700 -p /run/chutes
+
+ss58=""
+[ -f "$VALIDATOR_SS58_FILE" ] && ss58=$(cat "$VALIDATOR_SS58_FILE" 2>/dev/null | tr -d '\n\r\t ')
+
+# Accept the ss58 only if it passes the same safety checks the prod script enforces
+# (length 40-50, '5' prefix, base58 charset — so no shell metacharacters reach the env
+# file). Anything else degrades to an empty ALLOWED_VALIDATORS; an unvalidated value is
+# never written.
+valid=0
+if [ -n "$ss58" ]; then
+    len=$(printf '%s' "$ss58" | wc -c)
+    leftover=$(printf '%s' "$ss58" | tr -d '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz')
+    if [ "$len" -ge 40 ] && [ "$len" -le 50 ] && [ -z "$leftover" ]; then
+        case "$ss58" in 5*) valid=1 ;; esac
+    fi
+fi
+
+if [ "$valid" -eq 1 ]; then
+    printf 'ALLOWED_VALIDATORS=%s\n' "$ss58" > "$VALIDATOR_AUTH_ENV"
+    chmod 600 "$VALIDATOR_AUTH_ENV"
+    log_end_msg 0
+    log_success_msg "write-validator-auth (debug): wrote ALLOWED_VALIDATORS from boot attestation"
+else
+    printf 'ALLOWED_VALIDATORS=\n' > "$VALIDATOR_AUTH_ENV"
+    chmod 600 "$VALIDATOR_AUTH_ENV"
+    log_end_msg 0
+    log_warning_msg "write-validator-auth (debug): no valid validator ss58 (fail-open) — wrote empty ALLOWED_VALIDATORS"
+fi
+
+exit 0

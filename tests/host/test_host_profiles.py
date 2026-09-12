@@ -7,15 +7,19 @@ orchestration logic (mocking all subprocess/OS calls).
 from unittest.mock import MagicMock, patch
 
 import pytest
-from chutes.host.profiles import (
+from chutes_cvm.host.profiles import (
     HOST_PROFILES,
     PPA,
     HostProfile,
-    Ubuntu2510Profile,
     Ubuntu2604Profile,
     resolve_profile,
 )
-from chutes.host.setup import _get_kernel_version, install_dependencies, setup_host
+from chutes_cvm.host.setup import (
+    _ensure_chutes_dirs,
+    _get_kernel_version,
+    _setup_ntp,
+    setup_host,
+)
 
 # ---------------------------------------------------------------------------
 # PPA dataclass
@@ -112,41 +116,9 @@ def test_describe_contains_version_and_codename(version):
     assert profile.codename in desc
 
 
-# ---------------------------------------------------------------------------
-# Ubuntu 25.10 specifics
-# ---------------------------------------------------------------------------
-
-
-def test_2510_has_no_ppas():
-    """25.10 uses Intel DCAP repo for attestation -- no PPAs needed."""
-    profile = Ubuntu2510Profile()
-    assert profile.ppas == []
-
-
-def test_2510_has_intel_sgx_repo():
-    """25.10 uses Intel's official SGX/DCAP repository (noble suite)."""
-    profile = Ubuntu2510Profile()
-    assert len(profile.repos) >= 1
-    intel_repos = [r for r in profile.repos if r.name == "intel-sgx"]
-    assert len(intel_repos) == 1
-    assert intel_repos[0].suite == "noble"
-    assert "download.01.org" in intel_repos[0].uri
-
-
-def test_2510_uses_generic_kernel():
-    profile = Ubuntu2510Profile()
-    assert profile.kernel_package == "linux-image-generic"
-
-
-def test_2510_enables_kvm_intel_tdx():
-    """25.10 requires explicit kvm_intel.tdx=1 kernel param."""
-    profile = Ubuntu2510Profile()
-    assert "kvm_intel.tdx=1" in profile.grub_cmdline_additions
-
-
 @pytest.mark.parametrize(
     "profile_cls",
-    [Ubuntu2510Profile, Ubuntu2604Profile],
+    [Ubuntu2604Profile],
 )
 def test_host_profiles_do_not_include_libvirt(profile_cls):
     """libvirt is not needed — VFIO prep uses direct PCI remove+rescan."""
@@ -201,9 +173,9 @@ def test_2604_has_intel_sgx_repo():
     assert "download.01.org" in intel_repos[0].uri
 
 
-def test_2604_uses_generic_kernel():
+def test_2604_pins_kernel_package():
     profile = Ubuntu2604Profile()
-    assert profile.kernel_package == "linux-image-generic"
+    assert profile.kernel_package == "linux-image-7.0.0-31-generic"
 
 
 def test_2604_enables_kvm_intel_tdx():
@@ -228,14 +200,20 @@ def test_resolve_profile_rejects_unsupported_version():
         resolve_profile("18.04")
 
 
-@patch("chutes.host.profiles.detect_ubuntu_version", return_value="25.10")
+def test_resolve_profile_rejects_2510():
+    # 26.04 is the only supported host OS; 25.10 hosts must upgrade first.
+    with pytest.raises(ValueError, match="Unsupported Ubuntu version"):
+        resolve_profile("25.10")
+
+
+@patch("chutes_cvm.host.profiles.detect_ubuntu_version", return_value="26.04")
 def test_resolve_profile_auto_detects(mock_detect):
     profile = resolve_profile(None)
-    assert isinstance(profile, Ubuntu2510Profile)
+    assert isinstance(profile, Ubuntu2604Profile)
     mock_detect.assert_called_once()
 
 
-@patch("chutes.host.profiles.detect_ubuntu_version", return_value="99.99")
+@patch("chutes_cvm.host.profiles.detect_ubuntu_version", return_value="99.99")
 def test_resolve_profile_auto_detect_unsupported(mock_detect):
     with pytest.raises(ValueError, match="Unsupported Ubuntu version"):
         resolve_profile(None)
@@ -246,22 +224,12 @@ def test_resolve_profile_auto_detect_unsupported(mock_detect):
 # ---------------------------------------------------------------------------
 
 
-@patch("chutes.host.setup.subprocess.run")
-def test_get_kernel_version_parses_depends(mock_run):
-    mock_run.return_value = MagicMock(
-        stdout=(
-            "Package: linux-image-generic\n"
-            "Version: 6.17.0.15.16\n"
-            "Depends: linux-image-6.17.0-15-generic, linux-modules-6.17.0-15-generic\n"
-        )
-    )
-    assert _get_kernel_version("linux-image-generic") == "6.17.0-15-generic"
+def test_get_kernel_version_parses_pinned_package():
+    assert _get_kernel_version("linux-image-6.17.0-35-generic") == "6.17.0-35-generic"
 
 
-@patch("chutes.host.setup.subprocess.run")
-def test_get_kernel_version_raises_on_no_match(mock_run):
-    mock_run.return_value = MagicMock(stdout="Package: something\nVersion: 1.0\n")
-    with pytest.raises(RuntimeError, match="Could not determine kernel version"):
+def test_get_kernel_version_rejects_metapackage():
+    with pytest.raises(ValueError, match="must be a pinned version"):
         _get_kernel_version("linux-image-generic")
 
 
@@ -270,12 +238,13 @@ def test_get_kernel_version_raises_on_no_match(mock_run):
 # ---------------------------------------------------------------------------
 
 
-@patch("chutes.host.setup.install_dependencies")
-@patch("chutes.host.setup._add_user_to_kvm")
-@patch("chutes.host.setup._grub_update_cmdline")
-@patch("chutes.host.setup._grub_set_kernel")
-@patch("chutes.host.setup._get_kernel_version", return_value="6.17.0-15-generic")
-@patch("chutes.host.setup._run")
+@patch("chutes_cvm.host.setup._ensure_chutes_dirs")
+@patch("chutes_cvm.host.setup._setup_ntp")
+@patch("chutes_cvm.host.setup._add_user_to_kvm")
+@patch("chutes_cvm.host.setup._grub_update_cmdline")
+@patch("chutes_cvm.host.setup._grub_set_kernel")
+@patch("chutes_cvm.host.setup._get_kernel_version", return_value="6.17.0-15-generic")
+@patch("chutes_cvm.host.setup._run")
 @patch("os.geteuid", return_value=0)
 def test_setup_host_calls_all_steps(
     mock_euid,
@@ -284,42 +253,83 @@ def test_setup_host_calls_all_steps(
     mock_grub_kernel,
     mock_grub_cmdline,
     mock_kvm,
-    mock_install_deps,
+    mock_ntp,
+    mock_dirs,
 ):
-    profile = Ubuntu2510Profile()
+    profile = Ubuntu2604Profile()
     setup_host(profile)
 
     mock_kver.assert_called_once_with(profile.kernel_package)
     mock_grub_kernel.assert_called_once_with("6.17.0-15-generic")
     mock_grub_cmdline.assert_called_once_with(profile.grub_cmdline_additions)
     mock_kvm.assert_called_once()
-    mock_install_deps.assert_called_once()
+    # The folded-in per-host config steps run as part of setup-host.
+    mock_ntp.assert_called_once()
+    mock_dirs.assert_called_once()
 
     install_calls = [
         c for c in mock_run.call_args_list if len(c[0]) > 0 and "install" in c[0][0]
     ]
     assert len(install_calls) > 0, "apt install should have been called"
-
-
-@patch("chutes.guest.gpu.tools.ensure_gpu_tools_available")
-@patch("chutes.host.setup._symlink_host_bin_tools")
-@patch("os.geteuid", return_value=0)
-def test_install_dependencies_runs_symlink_and_gpu_tools(
-    mock_euid, mock_symlink, mock_ensure_gpu
-):
-    install_dependencies()
-    mock_symlink.assert_called_once()
-    mock_ensure_gpu.assert_called_once()
-
-
-@patch("os.geteuid", return_value=1000)
-def test_install_dependencies_exits_if_not_root(mock_euid):
-    with pytest.raises(SystemExit):
-        install_dependencies()
+    # base_packages (chrony/aria2/xfsprogs) are installed alongside the kernel + TDX stack.
+    installed = [pkg for c in install_calls for pkg in c[0][0]]
+    assert "chrony" in installed and "aria2" in installed and "xfsprogs" in installed
 
 
 @patch("os.geteuid", return_value=1000)
 def test_setup_host_exits_if_not_root(mock_euid):
-    profile = Ubuntu2510Profile()
+    profile = Ubuntu2604Profile()
     with pytest.raises(SystemExit):
         setup_host(profile)
+
+
+# ---------------------------------------------------------------------------
+# base_packages + folded-in host config (ntp / chutes_dirs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("version", list(HOST_PROFILES.keys()))
+def test_every_profile_base_packages_include_host_deps(version):
+    """The folded-in host operational deps must be present so setup-host fully provisions."""
+    profile = HOST_PROFILES[version]
+    assert {"chrony", "aria2", "xfsprogs"}.issubset(set(profile.base_packages))
+
+
+@patch("chutes_cvm.host.setup._run")
+@patch("chutes_cvm.host.setup._write_system_file")
+@patch("chutes_cvm.host.setup.proc.run", return_value=MagicMock(returncode=0))
+def test_setup_ntp_masks_timesyncd_writes_conf_and_enables_chrony(
+    mock_sub, mock_write, mock_run
+):
+    _setup_ntp()
+    # systemd-timesyncd is masked (chrony owns the clock).
+    assert any(
+        "systemd-timesyncd" in c.args[0] and "mask" in c.args[0]
+        for c in mock_sub.call_args_list
+    )
+    # chrony.conf is written with makestep (immediate step, not slew).
+    assert mock_write.call_args.args[0] == "/etc/chrony/chrony.conf"
+    assert "makestep" in mock_write.call_args.args[1]
+    # chrony is enabled + started.
+    assert any(
+        "chrony" in c.args[0] and "enable" in c.args[0] for c in mock_run.call_args_list
+    )
+
+
+@patch("chutes_cvm.host.setup.proc.run", return_value=MagicMock(returncode=1))
+@patch("chutes_cvm.host.setup._write_system_file")
+@patch("chutes_cvm.host.setup._run")
+def test_setup_ntp_tolerates_waitsync_failure(mock_run, mock_write, mock_sub):
+    # A non-zero waitsync (clock not yet synced) must not raise — setup continues.
+    _setup_ntp()  # returncode=1 on the tolerant subprocess calls; no exception
+
+
+@patch("chutes_cvm.host.setup.os.chmod")
+@patch("chutes_cvm.host.setup.os.makedirs")
+def test_ensure_chutes_dirs_creates_expected(mock_makedirs, mock_chmod):
+    _ensure_chutes_dirs()
+    made = [c.args[0] for c in mock_makedirs.call_args_list]
+    assert "/var/lib/chutes/base-images" in made
+    assert "/var/lib/chutes/vm-images" in made
+    # created idempotently
+    assert all(c.kwargs.get("exist_ok") for c in mock_makedirs.call_args_list)

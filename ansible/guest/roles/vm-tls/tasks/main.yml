@@ -1,0 +1,93 @@
+---
+# vm-tls — installs setup_vm_tls, the initramfs init-bottom script
+# (PREREQ=setup_storage) that signs the VM mTLS leaf certs (proxy server cert +
+# registry client cert) from the per-boot VM root CA and then deletes the CA key
+# — all within the RTMR2-measured initramfs before pivot_root. The CA itself is
+# generated earlier in fetch_key_and_unlock (init-premount) and registered with
+# the validator implicitly via the RTMR3-attested /provision call in
+# setup_storage (no separate registration endpoint).
+#
+# This role runs against hosts: vm (like signing-keys and rtmr3-measure) and
+# installs the script onto the live VM filesystem. The "update initramfs"
+# handler rebuilds the running image's initramfs; the LUKS role (later, on
+# hosts: host) also runs update-initramfs in a chroot of the final image and
+# picks the on-disk script up automatically. Ordering the role BEFORE the luks
+# role in the playbook keeps the script present when that chroot rebuild runs.
+
+- name: Install setup_vm_tls initramfs script
+  ansible.builtin.copy:
+    src: initramfs/setup_vm_tls
+    dest: /etc/initramfs-tools/scripts/init-bottom/setup_vm_tls
+    owner: root
+    group: root
+    mode: '0755'
+  notify: update initramfs
+
+# ── Registry mTLS leaf: shared group + consumer wiring (self-contained) ───────
+# This role owns the registry-client-leaf access story end to end, mirroring the
+# signing-keys role. The leaf is minted root:root under 0700 /run/chutes by the
+# setup_vm_tls script above; here we create the shared registry-tls group, a
+# boot-time perms unit that chgrp's the leaf to it, and SupplementaryGroups
+# drop-ins granting each consumer group membership. Wiring consumers via drop-ins
+# (not by editing their units) keeps admission-controller and chute-log-shipper
+# ignorant of registry mTLS and independently runnable, and lands the group with
+# the SupplementaryGroups= referencing it — after admission's first (group-less)
+# start earlier in the build.
+#
+# containerd reads the leaf directly via registries.yaml; cosign is passed it
+# explicitly with --registry-client-cert, as go-containerregistry ignores the
+# Docker certs.d convention.
+
+- name: Create registry-tls group (shared read access to the registry mTLS leaf)
+  ansible.builtin.group:
+    name: registry-tls
+    gid: 10152
+    state: present
+    system: true
+
+- name: Install registry mTLS leaf permission units
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - registry-tls-config.path
+    - registry-tls-config.service
+
+- name: Ensure consumer systemd drop-in directories exist
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - admission-controller
+    - chute-log-shipper
+
+- name: Grant admission-controller registry mTLS leaf access via drop-in
+  ansible.builtin.copy:
+    src: admission-registry-tls.conf
+    dest: /etc/systemd/system/admission-controller.service.d/40-registry-tls.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Grant chute-log-shipper registry mTLS leaf access via drop-in
+  ansible.builtin.copy:
+    src: chute-log-shipper-registry-tls.conf
+    dest: /etc/systemd/system/chute-log-shipper.service.d/20-registry-tls.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+# Enable-only at build time: the leaf does not exist on the build VM. On a real
+# boot the initramfs mints it before multi-user.target, so the path unit fires
+# and the perms oneshot runs before the consumers start.
+- name: Enable registry mTLS leaf permission path unit
+  ansible.builtin.systemd:
+    name: registry-tls-config.path
+    enabled: true
+    daemon_reload: true

@@ -1,0 +1,57 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-premount/fetch_key_and_unlock_debug
+#
+# DEBUG IMAGE ONLY. Runs the shared boot-attestation flow (attest-common) to obtain
+# ephemeral validator auth and let the validator register the VM root CA, proving hotkey
+# possession over the server nonce (hotkey-sign, shared with prod).
+#
+# Two deliberate differences from prod fetch_key_and_unlock:
+#   * FAIL-OPEN — any failure logs and lets the VM boot anyway. A debug image is an
+#     inspection tool (SSH/root, no LUKS); it is never trusted with real traffic, so
+#     blocking boot buys nothing. Powering off would only defeat the tool.
+#   * NO LUKS — the debug image is unencrypted; there is no device to unlock/rotate.
+#
+# This script exists ONLY in the debug initramfs, so prod carries none of the fail-open
+# code and has a distinct measurement.
+PREREQ="load-tdx network"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+[ -f /etc/tdx-luks.conf ] && . /etc/tdx-luks.conf
+. /scripts/attest-common
+
+if [ -z "$TDX_BASE_URL" ]; then
+    log_failure_msg "debug attestation: missing TDX configuration (/etc/tdx-luks.conf) — skipping"
+    exit 0   # fail-open: continue booting
+fi
+
+# Fail-open: log and keep booting instead of powering off.
+handle_failure() {
+    log_failure_msg "debug attestation failed (continuing boot): $1"
+    echo "DEBUG-ATTEST-FAILED: $1" > /dev/kmsg 2>/dev/null || true
+}
+
+echo ""
+log_msg "Starting debug boot attestation (fail-open, no LUKS)"
+log_msg "TDX mTLS base: ${TDX_BASE_URL}"
+
+# run_boot_attestation has already called handle_failure (log-only here) on any
+# failure. On success, persist the ephemeral /run/chutes state (validator auth,
+# cert-hash, luks-quote-nonce, etc.) for the debug storage/tls scripts. On failure we
+# boot anyway (fail-open) without it, and those scripts degrade the same fail-open way.
+if run_boot_attestation; then
+    write_boot_state
+else
+    # Fail-open: no real credentials from the API (unregistered image, API 500, etc.).
+    # Write a format-valid dummy validator ss58 (well-known Alice dev key) so the normal
+    # downstream startup runs unchanged — write-validator-auth, 03-k3s-validator-auth.sh
+    # and system-manager all see a credential exactly as in prod, needing no debug
+    # branches. A debug VM never serves real traffic, so this allow-list entry is inert.
+    mkdir -m 0700 -p /run/chutes
+    printf '%s' "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" > /run/chutes/validator-ss58
+    chmod 600 /run/chutes/validator-ss58
+    log_msg "debug attestation fail-open: wrote dummy validator-ss58 for normal downstream startup"
+fi
+
+exit 0

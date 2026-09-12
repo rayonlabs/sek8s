@@ -10,17 +10,28 @@ DC=docker compose -p ${PROJECT} -f ${COMPOSE_FILE} -f ${COMPOSE_BASE_FILE}
 POETRY ?= "poetry"
 
 SRC_DIR := src
-PACKAGES := $(shell ls $(SRC_DIR))
+# Python packages only: the Python tooling below derives src/<pkg>/<import>/ paths and
+# -p/--cov import names from this list, so non-Python packages under src/ (e.g. the
+# sr25519-signer Rust crate) must not appear in it.
+PACKAGES := $(patsubst $(SRC_DIR)/%/pyproject.toml,%,$(wildcard $(SRC_DIR)/*/pyproject.toml))
 VERSION := $(shell head ansible/guest/VERSION | grep -Eo "\d+.\d+.\d+")
 
 # Package filter: "make <target> sek8s" selects one package
 PKG_FILTER := $(filter $(PACKAGES),$(MAKECMDGOALS))
 SELECTED_PKGS := $(or $(PKG_FILTER),$(PACKAGES))
 
-# Wire package goal into PROJECT for docker targets (build/tag/push/sign)
+# Standalone docker images: docker/<name> with a Dockerfile and no matching src/ package.
+# Image filter: "make images busybox" selects one image; bare "make images" builds all.
+STANDALONE_IMAGES := $(shell for d in docker/*/; do n=$$(basename "$$d"); [ -f "$$d/Dockerfile" ] && [ ! -d "src/$$n" ] && echo $$n; done)
+IMG_FILTER := $(filter $(STANDALONE_IMAGES),$(MAKECMDGOALS))
+SELECTED_IMGS := $(or $(IMG_FILTER),$(STANDALONE_IMAGES))
+
+# Wire package/image goal into PROJECT for docker targets (build/tag/push/sign)
 ifeq ($(PROJECT),)
 ifneq ($(PKG_FILTER),)
 override PROJECT := $(firstword $(PKG_FILTER))
+else ifneq ($(IMG_FILTER),)
+override PROJECT := $(firstword $(IMG_FILTER))
 endif
 endif
 
@@ -42,6 +53,12 @@ MYPY_ARGS := $(foreach pkg,$(SELECTED_PKGS),-p $(call pkg_to_import,$(pkg)))
 # Allow package names as make goals (no-op targets)
 ifneq ($(PKG_FILTER),)
 $(PKG_FILTER):
+	@:
+endif
+
+# Allow standalone image names as make goals (no-op targets)
+ifneq ($(IMG_FILTER),)
+$(IMG_FILTER):
 	@:
 endif
 

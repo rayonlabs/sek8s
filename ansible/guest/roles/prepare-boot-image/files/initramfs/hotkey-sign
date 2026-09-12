@@ -1,0 +1,65 @@
+# /etc/initramfs-tools/scripts/hotkey-sign
+#
+# Miner-hotkey proof-of-possession for the boot attestation / provision flow, sourced by the
+# boot-lifecycle initramfs scripts (attest-common, provision-common).
+#
+# The seed cannot drive the Python substrate stack in a busybox initramfs, so signing uses the
+# staged static /usr/bin/sr25519 (Schnorr/Ristretto, byte-compatible with substrate-interface).
+# The proof is an sr25519 signature over  {ss58}:{nonce}:{sha256(body)}  where {nonce} is the
+# server-issued single-use nonce each call is chained (each API response hands the next call its
+# nonce, also sent verbatim in X-Chutes-Nonce), and {sha256(body)} is the hex sha256 of the exact
+# request body. Sent in X-Chutes-Signature alongside X-Chutes-Hotkey. The API reconstructs the same
+# message (get_signing_message with the body hash it computed over the received bytes; verify_hotkey_auth)
+# and verifies it against the hotkey, so a caller cannot assert another miner's (hotkey, vm_name)
+# and rotate its LUKS passphrase.
+#
+# Staged UNCONDITIONALLY (prod + debug): the hotkey identity is proven on every boot. The seed
+# arrives at runtime on the per-VM config volume; it is stashed to
+# the initramfs /run tmpfs (while the volume is mounted, in init-premount) and shredded before
+# pivot_root. Signing derives the ss58 from the STASHED FILE each call — not a shell var — because
+# init-premount and init-bottom are separate script invocations and only the /run file persists.
+
+HOTKEY_SEED="/run/chutes/miner-seed"
+
+# hotkey_stash_seed <config_mount>
+#   Copy the miner seed off the (currently mounted) config volume into the initramfs /run tmpfs.
+#   Called in init-premount while the config volume is still mounted. Returns 1 if the seed is
+#   missing or does not derive a valid hotkey.
+hotkey_stash_seed() {
+    _hk_src="$1/miner-seed"
+    [ -f "$_hk_src" ] || return 1
+    mkdir -m 0700 -p /run/chutes
+    cp "$_hk_src" "$HOTKEY_SEED"
+    chmod 600 "$HOTKEY_SEED"
+    [ -n "$(hotkey_ss58)" ] || return 1
+    return 0
+}
+
+# hotkey_ss58
+#   Echo the AUTHORITATIVE ss58 derived from the stashed seed. Works in any later init-bottom
+#   script (the seed file persists on /run tmpfs; shell globals do not). Deriving from the seed
+#   rather than trusting the config's miner-ss58 is the point — it proves possession, and closes
+#   the footgun where a typo'd miner-ss58 attests under a hotkey every allow_miner route rejects.
+hotkey_ss58() {
+    [ -f "$HOTKEY_SEED" ] || return 1
+    sr25519 address --seed-file "$HOTKEY_SEED" 2>/dev/null
+}
+
+# hotkey_sign <nonce> <body>
+#   Echo a hex sr25519 signature over  {ss58}:{nonce}:{sha256hex(body)}  — the exact message the API
+#   reconstructs (get_signing_message with payload_hash = request.state.body_sha256, hashed over the
+#   received body bytes; verify_hotkey_auth). {nonce} must be the call's server-issued nonce, also
+#   sent verbatim in X-Chutes-Nonce. {body} must be byte-identical to the curl -d payload. Echoes
+#   nothing when no seed was stashed. sr25519 emits hex, decoded API-side with bytes.fromhex().
+hotkey_sign() {
+    _hk_ss58=$(hotkey_ss58) || return 0
+    [ -n "$_hk_ss58" ] || return 0
+    _hk_bh=$(printf '%s' "$2" | sha256sum | cut -d' ' -f1)
+    sr25519 sign --seed-file "$HOTKEY_SEED" --message "${_hk_ss58}:${1}:${_hk_bh}" 2>/dev/null
+}
+
+# hotkey_shred_seed
+#   Remove the stashed seed. Called before pivot_root so the initramfs copy never reaches userspace.
+hotkey_shred_seed() {
+    rm -f "$HOTKEY_SEED"
+}

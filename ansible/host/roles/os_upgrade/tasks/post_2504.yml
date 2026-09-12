@@ -1,7 +1,7 @@
 ---
 # Post-upgrade tasks for hosts upgraded FROM Ubuntu 25.04 (Plucky).
 # Runs after do-release-upgrade completes but BEFORE the first reboot into
-# the new OS. Fixes must be in place before boot — setup-tdx-host handles
+# the new OS. Fixes must be in place before boot — chutes-cvm host setup handles
 # full OS state after the reboot.
 
 # ── Fix dkms.service / cloud-init-network deadlock ──────────────────────────

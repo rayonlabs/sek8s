@@ -11,11 +11,15 @@ all:
 
   vars:
     ansible_user: "{{ lookup('env', 'USER') }}"
-    cosign_public_key_path: "~/.cosign/cosign.pub"
-    # Helm chart signing PGP public key (required)
-    helm_chart_public_key_path: "~/.chutes/helm-pubkey.gpg"
+    # Root RSA PUBLIC key — baked into the image and measured into RTMR3. Fetched at build time
+    # from R2 (not user-supplied). It is published from KMS out-of-band in chutes-ops
+    # (`make export-signing-keys && make publish-signing-key`) — a manual prerequisite, NOT part of
+    # the build (the build depends on it, so it can never upload it). root_signing_key_path is just
+    # the build-local cache the fetch fills.
+    root_signing_key_url: "https://vm.chutes.ai/root-signing-key.pem"
+    root_signing_key_path: "/tmp/chutes-root-signing-key.pem"
     luks_passphrase: "{{ lookup('env', 'LUKS_PASSPHRASE') | mandatory }}"
-    tdx_base_url: "https://tdx-attestation.example.com:8443"
+    tdx_base_url: "https://cvm.chutes.ai"
     validator_base_url: "https://api.chutes.ai"
     build_env: "prod"
     prime_wait_timeout: 300
@@ -23,6 +27,5 @@ all:
     debug_build: false
     # List of SSH public key strings for guest access (required when using tee-gpu-vm.yml)
     guest_ssh_keys: []
-    validator: "5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ"
     # Optional: Override sek8s image tag for testing (default: "latest")
     # sek8s_image_tag: "dev-latest"

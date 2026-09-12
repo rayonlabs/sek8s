@@ -1,0 +1,49 @@
+---
+# Init tasks for hosts that have just booted into Ubuntu 26.04 (target-keyed,
+# unlike source-keyed pre_/post_). Runs after the reboot but BEFORE
+# host_prerequisites / tdx_bootstrap run chutes-cvm host setup. Included by hop.yml on
+# the final hop only.
+#
+# Restore the PCCS artifacts that pre_2510 backed up and removed (Intel's noble
+# sgx-dcap-pccs was uninstallable on 25.10 — see pre_2510.yml). Putting the
+# preserved config/ (API key, token hashes, cached collateral) and ssl_key/
+# (TLS cert) back BEFORE chutes-cvm host setup reinstalls the package means the
+# package's own post-install (which starts the service — chutes-cvm host setup does
+# not) comes up already configured, the same end state as a fresh provision,
+# instead of starting on an empty template and being patched afterward. The
+# removal used purge:false, so apt keeps the retained conffiles on reinstall and
+# the restored config survives. Self-gating on the backup, so it is a no-op for
+# hosts that arrived at 26.04 without PCCS having been removed.
+
+- name: "Init 26.04: check for preserved PCCS backup"
+  ansible.builtin.stat:
+    path: "{{ pccs_upgrade_backup_dir }}"
+  register: _pccs_backup
+
+- name: "Init 26.04: restore PCCS artifacts before chutes-cvm host setup"
+  when: _pccs_backup.stat.exists
+  block:
+    - name: "Init 26.04: ensure PCCS install dir exists"
+      ansible.builtin.file:
+        path: "{{ pccs_install_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Init 26.04: find backed-up PCCS artifacts"
+      ansible.builtin.find:
+        paths: "{{ pccs_upgrade_backup_dir }}"
+        file_type: any
+        depth: 1
+      register: _pccs_backup_items
+
+    - name: "Init 26.04: overlay preserved PCCS artifacts (preserve owner/perms)"
+      ansible.builtin.command:
+        cmd: "cp -aT {{ item.path }} {{ pccs_install_dir }}/{{ item.path | basename }}"
+      loop: "{{ _pccs_backup_items.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: "Init 26.04: remove PCCS backup after successful restore"
+      ansible.builtin.file:
+        path: "{{ pccs_upgrade_backup_dir }}"
+        state: absent

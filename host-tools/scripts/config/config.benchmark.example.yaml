@@ -1,11 +1,11 @@
 # Benchmark TEE VM Configuration
 # Partner SSH access only — no miner credentials, no cache/config volume.
-# Pass --benchmark to quick-launch.sh when using this config.
+# Pass --benchmark to `chutes-cvm guest launch` when using this config.
 
 vm:
   hostname: chutes-benchmark-0
-  base_image: "/var/lib/chutes/base-images/tdx-guest-benchmark.qcow2"
-  overlay_directory: ""  # Empty = /var/lib/chutes/vm-overlays/
+  base_image: "/var/lib/chutes/base-images/tdx-guest-benchmark/"
+  vm_image_directory: ""  # Empty = /var/lib/chutes/vm-images/
 
 # miner block is not used in benchmark mode — omit entirely
 # (standard mode requires miner.ss58 and miner.seed)

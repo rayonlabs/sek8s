@@ -141,19 +141,9 @@ EOF
 # top-level k3s config keys (unknown top-level keys are silently ignored by k3s).
 ENCRYPTION_CONFIG="/run/chutes/k3s-encryption-config.yaml"
 
-# Debug builds bake a static encryption config at /etc/chutes; production writes
-# the real one to /run/chutes from initramfs before this script runs. Materialize
-# the debug copy here — BEFORE the check below — so debug enables encryption at the
-# same boot stage prod does. Otherwise this script (which runs before k3s.service)
-# never sees the file, because the debug copy was previously done by k3s.service's
-# ExecStartPre, which runs AFTER this — leaving encryption off for the whole boot.
-DEBUG_ENCRYPTION_SRC="/etc/chutes/k3s-encryption-config.yaml"
-if [ ! -f "$ENCRYPTION_CONFIG" ] && [ -f "$DEBUG_ENCRYPTION_SRC" ]; then
-    mkdir -m 700 -p /run/chutes
-    cp "$DEBUG_ENCRYPTION_SRC" "$ENCRYPTION_CONFIG"
-    chmod 600 "$ENCRYPTION_CONFIG"
-    log "Materialized debug secrets-encryption config from $DEBUG_ENCRYPTION_SRC"
-fi
+# Both prod and debug now write this file from initramfs before this script runs:
+# prod's setup_storage from the attestation-provided key, debug's setup_storage_debug
+# from a static well-known key. No build-time /etc/chutes fallback is needed.
 
 KUBE_API_ARGS=()
 

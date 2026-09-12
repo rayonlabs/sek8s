@@ -1,9 +1,0 @@
-#!/bin/bash
-# PATH-accessible wrapper for host CPU tuning.
-# Delegates to host-tools/scripts/tune-host.sh
-#
-# Installed as a symlink under /usr/local/bin; BASH_SOURCE is that path, so we
-# must resolve the real file under host-tools/bin before using ../scripts/...
-_SELF=$(readlink -f "${BASH_SOURCE[0]}")
-SCRIPT_DIR=$(cd -- "$(dirname -- "$_SELF")" && pwd)
-exec "${SCRIPT_DIR}/../scripts/tune-host.sh" "$@"

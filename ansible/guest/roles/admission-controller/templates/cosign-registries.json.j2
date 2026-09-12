@@ -9,23 +9,8 @@
           "organization": "parachutes",
           "require_signature": true,
           "verification_method": "key",
-          "public_key": "/etc/admission-controller/cosign/cosign.pub",
+          "public_key": "/run/chutes/signing-keys/cosign/dockerhub.pub",
           "rekor_url": "https://rekor.sigstore.dev"
-        },
-        "bitnami": {
-          "organization": "bitnami",
-          "require_signature": true,
-          "verification_method": "keyless",
-          "keyless_identity_regex": "^https://github.com/bitnami/.*",
-          "keyless_issuer": "https://token.actions.githubusercontent.com",
-          "rekor_url": "https://rekor.sigstore.dev",
-          "repositories": {
-            "kubectl": {
-              "repository": "kubectl",
-              "require_signature": false,
-              "verification_method": "disabled"
-            }
-          }
         }
       }
     },
@@ -60,19 +45,17 @@
       "verification_method": "disabled"
     },
     {
-      "registry": "{{ validator }}.localregistry.chutes.ai:{{ registry_port | default('30500') }}",
+      "registry": "registry.chutes.ai",
       "require_signature": true,
       "verification_method": "key",
-      "allow_http": true,
-      "allow_insecure": true,
-      "public_key": "/etc/admission-controller/cosign/cosign.pub",
+      "public_key": "/run/chutes/signing-keys/cosign/chutes.pub",
       "rekor_url": "https://rekor.sigstore.dev"
     },
     {
       "registry": "*",
       "require_signature": true,
       "verification_method": "key",
-      "public_key": "/etc/admission-controller/cosign/cosign.pub",
+      "public_key": "/run/chutes/signing-keys/cosign/chutes.pub",
       "rekor_url": "https://rekor.sigstore.dev"
     }
   ],

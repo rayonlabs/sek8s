@@ -1,0 +1,51 @@
+backup_dir: /mnt/backup
+root_mount: /mnt/root
+newroot_mount: /mnt/newroot
+nbd_device: /dev/nbd0
+encrypted_root_name: encrypted_root
+
+# Pinned filesystem identifiers. Both were random per build and both reached RTMR2: luksFormat's
+# container UUID via cryptroot/crypttab inside the initrd, and mkfs.ext4's filesystem UUID via
+# root=UUID= in the kernel cmdline. That made every rebuild produce different measurements, which
+# breaks the third-party reproduction that inventory-reproduce.yml documents.
+#
+# Derived (UUIDv5, via to_uuid) from version + build type, so they are stable across rebuilds,
+# distinct per version, and never shared between a debug and a production image. Neither value is
+# secret: the LUKS key is rotated on first boot and the base image is copied per VM.
+_boot_image_uuid_seed: "{{ vm_version | default('0.0.0') }}-{{ 'debug' if debug_build | default(false) | bool else 'prod' }}"
+luks_container_uuid: "{{ ('sek8s-luks-' ~ _boot_image_uuid_seed) | to_uuid }}"
+root_fs_uuid: "{{ ('sek8s-rootfs-' ~ _boot_image_uuid_seed) | to_uuid }}"
+
+# Fixed timestamp for reproducible initramfs packing. mkinitramfs stages files with `cp -pP`, so
+# every member carries its source mtime and two builds pack identical content into different
+# archive bytes — verified by extracting two initrds: no differing files, no size differences, yet
+# different hashes, and RTMR2 moved.
+#
+# mkinitramfs itself has no reference to SOURCE_DATE_EPOCH; the tool it shells out to does.
+# It builds a sorted manifest (LC_ALL=C sort | uniq, so ordering is already deterministic) and
+# hands it to `3cpio --create`, and 3cpio reads SOURCE_DATE_EPOCH to fix member mtimes. The
+# amd64_microcode hook uses the same mechanism explicitly.
+#
+# Value is arbitrary; it only has to be constant across rebuilds and inside 3cpio's accepted
+# range (0 to 4294967295).
+initramfs_source_date_epoch: 1700000000
+
+# Image output env label (override in inventory); used in final_img_path below.
+# The image SET lives in its own <env>/<version>[-debug]/ directory (qcow2 + direct-boot
+# sidecars + manifest.json) — see playbooks/group_vars/host.yml.
+build_env: "dev"
+image_set_name: "{{ vm_version | default('0.0.0') }}{{ '-debug' if debug_build | default(false) else '' }}"
+image_set_dir: "{{ img_dir }}/{{ build_env }}/{{ image_set_name }}"
+final_img_path: "{{ image_set_dir }}/{{ image_set_name }}.qcow2"
+
+# TDX-specific configuration
+# tdx_base_url: mTLS proxy — all boot-sensitive initramfs API calls
+# validator_base_url: fetch-signing-keys (public endpoint) and post-boot services (system-manager)
+tdx_base_url: "https://cvm.chutes.ai"
+validator_base_url: "https://api.chutes.ai"
+tdx_timeout: 30
+tdx_retry_count: 3
+
+# Debug build flag - set to true to skip encryption
+# Can be overridden in inventory.yml
+debug_build: false

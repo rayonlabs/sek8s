@@ -19,6 +19,22 @@
           Is this the intended build? The next step launches the TDX guest VM toward this output path.
           Press Enter to continue, or Ctrl+C to abort.
 
+    # The root RSA PUBLIC key is baked into the image and measured into RTMR3, so every build
+    # (ours and third-party reproductions) must use the SAME key. Fetch it from R2 once here, before
+    # any consumer (chutes-gpu verifies the helm key against it; signing-keys bakes it). Published
+    # to R2 from KMS out-of-band in chutes-ops (make export-signing-keys && make publish-signing-key).
+    # A wrong/missing key fails the build here rather than as an opaque RTMR3 mismatch later.
+    - name: Fetch root signing public key from R2
+      ansible.builtin.get_url:
+        url: "{{ root_signing_key_url }}"
+        dest: "{{ root_signing_key_path }}"
+        mode: "0644"
+        force: true
+
+    - name: Verify the fetched root key is a valid RSA public key
+      ansible.builtin.command: "openssl pkey -pubin -in {{ root_signing_key_path }} -noout"
+      changed_when: false
+
 - name: Run TDX guest image
   hosts: host
   become: true
@@ -29,6 +45,16 @@
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
   tasks:
+    # Install the chutes-cvm CLI from THIS checkout (editable venv + PATH shim) so the
+    # build's `chutes-cvm` calls (measurements/image, here and in capture-ccel)
+    # run the code being built and get the package's deps. Runs once; the console script
+    # is then on PATH for every later play.
+    - name: Install the chutes-cvm CLI from this checkout
+      ansible.builtin.command:
+        cmd: "{{ repo_root }}/src/chutes-cvm/install.sh"
+      register: _cvm_install
+      changed_when: "'Installed chutes-cvm' in _cvm_install.stdout"
+
     - name: Include run TDX vm role
       ansible.builtin.include_role:
         name: run-vm
@@ -38,6 +64,7 @@
   become: true
   tags:
     - common
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -51,6 +78,7 @@
   become: true
   tags:
     - gpu
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -64,6 +92,7 @@
   become: true
   tags:
     - checkpoint-gpu
+    - build
   tasks:
     - name: Save GPU checkpoint
       ansible.builtin.include_role:
@@ -76,6 +105,7 @@
   become: true
   tags:
     - k3s
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -89,6 +119,7 @@
   become: true
   tags:
     - gpu-verify
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -102,6 +133,7 @@
   become: true
   tags:
     - chutes-gpu
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -117,6 +149,7 @@
   become: true
   tags:
     - sek8s
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -132,6 +165,7 @@
   become: true
   tags:
     - attestation-service
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -147,6 +181,7 @@
   become: true
   tags:
     - admission-controller
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -157,11 +192,44 @@
         apply:
           tags: admission-controller
 
+- name: Install signing key trust anchor and initramfs fetch scripts
+  hosts: vm
+  become: true
+  tags:
+    - signing-keys
+    - build
+  handlers:
+    - name: Global handlers
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
+  tasks:
+    - name: Signing keys
+      ansible.builtin.include_role:
+        name: signing-keys
+        apply:
+          tags: signing-keys
+
+- name: Install VM mTLS initramfs cert lifecycle
+  hosts: vm
+  become: true
+  tags:
+    - vm-tls
+    - build
+  handlers:
+    - name: Global handlers
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
+  tasks:
+    - name: VM TLS
+      ansible.builtin.include_role:
+        name: vm-tls
+        apply:
+          tags: vm-tls
+
 - name: Setup system manager service (status + cache)
   hosts: vm
   become: true
   tags:
     - system-manager
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -172,11 +240,28 @@
         apply:
           tags: system-manager
 
+- name: Setup chute log shipper service
+  hosts: vm
+  become: true
+  tags:
+    - chute-log-shipper
+    - build
+  handlers:
+    - name: Global handlers
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
+  tasks:
+    - name: Chute log shipper
+      ansible.builtin.include_role:
+        name: chute-log-shipper
+        apply:
+          tags: chute-log-shipper
+
 - name: Setup cache volume service
   hosts: vm
   become: true
   tags:
     - cache-volume
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -187,12 +272,29 @@
         apply:
           tags: cache-volume
 
+- name: AppArmor hardening
+  hosts: vm
+  become: true
+  tags:
+    - apparmor-hardening
+    - build
+  handlers:
+    - name: Global handlers
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
+  tasks:
+    - name: AppArmor hardening
+      ansible.builtin.include_role:
+        name: apparmor-hardening
+        apply:
+          tags: apparmor-hardening
+
 - name: Add dyanmic config services
   hosts: vm
   become: true
   any_errors_fatal: false
   tags:
     - config
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -208,6 +310,7 @@
   become: true
   tags:
     - lock-accounts
+    - build
   tasks:
     - name: Lock accounts
       ansible.builtin.include_role:
@@ -219,6 +322,7 @@
   become: true
   tags:
     - disable-console
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -233,6 +337,7 @@
   become: true
   tags:
     - debug-credentials
+    - build
   tasks:
     - name: Set known root password for console access (debug builds only)
       ansible.builtin.user:
@@ -240,15 +345,27 @@
         password: "{{ 'debug' | password_hash('sha512') }}"
       when: debug_build | default(false)
 
-    - name: Allow root password SSH login (debug builds only)
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: "{{ item.regexp }}"
-        line: "{{ item.line }}"
-        state: present
-      loop:
-        - { regexp: '^#?PermitRootLogin',       line: 'PermitRootLogin yes' }
-        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication yes' }
+    - name: Allow root password SSH login via high-precedence drop-in (debug builds only)
+      # Ubuntu's cloud image ships /etc/ssh/sshd_config.d/50-cloud-init.conf with
+      # `PasswordAuthentication no`. sshd honours the FIRST value seen for each
+      # keyword, and the main sshd_config Includes the drop-in dir near the top —
+      # so editing the main file is silently overridden by that drop-in and the
+      # debug image ends up key-only (unusable without the build-time key, which
+      # defeats the point of a debug image). Disabling cloud-init does NOT remove
+      # the drop-in. A `00-` drop-in sorts before `50-cloud-init.conf`, so its
+      # values are seen first and win — restoring password/console access.
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-debug-access.conf
+        content: |
+          # Debug build only — restores root password SSH + console access so the
+          # image is usable without the build-time key (e.g. measurement capture).
+          # Named `00-` to win first-match precedence over 50-cloud-init.conf.
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+        owner: root
+        group: root
+        mode: '0644'
       when: debug_build | default(false)
 
 - name: Security Hardening
@@ -256,6 +373,7 @@
   become: true
   tags:
     - security
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -264,11 +382,28 @@
       ansible.builtin.include_role:
         name: security
 
+- name: Install sr25519 signer (guest boot-time hotkey proof-of-possession)
+  hosts: vm
+  become: true
+  tags:
+    - sr25519
+    - build
+  handlers:
+    - name: Global handlers
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
+  tasks:
+    # Before the luks play rebuilds the final initramfs — fetch_key copy_exec's /usr/bin/sr25519
+    # into it, so the binary must exist first (and while the VM is still up).
+    - name: Install sr25519 signer
+      ansible.builtin.include_role:
+        name: sr25519
+
 - name: Extend RTMR3 with guest software stack
   hosts: vm
   become: true
   tags:
     - rtmr3-measure
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -283,6 +418,7 @@
   any_errors_fatal: false
   tags:
     - cleanup-orchestration
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -297,6 +433,7 @@
   any_errors_fatal: false
   tags:
     - cleanup-build-vm
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -310,6 +447,7 @@
   become: true
   tags:
     - remove-ssh
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -324,6 +462,7 @@
   become: true
   tags:
     - finalize-vm-image
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
@@ -332,41 +471,123 @@
       ansible.builtin.include_role:
         name: finalize-vm-image
 
-- name: Compute expected RTMR3 from final image
+# The whole measurement phase — gather-measurement-inputs + compute-measurements +
+# image-manifest — is generated by the fork entirely OFFLINE (no TDX hardware) and cheap, so
+# it always runs as part of a full build. There's no on/off variable and no per-profile
+# selection: it generates every profile (pending ones self-skip). Every register (mrtd + rtmr0
+# + rtmr1/2 + rtmr3) is computed POST-luks in one `build` call below, since the CLI unlocks the
+# encrypted root with LUKS_PASSPHRASE to read RTMR3's userspace files. To build the image
+# WITHOUT measurements (e.g. non-Docker or fast local dev iteration), run `--tags build`, or
+# `--skip-tags compute-measurements` — the whole chain shares the `compute-measurements` tag.
+- name: Prepare boot image (encrypt + measured initramfs for prod / install debug initramfs)
   hosts: host
   become: true
   tags:
-    - compute-rtmr3
-  tasks:
-    - name: Compute RTMR3
-      ansible.builtin.include_role:
-        name: compute-rtmr3
-
-- name: Encrypt disk
-  hosts: host
-  become: true
-  tags:
-    - luks
+    - prepare-boot-image
+    - build
   handlers:
     - name: Global handlers
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../handlers/main.yml"
   tasks:
-    - name: Encrypt disk
+    - name: Prepare boot image
       ansible.builtin.include_role:
-        name: luks
+        name: prepare-boot-image
         apply:
-          tags: luks
-      when: not (debug_build | default(false))
+          tags: prepare-boot-image
 
-- name: Prime VM for stable TDX measurements
+# ── Measurement GATHER (post-boot-image) ──────────────────────────────────────
+# The initrd is now final (prepare-boot-image rebuilt it for prod AND debug). Stage this image's
+# direct-boot vmlinuz/initrd/cmdline — RTMR1/2 measure these exact bytes.
+#
+# There is NO CCEL capture in this build flow: the tdx-measure fork self-generates the
+# complete RTMR0 offline, so the build needs no TDX hardware. The `capture-ccel` role is
+# retained on disk as a STANDALONE tool (for the occasional debug / new-CPU-gen cross-
+# check against a real quote — include it from a one-off playbook when needed), but it is
+# deliberately not part of the build: the fork is the source of truth, and the runtime
+# attestation match is the ongoing guarantee.
+- name: Gather measurement inputs from final image (post-luks)
   hosts: host
   become: true
   tags:
-    - prime-vm
+    - gather-measurement-inputs
+    - compute-measurements
   tasks:
-    - name: Prime VM EFI boot variable state
+    - name: Stage direct-boot artifacts
       ansible.builtin.include_role:
-        name: prime-vm
-        apply:
-          tags: prime-vm
+        name: stage-boot-artifacts
+
+# ── Measurement COMPUTE (post-luks) ───────────────────────────────────────────
+# `chutes-cvm measurements generate` computes EVERY register in one call — mrtd + RTMR0
+# (per-topology, the fork) + RTMR1/RTMR2 (the staged direct-boot artifacts) + RTMR3 (mounting the
+# root, unlocked with LUKS_PASSPHRASE) — writing the version's single measurements.yaml.
+# tdx-measure builds the shared fork engine. All offline (no TDX/GPU).
+- name: Compute measurements from gathered inputs (post-luks)
+  hosts: host
+  become: true
+  tags:
+    - compute-measurements
+  tasks:
+    - name: Provision the tdx-measure fork (RTMR0/1/2 engine)
+      ansible.builtin.include_role:
+        name: tdx-measure
+
+    - name: Build the full measurements.yaml (mrtd + rtmr0 all topologies + rtmr1/2 + rtmr3)
+      ansible.builtin.command:
+        argv:
+          - chutes-cvm
+          - measurements
+          - generate
+          - --version
+          - "{{ vm_version }}"
+          - --image
+          - "{{ final_img_path }}"
+          - --output
+          - "{{ repo_root }}/measurements/{{ vm_version }}{{ '-debug' if debug_build | default(false) else '' }}/measurements.yaml"
+          - --tdx-measure-bin
+          - "{{ tdx_measure_bin | default('tdx-measure') }}"
+          # Source of the known host classes + their fingerprints (the build host must reach it).
+          - --api-base
+          - "{{ measurements_api_base | default('https://api.chutes.ai') }}"
+          # This build is the measurement generator, so it processes the full queue — including
+          # host classes awaiting generation (a newly submitted profile is 'pending' until its
+          # measurement exists here). Third-party verification runs omit this and see measured only.
+          - --include-pending
+      environment:
+        # RTMR3 mounts the root; LUKS_PASSPHRASE unlocks it when the image is encrypted (prod).
+        LUKS_PASSPHRASE: "{{ luks_passphrase | default('') }}"
+        # The tdx-measure fork shells out to `docker build` for offline ACPI generation;
+        # extend PATH so it is found even under snap or a minimal inherited PATH.
+        PATH: "{{ lookup('env', 'PATH') }}:/usr/local/bin:/usr/bin:/snap/bin"
+      register: _measurements_build
+      changed_when: _measurements_build.rc == 0
+
+    - name: Show measurements build output
+      ansible.builtin.debug:
+        var: _measurements_build.stderr_lines
+
+- name: Stage the published image-set manifest
+  hosts: host
+  become: true
+  tags:
+    - image-manifest
+    - compute-measurements
+  tasks:
+    # The publishable image is a SET: the finished qcow2 + its direct-boot artifacts + a
+    # manifest.json tying them together, all in the set's own <env>/<version>[-debug]/
+    # directory (so prod and debug never share a manifest, and the directory can be copied
+    # straight into /var/lib/chutes/base-images/<variant>/ for testing). chutes_cvm.guest.image_set is the single manifest
+    # generator (also used by publish and the launcher), so the schema never drifts.
+    # Generated over the FINAL qcow2 so the recorded sha256 matches what miners
+    # download, and for whichever variant this build produced (debug or prod) — so the
+    # build (ansible) owns the published sha for both. Depends on the direct-boot sidecars
+    # from stage-boot-artifacts, so it carries the `compute-measurements` tag too — a
+    # `--skip-tags compute-measurements` skips the manifest with them.
+    - name: Generate manifest.json for the finished image set
+      ansible.builtin.command:
+        chdir: "{{ repo_root }}/host-tools/scripts"
+        argv: >-
+          {{ ['chutes-cvm', 'image', 'manifest', final_img_path,
+              '--version', vm_version]
+             + (['--debug'] if (debug_build | default(false)) else []) }}
+      changed_when: true
 

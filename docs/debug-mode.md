@@ -55,7 +55,7 @@ The default is defined in each role's `defaults/main.yml` and can be overridden 
 make build-image
 
 # The playbook will automatically:
-# - Skip the luks role (no encryption)
+# - Run prepare-boot-image in debug mode (debug initramfs, no encryption)
 # - Skip the harden-access role (keep SSH access)
 # - Configure containerd cache for unencrypted device
 ```
@@ -67,7 +67,7 @@ make build-image
 make build-image
 
 # The playbook will:
-# - Run the luks role (encrypt root and setup boot scripts)
+# - Run prepare-boot-image (encrypt root + boot scripts + measured initramfs)
 # - Run the harden-access role (remove SSH access)
 # - Configure containerd cache for encrypted device with attestation
 ```
@@ -76,9 +76,9 @@ make build-image
 
 ### Roles Affected
 
-1. **luks role** - Skipped when `debug_build: true`
+1. **prepare-boot-image role** - Runs `debug.yml` (no encryption) when `debug_build: true`
    - No root encryption
-   - No boot scripts installed
+   - Fail-open debug initramfs installed instead of the LUKS-unlock prod one
    - No attestation setup
 
 2. **harden-access role** - Skipped when `debug_build: true`
@@ -130,12 +130,13 @@ fi
 
 ```bash
 cd host-tools/scripts
-./quick-launch.sh --download-debug
+chutes-cvm image download --debug
 ```
 
-This downloads the debug image to `/var/lib/chutes/base-images/tdx-guest-debug.qcow2`.
+This downloads the debug image set (qcow2 + boot artifacts + `manifest.json`) into
+`/var/lib/chutes/base-images/tdx-guest-debug/` and verifies it against the manifest.
 
-### Launch with quick-launch.sh
+### Launch with chutes-cvm
 
 Use the debug example config as a starting point:
 
@@ -143,7 +144,7 @@ Use the debug example config as a starting point:
 cd host-tools/scripts
 cp config/config.debug.example.yaml config.yaml
 # Edit config.yaml with your credentials and network settings
-./quick-launch.sh config.yaml --foreground
+chutes-cvm guest launch config.yaml --foreground
 ```
 
 The debug config sets `vm.base_image` to the debug image path and uses smaller volume sizes. See [`config/config.debug.example.yaml`](../host-tools/scripts/config/config.debug.example.yaml) for the full template.

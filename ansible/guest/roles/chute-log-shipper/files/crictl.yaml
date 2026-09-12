@@ -1,0 +1,5 @@
+# crictl config for chute-log-shipper. The non-root service cannot read k3s's own
+# crictl.yaml (root-only agent dir), so it uses this readable copy via --config.
+runtime-endpoint: unix:///run/k3s/containerd/containerd.sock
+image-endpoint: unix:///run/k3s/containerd/containerd.sock
+timeout: 10

@@ -7,13 +7,41 @@ The System Status service is a read-only FastAPI endpoint that runs inside the g
 
 | Capability | Description |
 | --- | --- |
-| Service inventory | Enumerate the fixed allowlist of managed systemd units (admission controller, **system manager**, attestation service, k3s server, `nvidia-persistenced`, `nvidia-fabricmanager`, and `infiniband-config`). |
+| Service inventory | Enumerate the fixed allowlist of managed systemd units: the long-running sek8s services (admission controller, **OPA**, **system manager**, attestation service, **chute log shipper**), k3s server, `storage-bind-mounts`, and the GPU/fabric units (`nvidia-persistenced`, `nvidia-fabricmanager`, `infiniband-config`). |
 | Service status | Return summarized health derived from `systemctl show` for an allowlisted unit. |
 | Service logs | Tail the latest N log lines (`journalctl -u <unit>`) with optional time window filtering. |
 | GPU telemetry | Surface `nvidia-smi` output in either default (summary) or `-q` (detailed) modes with optional GPU index selection. |
 | Overview summary | Aggregate all service statuses with the latest `nvidia-smi` result to produce an "ok"/"degraded" snapshot. |
 
 Future enhancements (e.g., additional units) must be added explicitly to the allowlist to avoid broadening the attack surface.
+
+Because the prod VM has no console or SSH access, this allowlist is the **only** operator/tooling view of a
+unit — and it is also the **only** way journal content leaves the guest. That makes the allowlist a
+confidentiality boundary, not just a convenience:
+
+- **The miner is the party this guest is confidential *from*.** Miner-authenticated calls to
+  `/services/{id}/logs` are how the miner CLI reads guest journals, so anything a unit logs is effectively
+  published to the host operator. A unit qualifies only when its journal is free of **tenant/validator**
+  material: chute log content, admission review objects (pod specs, env, mounts), key material.
+- **Secondarily, the validator reads the same endpoints**, so units handling the *miner's own* credentials
+  stay off the list too — not to protect them from the miner, but to keep `MINER_SEED` away from the validator.
+  This is why `config-manager.service` (config-volume credential handling) is excluded.
+
+`opa.service` is on the list, but only because `decision_logs` is off by default (see
+`ansible/guest/roles/admission-controller/defaults/main.yml`). A build with `-e opa_decision_logs=true`
+puts full AdmissionReview inputs in that journal and therefore behind this endpoint — acceptable for a debug
+build (which already has console access), never for prod.
+
+**Traceback hygiene.** Loguru's default `diagnose=True` renders frame-local *values* into exception
+tracebacks, which on an error path would put request data into an allowlisted journal. The admission path
+(`services/admission_controller.py`, `validators/`, `clients/cosign.py`) uses stdlib `logging`, which never
+renders locals, so it was never exposed — but the guest mixes both libraries, so every service entrypoint now
+calls `sek8s_common.log_config.configure_logging()` to install a `diagnose=False` sink. That makes the property
+hold for the whole process regardless of which library a future call site reaches for. Only values are
+suppressed — `backtrace` stays on, so tracebacks still carry every frame, line, and source line, including the
+call chain above the catching point. The chute log shipper is
+independently clear: it never calls `logger.exception`, and every one of its log statements carries only
+`config_id`, pod name, counts, and status codes — never log content.
 
 ## API Surface
 
@@ -68,5 +96,9 @@ All other paths return 404.
 ## Open Questions / Next Steps
 
 - Determine the final authentication story (e.g., reuse validator signature headers similar to the attestation proxy or rely on mTLS). The initial implementation focuses on the read-only execution layer; transport-level protections can be layered in once the consuming component is chosen.
-- Extend the allowlist if additional services (OPA, attestation proxy) need coverage.
+- Remaining un-exposed units, should a triage gap show up in practice (all secret-free journals):
+  `registry-tls-config`, `verify-apparmor-profiles`, `gpu-verify`, `rtmr3-verify`,
+  `setup-cache` / `verify-cache-volume` / `verify-storage`, `attestation-service-init`. These are boot one-shots
+  whose failure already surfaces through the long-running service that depends on them, so they are deliberately
+  left off rather than widening the endpoint. `config-manager` is excluded by the credential rule above.
 - Consider Prometheus metrics (command success/failure counts) if observability gaps appear.

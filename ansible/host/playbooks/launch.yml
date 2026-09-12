@@ -1,5 +1,5 @@
 ---
-# Bootstrap base image (if missing), render config.yaml on host, run quick-launch.sh.
+# Bootstrap base image (if missing), render config.yaml on host, run `chutes-cvm guest launch`.
 #
 # Required (host_vars / group_vars / Vault):
 #   chutes_miner_ss58, chutes_miner_seed — miner credentials for the guest config
@@ -75,7 +75,7 @@
     - role: host_prerequisites
 
   tasks:
-    - name: Launch VM (download image if missing, render config, run quick-launch)
+    - name: Launch VM (download image if missing, render config, run chutes-cvm guest launch)
       ansible.builtin.include_role:
         name: chutes_tee_vm
         tasks_from: launch_and_verify.yml

@@ -1,0 +1,8 @@
+---
+# The sr25519 signer crate (control host) and the static musl binary it produces. The binary is
+# copied into the guest and staged into the initramfs (luks/fetch_key), so it is measured into
+# RTMR2 — the pinned toolchain (src/sr25519/rust-toolchain.toml) keeps it reproducible.
+sr25519_src_dir: "{{ repo_root }}/src/sr25519"
+sr25519_musl_target: x86_64-unknown-linux-musl
+sr25519_bin_src: "{{ sr25519_src_dir }}/target/{{ sr25519_musl_target }}/release/sr25519"
+sr25519_bin_dest: /usr/bin/sr25519

@@ -1,0 +1,130 @@
+---
+# AppArmor hardening: install profiles, abstractions, systemd drop-ins,
+# and a boot-time verification service.
+
+# ── Abstractions (Jinja2 templates for debug_build audit toggle) ──────────
+
+- name: Install sek8s AppArmor abstractions
+  ansible.builtin.template:
+    src: "abstractions/{{ item }}.j2"
+    dest: "/etc/apparmor.d/abstractions/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - sek8s-shell-base
+    - sek8s-cache-deny
+    - sek8s-secrets-deny
+
+# ── Static profiles ──────────────────────────────────────────────────────
+
+- name: Install sek8s AppArmor profiles
+  ansible.builtin.copy:
+    src: "profiles/{{ item }}"
+    dest: "/etc/apparmor.d/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - sek8s.system-manager
+    - sek8s.setup-cache
+    - sek8s.deny-sensitive-default
+    - sek8s.attestation-proxy
+    - sek8s.chute-log-shipper
+    - sek8s.k3s-init
+
+# One profile per entry in `k3s_init_secrets` (inventory.yml), all in a single file. Generated
+# rather than hand-written so the table stays the only place per-script secret access is declared —
+# the same table drives the staging loop in k3s-post-start.sh.
+# Debug builds load the profiles in complain mode: denials are logged, not
+# enforced, so a too-strict profile can't power off the VM (setup-cache et al.
+# carry OnFailure=poweroff) — you still get a login and a full denial log to
+# tighten profiles against. Production keeps flags=(enforce) untouched.
+# Match only the `enforce` token, not the whole flag list, so profiles carrying extra flags
+# (e.g. `flags=(enforce, attach_disconnected)`) still flip to `flags=(complain, attach_disconnected)`
+# rather than being left in enforce on a debug build.
+- name: Debug builds — set sek8s AppArmor profiles to complain mode
+  ansible.builtin.replace:
+    path: "/etc/apparmor.d/{{ item }}"
+    regexp: 'flags=\(enforce'
+    replace: 'flags=(complain'
+  loop:
+    - sek8s.system-manager
+    - sek8s.setup-cache
+    - sek8s.deny-sensitive-default
+    - sek8s.attestation-proxy
+    - sek8s.chute-log-shipper
+    - sek8s.k3s-init
+  when: debug_build | default(false) | bool
+
+# ── Systemd drop-ins: apply named profiles to services ───────────────────
+# system-manager and setup-cache need their own permissive profiles
+# (overriding the auto-attached deny-sensitive-default on bash/python).
+
+- name: Create systemd drop-in directories for AppArmor overrides
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - system-manager
+    - setup-cache
+    - chute-log-shipper
+
+- name: Apply AppArmor profile to system-manager via systemd
+  ansible.builtin.copy:
+    content: |
+      [Service]
+      AppArmorProfile=sek8s.system-manager
+    dest: /etc/systemd/system/system-manager.service.d/30-apparmor.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Apply AppArmor profile to chute-log-shipper via systemd
+  ansible.builtin.copy:
+    content: |
+      [Service]
+      AppArmorProfile=sek8s.chute-log-shipper
+    dest: /etc/systemd/system/chute-log-shipper.service.d/30-apparmor.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Apply AppArmor profile to setup-cache via systemd
+  ansible.builtin.copy:
+    content: |
+      [Service]
+      AppArmorProfile=sek8s.setup-cache
+    dest: /etc/systemd/system/setup-cache.service.d/30-apparmor.conf
+    owner: root
+    group: root
+    mode: '0644'
+
+# ── Boot-time profile verification ──────────────────────────────────────
+
+- name: Install AppArmor profile verification script
+  ansible.builtin.copy:
+    src: verify-apparmor-profiles.sh
+    dest: /usr/local/bin/verify-apparmor-profiles.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install AppArmor profile verification service
+  ansible.builtin.copy:
+    src: verify-apparmor-profiles.service
+    dest: /etc/systemd/system/verify-apparmor-profiles.service
+    owner: root
+    group: root
+    mode: '0644'
+
+# Enforcing-only: debug builds run profiles in complain, so this check (which
+# powers off when a profile isn't enforcing) must not be enabled there.
+- name: Enable AppArmor profile verification service (enforcing builds only)
+  ansible.builtin.systemd:
+    name: verify-apparmor-profiles.service
+    enabled: "{{ not (debug_build | default(false) | bool) }}"
+    daemon_reload: true

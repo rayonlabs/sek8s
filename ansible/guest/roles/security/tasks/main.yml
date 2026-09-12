@@ -1,20 +1,7 @@
 ---
 - name: Security hardening
   tags: security
-  vars:
-    enable_module_signing: true
-    attestation_endpoint: "https://api.example.com/attestation"
-    attestation_interval: 900  # 15 minutes
-    module_monitoring: true
   block:
-    # - name: Module signing
-    #   ansible.builtin.include_tasks: module-signing.yml
-    #   tags: module-signing
-
-    # - name: Attestation integration
-    #   ansible.builtin.include_tasks: attestation-integration.yml
-    #   tags: attestation
-    
     - name: Chroot and init hardening
       ansible.builtin.include_tasks: chroot-hardening.yml
       tags:

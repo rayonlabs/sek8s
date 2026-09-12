@@ -1,0 +1,315 @@
+---
+# capture-ccel — MINIMAL-boot capture of the CCEL (RTMR0 baseline) into
+# measurements/<version>/.
+#
+# STANDALONE / DEBUG ONLY — this role is NOT part of the build (chutes-miner-vm.yml).
+# The tdx-measure fork self-generates the complete RTMR0 offline, so a real CCEL is no
+# longer needed to produce measurements. Kept on disk for the occasional cross-check of a
+# new CPU generation against a real quote, or for debugging a suspected fork divergence;
+# needs a TDX host. Invoke it deliberately (e.g. from a one-off playbook), not in the flow.
+#
+# RTMR0 is extended by TDX firmware (TD-HOB / ACPI / SMBIOS) BEFORE the kernel starts, and
+# the CCEL is a firmware-populated ACPI table readable the moment the kernel is up — it is
+# completely independent of userspace. So instead of booting the full debug control plane
+# (k3s / attestation / mTLS) just to read one ACPI table, we take a THROWAWAY copy of the
+# debug image, inject a dumper into its initramfs that dumps the CC event log to the serial
+# console and powers off, and boot that: firmware -> kernel -> dump -> off. The host reads
+# the base64 back out of the serial log and decodes it. This yields the same CCEL a full
+# boot would, without any of the userspace that can hang.
+#
+# Launches with GPU passthrough (NOT --no-gpus): RTMR0 #0/#14 depend on guest RAM + CPU
+# count, so the capture must be sized like production (mem = gpu_count x ram_per_gpu). The
+# dumper powers off before drivers load, so the GPUs never enter the measurement.
+#
+# Only ccel_data is load-bearing (generate_measurements consumes the baseline CCEL and
+# recomputes per-topology ACPI via the fork). The fw_cfg/SMBIOS preimages are captured
+# best-effort for the future smbios_match.py — their absence is not an error.
+#
+# The CCEL is identical across debug and prod for a given topology, and is topology-
+# independent for the constant events, so capture once per image version. RTMR1/2/3 are
+# computed separately, statically (`chutes-cvm measurements generate`).
+#
+# Runs as a gather step (post-luks), gated by measurements=full (the only TDX-hardware
+# step). To (re)capture against an already-built image without a full rebuild:
+#     ansible-playbook playbooks/chutes-miner-vm.yml --tags gather-measurement-inputs
+
+- name: Set derived capture facts
+  ansible.builtin.set_fact:
+    _baseline_dir: "{{ measurement_output_dir }}/{{ vm_version }}"
+
+# ── Resolve the VM/bridge network ─────────────────────────────────────────────
+# The capture never uses the network, but the virtio-net device must be present so the
+# guest DSDT (an RTMR0 input) matches a real launch. Reuse br0's subnet if it's already
+# up; otherwise discover a non-overlapping /24 exactly as the host launch flow does.
+
+- name: Read the launcher bridge address (empty if the bridge is absent)
+  ansible.builtin.shell: |
+    ip -4 -o addr show {{ measurement_bridge_name }} 2>/dev/null | grep -oP 'inet \K\S+' | head -1 || true
+  register: _br_cidr
+  changed_when: false
+
+- name: Record existing bridge CIDR
+  ansible.builtin.set_fact:
+    _br_existing_cidr: "{{ _br_cidr.stdout | trim }}"
+
+- name: Discover a non-overlapping network when the bridge is absent
+  ansible.builtin.command: "python3 {{ measurement_pick_network_script }}"
+  register: _pick_net
+  changed_when: false
+  when: _br_existing_cidr | length == 0
+
+- name: Resolve bridge_ip / vm_ip (reuse the bridge subnet, or the discovered one)
+  ansible.builtin.set_fact:
+    _bridge_ip: >-
+      {{ _br_existing_cidr if (_br_existing_cidr | length > 0)
+         else (_pick_net.stdout | trim | from_json).bridge_ip }}
+    _vm_ip: >-
+      {{ (_br_existing_cidr.split('/')[0].rsplit('.', 1)[0] ~ '.2')
+         if (_br_existing_cidr | length > 0)
+         else (_pick_net.stdout | trim | from_json).vm_ip }}
+
+- name: Show the resolved capture network
+  ansible.builtin.debug:
+    msg: "capture network: vm_ip={{ _vm_ip }} bridge_ip={{ _bridge_ip }} (bridge {{ 'reused' if (_br_existing_cidr | length > 0) else 'to be created' }})"
+
+- name: Assert the built debug image exists
+  ansible.builtin.stat:
+    path: "{{ measurement_source_image }}"
+    get_checksum: false
+  register: _src_img
+  failed_when: not _src_img.stat.exists
+
+# ── Assemble a throwaway image set with the CCEL dumper baked into its initramfs ──
+- name: Create the throwaway working image-set directory
+  ansible.builtin.file:
+    path: "{{ measurement_work_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy the built debug image into the working set (never mutate the source)
+  ansible.builtin.copy:
+    src: "{{ measurement_source_image }}"
+    dest: "{{ measurement_work_image }}"
+    remote_src: true
+    mode: "0644"
+
+- name: Inject the CCEL dumper into the copy's initramfs and rebuild it
+  block:
+    - name: Load nbd
+      ansible.builtin.command: modprobe nbd max_part=8
+      args: { creates: "{{ measurement_nbd_device }}" }
+      changed_when: false
+
+    - name: Disconnect nbd if already connected
+      ansible.builtin.command: "qemu-nbd --disconnect {{ measurement_nbd_device }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Connect the work image
+      ansible.builtin.command: "qemu-nbd --connect={{ measurement_nbd_device }} {{ measurement_work_image }}"
+      args: { creates: "{{ measurement_nbd_device }}p1" }
+
+    - name: partprobe
+      ansible.builtin.command: "partprobe {{ measurement_nbd_device }}"
+      changed_when: false
+
+    - name: "Detect partitions (debug — efi vfat, boot ext4 <2G, root ext4 >2G)"
+      ansible.builtin.shell: |
+        set -e
+        efi=""; boot=""; root=""
+        for part in {{ measurement_nbd_device }}p*; do
+          fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || echo "")
+          size_mb=$(( $(blockdev --getsize64 "$part" 2>/dev/null || echo 0) / 1024 / 1024 ))
+          case "$fstype" in
+            vfat) efi="$part" ;;
+            ext4) if [ "$size_mb" -lt 2048 ]; then boot="$part"; else root="$part"; fi ;;
+          esac
+        done
+        [ -n "$root" ] && [ -n "$boot" ] || { echo "partition detect failed" >&2; exit 1; }
+        printf 'root=%s\nboot=%s\nefi=%s\n' "$root" "$boot" "$efi"
+      args: { executable: /bin/bash }
+      register: _parts
+      changed_when: false
+
+    - name: Parse partitions
+      ansible.builtin.set_fact:
+        _root: "{{ _parts.stdout | regex_search('root=(\\S+)', '\\1') | first }}"
+        _boot: "{{ _parts.stdout | regex_search('boot=(\\S+)', '\\1') | first }}"
+        _efi: "{{ _parts.stdout | regex_search('efi=(\\S+)', '\\1') | first }}"
+
+    - name: Mount root/boot/efi + bind system dirs
+      ansible.builtin.mount:
+        path: "{{ measurement_mnt }}{{ item.p }}"
+        src: "{{ item.s }}"
+        fstype: "{{ item.f }}"
+        opts: "{{ item.o | default(omit) }}"
+        state: ephemeral
+      loop:
+        - { p: "", s: "{{ _root }}", f: ext4 }
+        - { p: "/boot", s: "{{ _boot }}", f: ext4 }
+        - { p: "/boot/efi", s: "{{ _efi }}", f: vfat }
+        - { p: "/proc", s: /proc, f: none, o: bind }
+        - { p: "/sys", s: /sys, f: none, o: bind }
+        - { p: "/dev", s: /dev, f: none, o: bind }
+        - { p: "/run", s: /run, f: none, o: bind }
+
+    - name: Install the CCEL dumper (init-premount, runs first, dumps + powers off)
+      ansible.builtin.copy:
+        src: files/initramfs/dump-ccel
+        dest: "{{ measurement_mnt }}/etc/initramfs-tools/scripts/init-premount/dump-ccel"
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Ensure qemu_fw_cfg ships in the capture initramfs (fw_cfg/SMBIOS dump needs it)
+      # Without the module in the initramfs, `modprobe qemu_fw_cfg` at init-premount finds
+      # nothing, /sys/firmware/qemu_fw_cfg is never created, and every fw_cfg/SMBIOS dump
+      # misses (only the ACPI-sourced ccel_data survives).
+      ansible.builtin.lineinfile:
+        path: "{{ measurement_mnt }}/etc/initramfs-tools/modules"
+        line: qemu_fw_cfg
+        create: true
+        mode: "0644"
+
+    - name: Rebuild the initramfs in the chroot
+      ansible.builtin.command: "chroot {{ measurement_mnt }} update-initramfs -u -k all"
+      changed_when: true
+
+  always:
+    - name: Unmount the work image
+      ansible.builtin.command: "umount -R {{ measurement_mnt }}"
+      failed_when: false
+      changed_when: false
+
+    - name: Disconnect nbd
+      ansible.builtin.command: "qemu-nbd --disconnect {{ measurement_nbd_device }}"
+      failed_when: false
+      changed_when: false
+
+- name: Stage the (dumper-carrying) direct-boot artifacts from the rebuilt image
+  ansible.builtin.command: "bash {{ measurement_stage_boot_script }} {{ measurement_work_image }}"
+  changed_when: true
+
+- name: Generate the working set's manifest (coherence contract the launcher verifies)
+  ansible.builtin.command:
+    argv:
+      - chutes-cvm
+      - image
+      - manifest
+      - "{{ measurement_work_image }}"
+      - -o
+      - "{{ measurement_work_dir }}/manifest.json"
+      - --version
+      - "{{ vm_version }}"
+      - --debug
+  changed_when: true
+
+# ── Boot GPU-less, let the dumper run + power off, then decode the CCEL from serial ──
+- name: Capture the baseline (VM runs from here; always torn down)
+  block:
+    - name: Truncate the serial log so we only parse this run
+      ansible.builtin.copy:
+        dest: "{{ measurement_serial_log }}"
+        content: ""
+        mode: "0644"
+
+    - name: Launch the dumper VM from the working image set (TDX, profile-sized)
+      # No --no-gpus: GPU passthrough sizes the guest like production (see header).
+      ansible.builtin.command:
+        argv:
+          - chutes-cvm
+          - launch
+          - --hostname
+          - "{{ measurement_hostname }}"
+          - --base-image
+          - "{{ measurement_work_dir }}"
+          - --miner-ss58
+          - "{{ measurement_miner_ss58 }}"
+          - --miner-seed
+          - "{{ measurement_miner_seed }}"
+          - --vm-ip
+          - "{{ _vm_ip }}"
+          - --bridge-ip
+          - "{{ _bridge_ip }}"
+          - --network-type
+          - tap
+      changed_when: true
+
+    - name: Wait for the dump to complete (MEAS-DUMP-COMPLETE on the serial log)
+      ansible.builtin.shell: "grep -q 'MEAS-DUMP-COMPLETE' {{ measurement_serial_log }}"
+      register: _dump_done
+      retries: "{{ (measurement_dump_wait_seconds | int) // 5 }}"
+      delay: 5
+      until: _dump_done.rc == 0
+      changed_when: false
+
+    - name: Ensure the baseline destination exists
+      ansible.builtin.file:
+        path: "{{ _baseline_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Decode the dumped blobs from the serial log into measurements/<version>/
+      # ccel_data is required; the rest (fw_cfg/SMBIOS preimages) are best-effort. Only
+      # lines between a blob's BEGIN/END markers are decoded; empty results are dropped.
+      ansible.builtin.shell: |
+        set -uo pipefail
+        log="{{ measurement_serial_log }}"
+        out="{{ _baseline_dir }}"
+        for label in ccel_data ccel acpi_tables table_loader rsdp smbios_tables smbios_anchor extra_pci_roots bootorder; do
+          awk -v L="$label" '
+            $0 ~ ("MEAS-DUMP-BEGIN " L "( |$)") {f=1; next}
+            $0 ~ ("MEAS-DUMP-END " L "( |$)")   {f=0}
+            f {print}
+          ' "$log" | tr -d '\r' | base64 -d > "$out/$label.bin" 2>/dev/null || true
+          if [ -s "$out/$label.bin" ]; then
+            echo "  $label -> $out/$label.bin ($(stat -c%s "$out/$label.bin") bytes)"
+          else
+            rm -f "$out/$label.bin"
+            echo "  $label -> (missing / empty)"
+          fi
+        done
+      args: { executable: /bin/bash }
+      register: _decode
+      changed_when: true
+
+    - name: Show decoded artifacts
+      ansible.builtin.debug:
+        var: _decode.stdout_lines
+
+    - name: Verify the CC event log was actually captured
+      # The whole point of the capture is the CCEL (the RTMR0 baseline). If the guest
+      # kernel didn't expose data/CCEL the decode yields nothing — fail loudly rather
+      # than ship a bad fixture.
+      ansible.builtin.stat:
+        path: "{{ _baseline_dir }}/ccel_data.bin"
+      register: _ccel_stat
+      failed_when: (not _ccel_stat.stat.exists) or (_ccel_stat.stat.size | int) == 0
+
+    - name: Write baseline metadata
+      ansible.builtin.copy:
+        dest: "{{ _baseline_dir }}/baseline.json"
+        content: |
+          {
+            "version": "{{ vm_version }}",
+            "build_env": "{{ build_env }}",
+            "boot_method": "direct",
+            "capture_method": "initramfs-dump",
+            "source_image": "{{ measurement_source_image }}",
+            "gpus": true
+          }
+        mode: "0644"
+
+  always:
+    # Stop ONLY the throwaway capture VM — never the bridge (shared with other VMs).
+    # It usually powered itself off already; this is belt-and-suspenders.
+    - name: Stop the capture VM (leave the shared bridge in place)
+      ansible.builtin.command:
+        argv: [chutes-cvm, stop]
+      changed_when: true
+      failed_when: false
+
+    - name: Remove the throwaway working image set
+      ansible.builtin.file:
+        path: "{{ measurement_work_dir }}"
+        state: absent

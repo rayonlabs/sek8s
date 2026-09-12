@@ -8,6 +8,7 @@
 | `src/sek8s/VERSION` | `sek8s` Python package version |
 | `src/sek8s-common/VERSION` | `sek8s-common` Python package version |
 | `src/attestation-proxy/VERSION` | `attestation-proxy` Python package version |
+| `src/chutes-cvm/VERSION` | `chutes-cvm` host CLI package version |
 
 Each `src/<pkg>/VERSION` is the **source of truth** for `[tool.poetry] version` in the
 corresponding `pyproject.toml`. The sync script (`scripts/sync_pyproject_versions.py`)
@@ -15,7 +16,9 @@ keeps them aligned, and CI enforces it.
 
 ## Version domains — which changes require which bump
 
-There are two independent release domains. A single PR may touch both.
+There are several independent release domains (below, plus the CalVer **ops** domain —
+`ansible/host/`, `host-tools/`, `.github/workflows/` — versioned via `changelogs/ops/VERSION`).
+A single PR may touch more than one; bump each affected VERSION file.
 
 ### VM image domain
 
@@ -38,6 +41,15 @@ bump (not `ansible/guest/VERSION`).
 
 Rationale: the proxy runs as a standalone k3s container image, independently releasable
 from the VM image.
+
+### chutes-cvm domain
+
+Changes under `src/chutes-cvm/*` require an **`src/chutes-cvm/VERSION`** bump (SemVer).
+Changelog fragments live in `changelogs/chutes-cvm/`.
+
+Rationale: `chutes-cvm` is the host-side CLI + toolkit, installed independently on bare-metal
+hosts (via `src/chutes-cvm/install.sh` or `pip`) — released on its own cadence, not tied to the
+guest VM image. It is not baked into the VM image, so it does not bump `ansible/guest/VERSION`.
 
 ### Cross-domain changes
 

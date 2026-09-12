@@ -2,7 +2,7 @@
 Description=Verify Storage Volume Encryption
 Documentation=https://github.com/yourusername/sek8s
 After=cache-storage.mount
-Before=setup-storage-bind-mounts.service containerd.service k3s.service k3s-agent.service
+Before=setup-storage-bind-mounts.service containerd.service k3s.service
 Requires=cache-storage.mount
 DefaultDependencies=no
 # If this service fails, don't continue boot

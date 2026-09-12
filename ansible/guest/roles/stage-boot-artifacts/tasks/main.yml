@@ -1,0 +1,32 @@
+---
+# stage-boot-artifacts — Extract the direct-boot kernel/initrd/cmdline from the
+# finalized image and persist them next to it as publishable artifacts
+# (<image>.vmlinuz/.initrd/.cmdline). Published to R2 with the qcow2; read by both
+# `chutes-cvm measurements generate` (RTMR1/2) and the launcher (deploy). See
+# files/stage-boot-artifacts.sh.
+#
+# Part of the measurement GATHER phase (runs POST-luks, so the staged initrd is the
+# final one). Reads /boot via guestfish, which stays plaintext even in a luks image.
+# Self-contained: installs its own guestfish.
+
+- name: Ensure guestfish is installed
+  ansible.builtin.apt:
+    name: libguestfs-tools
+    state: present
+    update_cache: true
+
+- name: Check guestfish is available
+  ansible.builtin.command: which guestfish
+  changed_when: false
+  register: stage_boot_guestfish_check
+  failed_when: stage_boot_guestfish_check.rc != 0
+
+- name: Stage direct-boot artifacts from final image
+  ansible.builtin.command: >-
+    {{ role_path }}/files/stage-boot-artifacts.sh {{ final_img_path }}
+  register: stage_boot_result
+  changed_when: true
+
+- name: Show staged artifacts
+  ansible.builtin.debug:
+    msg: "{{ stage_boot_result.stderr_lines }}"
