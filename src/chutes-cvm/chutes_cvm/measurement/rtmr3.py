@@ -90,18 +90,19 @@ def measured_hashes(
 
 
 def fold_chain(hashes: list[tuple[str, str]]) -> str:
-    """Replay the RTMR3 extension chain over ``(hash hex, path)`` pairs.
+    """RTMR3 over ``(hash hex, path)`` pairs in chain order.
 
-    ``rtmr3 = 0x00*48; for f: rtmr3 = SHA384(rtmr3 || SHA384(f.contents))`` — the
-    per-file hash covers content only, never the path, matching ``tdx-measure``'s
-    ``sha384sum < file`` and the 48 bytes the initramfs hands ``tdx-rtmr-extend``.
+    ``rtmr3 = SHA384(0x00*48 || SHA384(list))``, where ``list`` is ``tdx-measure hash``
+    output verbatim — one ``"<sha384hex> <path>\\n"`` line per file. ONE hardware extend
+    over a digest of the whole ordered list, not one extend per file: 41k per-file TDCALLs
+    cost ~167s of boot and bind nothing this does not. Hashing the list text also binds the
+    paths, which the former per-file content chain did not.
 
     Returns the final register value as uppercase hex.
     """
-    rtmr3 = bytes(RTMR3_LEN)
-    for digest, _rel_path in hashes:
-        rtmr3 = hashlib.sha384(rtmr3 + bytes.fromhex(digest)).digest()
-    return rtmr3.hex().upper()
+    body = "".join(f"{digest} {rel_path}\n" for digest, rel_path in hashes).encode()
+    chain_digest = hashlib.sha384(body).digest()
+    return hashlib.sha384(bytes(RTMR3_LEN) + chain_digest).hexdigest().upper()
 
 
 def compute_rtmr3(

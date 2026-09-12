@@ -32,11 +32,13 @@ def test_rtmr3_chain_matches_reference(tmp_path):
 
     rtmr3, per_file = rr.rtmr3_chain(str(root), str(conf))
 
-    # Independent reference: rtmr3 = 0x00*48; rtmr3 = SHA384(rtmr3 || SHA384(contents)).
-    acc = bytes(48)
-    for payload in (b"alpha", b"beta"):
-        acc = hashlib.sha384(acc + hashlib.sha384(payload).digest()).digest()
-    assert rtmr3 == acc.hex().upper()
+    # Independent reference: rtmr3 = SHA384(0x00*48 || SHA384(hash-list text)).
+    body = "".join(
+        f"{hashlib.sha384(payload).hexdigest()} {path}\n"
+        for payload, path in ((b"alpha", "/etc/a"), (b"beta", "/etc/b"))
+    ).encode()
+    acc = hashlib.sha384(bytes(48) + hashlib.sha384(body).digest())
+    assert rtmr3 == acc.hexdigest().upper()
     assert [p[1] for p in per_file] == ["/etc/a", "/etc/b"]
     assert per_file[0][0] == hashlib.sha384(b"alpha").hexdigest()
 

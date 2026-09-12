@@ -135,18 +135,27 @@ if [ "$command" = "list" ]; then
 fi
 
 # hash: content-only SHA-384 per file, in chain order.
-count=0
+#
+# Batched through xargs, not one sha384sum per file: at 41k files the per-file fork was the
+# whole cost (~6ms each, ~4min of boot). -z disables GNU's filename escaping -- that escaping
+# is what forced the per-file stdin form, since a backslash in a name shifts the hash field.
+# xargs preserves input order, so digests pair positionally with $sorted by line number and
+# the names sha384sum echoes are ignored entirely.
 total=$(wc -l < "$sorted")
-while IFS= read -r relpath; do
-    [ -n "$relpath" ] || continue
-    digest=$(sha384sum < "$root$relpath" 2>/dev/null | cut -d' ' -f1)
-    if [ -z "$digest" ]; then
-        echo "tdx-measure: could not hash $relpath" >&2
-        exit 1
-    fi
-    printf '%s %s\n' "$digest" "$relpath"
-    count=$((count + 1))
-    if [ $((count % 200)) -eq 0 ]; then
-        echo "tdx-measure: hashed $count/$total files..." >&2
-    fi
-done < "$sorted"
+digests=$(mktemp)
+trap 'rm -f "$parsed" "$filelist" "$sorted" "$digests"' EXIT
+echo "tdx-measure: hashing $total files..." >&2
+
+# Paths are root-relative with a leading '/'; strip it and chdir to $root so the hashed names
+# stay short and no prefix has to be stripped back off the output.
+sed 's|^/||' "$sorted" | tr '\n' '\0' \
+    | (cd "${root:-/}" && xargs -0 sha384sum -z 2>/dev/null) \
+    | tr '\0' '\n' | cut -c1-96 > "$digests"
+
+hashed=$(grep -c '' "$digests" 2>/dev/null || echo 0)
+if [ "$hashed" -ne "$total" ]; then
+    echo "tdx-measure: hashed $hashed of $total files -- unreadable file?" >&2
+    exit 1
+fi
+
+awk 'NR==FNR { d[FNR]=$0; next } { print d[FNR] " " $0 }' "$digests" "$sorted"

@@ -164,16 +164,37 @@ def test_nothing_measurable_is_an_error(tmp_path):
         measured_hashes(root, conf, tdx_measure_script())
 
 
-def test_fold_matches_the_hardware_extension_chain(fixture_root):
-    """The register the hardware accumulates: rtmr3 = SHA384(rtmr3 || SHA384(contents)),
-    from 48 zero bytes, over tdx-measure's per-file hashes in its order."""
+def test_fold_matches_the_single_hardware_extend(fixture_root):
+    """The one value the initramfs extends: SHA384(0^48 || SHA384(hash-list text))."""
     root, conf = fixture_root
     hashes = measured_hashes(root, conf, tdx_measure_script())
 
-    acc = bytes(48)
-    for digest, _rel in hashes:
-        acc = hashlib.sha384(acc + bytes.fromhex(digest)).digest()
-    assert fold_chain(hashes) == acc.hex().upper()
+    body = "".join(f"{d} {p}\n" for d, p in hashes).encode()
+    expected = hashlib.sha384(bytes(48) + hashlib.sha384(body).digest())
+    assert fold_chain(hashes) == expected.hexdigest().upper()
+
+
+def test_fold_input_is_tdx_measure_output_verbatim(fixture_root):
+    """The digest is taken over tdx-measure's stdout, so re-serialising the parsed pairs
+    must reproduce those bytes exactly — the boot path hashes the file, not the pairs."""
+    root, conf = fixture_root
+    hashes = measured_hashes(root, conf, tdx_measure_script())
+
+    raw = _run("hash", root, conf).stdout
+    assert "".join(f"{d} {p}\n" for d, p in hashes) == raw
+
+
+def test_fold_binds_paths_not_just_content(fixture_root):
+    """Hashing the list text covers the paths, which the former per-file chain did not:
+    two files swapping names must change RTMR3 even though the content multiset is equal."""
+    root, conf = fixture_root
+    hashes = measured_hashes(root, conf, tdx_measure_script())
+    assert len(hashes) >= 2
+
+    swapped = list(hashes)
+    (d0, p0), (d1, p1) = swapped[0], swapped[1]
+    swapped[0], swapped[1] = (d1, p0), (d0, p1)
+    assert fold_chain(swapped) != fold_chain(hashes)
 
 
 def test_the_guest_gets_the_same_bytes_as_the_bundled_script():

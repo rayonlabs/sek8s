@@ -21,10 +21,9 @@
 # cannot be modified at runtime without the hardware RTMR3 reflecting that
 # change — making any tampered version self-defeating.
 #
-# RTMR3 extension chain (mirrors init-bottom rtmr3-measure):
-#   rtmr3_0 = 0x00...0  (48 zero bytes, TDX initial state)
-#   for each file F in sorted(all files under configured paths):
-#       rtmr3_{i+1} = SHA384(rtmr3_i || SHA384(F.contents))
+# RTMR3 (mirrors init-bottom rtmr3-measure):
+#   rtmr3 = SHA384(0x00...0 || SHA384(tdx-measure hash output))
+# One extend over a digest of the whole ordered "<sha384hex> <path>" list, not one per file.
 #
 # WHICH files are measured, in WHAT ORDER, and HOW each one is hashed are NOT
 # decided here: they come from /usr/local/bin/tdx-measure, the same script the
@@ -100,9 +99,8 @@ def fatal(msg: str) -> None:
 def measure() -> tuple[bytes, list[tuple[str, str]]]:
     """Return (expected RTMR3, per-file (sha384hex, path)).
 
-    Both the file set and the per-file hashes come from tdx-measure; the chain fold
-    is `rtmr3 = SHA384(rtmr3 || SHA384(contents))` from an all-zero register, which
-    is what the hardware accumulates as the initramfs extends each file.
+    Both the file set and the per-file hashes come from tdx-measure; the fold is
+    `rtmr3 = SHA384(0^48 || SHA384(list))`, the single value the initramfs extends.
     Root is "" because this verifies the live filesystem, post-bind-mount.
     """
     try:

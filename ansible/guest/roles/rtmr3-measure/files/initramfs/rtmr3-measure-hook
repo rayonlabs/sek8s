@@ -28,6 +28,10 @@ copy_exec /usr/bin/sha384sum
 # POSIX sh over find/sed/sort/wc/mktemp/sha384sum, all present in the initramfs.
 copy_exec /usr/local/bin/tdx-measure
 
+# tdx-measure batches its hashing through xargs and converts the NUL-delimited records with tr.
+copy_exec /usr/bin/xargs
+copy_exec /usr/bin/tr
+
 # TDX guest kernel module — needed so /dev/tdx_guest is available
 manual_add_modules tdx_guest
 force_load tdx_guest
