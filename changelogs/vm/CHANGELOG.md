@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 Version source of truth: `ansible/guest/VERSION`
 
-## [1.4.0] - 2026-09-11
+## [1.4.0] - 2026-09-12
 
 ### Added
 - **Boot-time miner-hotkey proof-of-possession (guest side).** A small, static, pinned-toolchain (musl) sr25519 signer (`src/sr25519`; Schnorr/Ristretto, which openssl cannot do) is built and staged into the guest initramfs (measured into RTMR2). The boot flow now derives the hotkey from the config-volume seed (`/run/tdx-config/miner-seed`) rather than trusting the claimed `miner-ss58`, and signs each chained server nonce — `/boot/attestation`, `/provision`, and `/provision/confirm` — sending the sr25519 proof in `X-Chutes-Signature`. This closes a cross-miner LUKS-brick vector where a peer could assert a victim's `(hotkey, vm_name)` and rotate its passphrase. The seed is stashed to `/run` for the init-bottom calls and shredded before the initramfs `/run` is moved into userspace. Pairs with a matching server-side signature check (chutes-api). Also fixes a migration miss: root-rotation confirm now uses `/provision/confirm` (the legacy `/luks/confirm` is deprecated).
@@ -407,6 +407,9 @@ Version source of truth: `ansible/guest/VERSION`
   HWE ABI, so the old version stopped resolving and the build failed outright at "Install HWE
   kernel and headers (pinned)". The new version is the current archive kernel and ships from
   noble-security. Guest RTMR measurements change accordingly.
+- The boot-time RTMR3 phase extends the register **once** instead of once per measured file,
+  matching the new `SHA384(0^48 || SHA384(hash-list))` definition. **Published RTMR3
+  measurements must be regenerated.**
 
 ### Fixed
 - `nvidia-fabricmanager` is no longer reported as unhealthy when it is intentionally masked (valid on non-NVLink hosts). The services overview now returns `ok` in this configuration instead of incorrectly reporting `degraded`.
@@ -553,6 +556,15 @@ Both failures were invisible on debug images, which load the sek8s profiles in c
   undefined`. `repo_root` was defined in `host` group scope but that role runs in a `vm` play,
   so it resolved nowhere. It now lives in `all` scope, which also removes the `playbook_dir`
   workaround the sr25519 role was carrying for the same reason.
+- Boot-time RTMR3 verification was O(n²) and made the measurement phase unusable once
+  `/usr/lib` was measured. Each of the 41,106 files spawned its own `awk` that rescanned the
+  whole expected-hashes manifest, so per-file cost grew from 5ms to 20ms over the first 3,600
+  files and the phase projected to roughly 67 minutes. The manifest is now read once into
+  memory and the hash list streamed past it in a single pass. Both formats carry the 96-char
+  hash at a fixed end of the line, so paths containing spaces are matched by offset rather than
+  by field splitting.
+- The rtmr3-measure initramfs hook now includes `xargs` and `tr`, which `tdx-measure` needs for
+  its batched hashing.
 
 ### Removed
 - Hard-coded validator SS58 (`5Dt7HZ7Zpw4DppPxFM7Ke3Cm7sDAWhsZXmM5ZAmE7dSVJbcQ`) removed from all Ansible role defaults (`common`, `admission-controller`, `attestation-service`, `system-manager`) and inventory files (`ansible/guest/inventory.yml`, `local/inventory.prod.yml`). The `validator` Ansible variable is no longer used anywhere in the guest image build.

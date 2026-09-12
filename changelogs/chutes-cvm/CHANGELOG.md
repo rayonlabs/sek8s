@@ -3,7 +3,7 @@
 The `chutes-cvm` CLI + toolkit (`src/chutes-cvm/`) — an independently installable host CLI
 (`pip`/`install.sh`). Versioned with SemVer via `src/chutes-cvm/VERSION`. Run
 `make promote-changelogs` to aggregate fragments into the current version section.
-## [0.1.0] - 2026-09-11
+## [0.1.0] - 2026-09-12
 
 ### Added
 - **`chutes-cvm measurements`** — TDX measurement generation is now a first-class command
@@ -226,6 +226,18 @@ The `chutes-cvm` CLI + toolkit (`src/chutes-cvm/`) — an independently installa
   in what order, and how to hash them, and had drifted from the guest in ways that would have made
   a predicted measurement disagree with the one a VM actually produces. Only the chain fold stays
   in Python, because at boot the hardware does the folding.
+- **RTMR3 is now a single hardware extend over a digest of the measured file list**, rather
+  than one extend per file: `rtmr3 = SHA384(0^48 || SHA384(hash-list))`, where the hash list is
+  `tdx-measure hash` output verbatim. 41k per-file TDCALLs cost ~167s of every boot and bind
+  nothing a single extend over the ordered list does not. Hashing the list text also binds the
+  measured paths, which the per-file content chain did not. **Published RTMR3 measurements must
+  be regenerated.**
+- `tdx-measure` batches its hashing through `xargs` instead of forking `sha384sum` per file,
+  which was the entire cost of the hashing phase (~6ms per file, 255s for 41k files on a real
+  guest; 30x faster on a 6k-file bench here, output byte-identical). `sha384sum -z` disables
+  GNU's filename escaping — the hazard that forced the per-file stdin form, where a backslash
+  in a name silently shifted the hash field — and xargs preserves input order, so digests pair
+  positionally with the sorted path list and the echoed names are ignored entirely.
 
 ### Fixed
 - Bridge networking now clamps TCP MSS to the egress interface's PMTU (`setup-bridge.sh`),
@@ -263,6 +275,19 @@ The `chutes-cvm` CLI + toolkit (`src/chutes-cvm/`) — an independently installa
   instead of writing it unconditionally. Any install that leaves `chutes_cvm` unimportable —
   a version-mismatched venv, an editable install whose source moved — now fails loudly rather
   than producing a broken command that looks installed.
+- `chutes-cvm host setup` could not complete on Ubuntu 26.04. The profile pinned
+  `linux-image-6.17.0-35-generic`, a noble HWE package that resolute has never carried, so the
+  install aborted before QEMU and the native TDX kernel were installed. That left hosts
+  upgraded from an earlier release running the new QEMU against the kernel carried over from
+  before the upgrade — which presents at VM launch as `kvm run failed Input/output error` on
+  every vCPU, the TD created but never enterable. This broke `setup.yml` and every
+  `upgrade-host.yml` hop, both of which provision through this path. Pinned to
+  `linux-image-7.0.0-31-generic`, resolute's current ABI.
+- `chutes-cvm host setup` now checks the pinned kernel is available before installing
+  anything, and reports it in one line naming the command that finds the current version.
+  Kernel pins expire by design — a pocket carries only the newest ABI — and this previously
+  surfaced as an apt error inside a Python traceback, after the repository setup steps had
+  already run.
 - `chutes-cvm host setup` could not complete on Ubuntu 26.04. The profile pinned
   `linux-image-6.17.0-35-generic`, a noble HWE package that resolute has never carried, so the
   install aborted before QEMU and the native TDX kernel were installed. That left hosts
